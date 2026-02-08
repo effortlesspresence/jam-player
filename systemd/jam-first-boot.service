@@ -1,0 +1,32 @@
+[Unit]
+Description=JAM Player First Boot - Generate device credentials
+Documentation=https://github.com/effortlesspresence/jam-player-v2
+
+# Run very early, before any other JAM services
+DefaultDependencies=no
+After=local-fs.target
+Before=jam-boot-check.service
+
+# Only run if the completion flag doesn't exist
+ConditionPathExists=!/etc/jam/device_data/.first_boot_complete
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Run as root (needed to write to /etc/jam/credentials with restricted permissions)
+User=root
+Group=root
+
+# Use the shared JAM venv
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_first_boot.py
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-first-boot
+
+# No restart - oneshot service, will retry on next boot if it fails
+
+[Install]
+WantedBy=multi-user.target

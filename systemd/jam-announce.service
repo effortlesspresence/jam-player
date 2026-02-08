@@ -1,0 +1,49 @@
+[Unit]
+Description=JAM Player Announce - Announces device presence to JAM backend
+Documentation=https://github.com/anthropics/jam-player
+
+# Only run if not yet announced
+ConditionPathExists=!/etc/jam/device_data/.announced
+
+# Requires first boot to have completed (credentials must exist)
+Requires=jam-first-boot.service
+After=jam-first-boot.service
+
+# Wait for boot check to complete (network readiness, system validation)
+After=jam-boot-check.service
+
+# Requires network
+After=network-online.target
+Wants=network-online.target
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+
+# Run as root
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Main script - calls announce-jp API, creates .announced flag on success
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_announce.py
+
+# Retry on failure (network might not be ready)
+Restart=on-failure
+RestartSec=30
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-announce
+
+[Install]
+WantedBy=multi-user.target

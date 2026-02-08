@@ -1,0 +1,43 @@
+[Unit]
+Description=JAM Player Content Manager - Downloads and manages content
+Documentation=https://github.com/anthropics/jam-player
+
+# Wait for network to be online
+After=network-online.target
+Wants=network-online.target
+
+# Wait for boot check to complete
+After=jam-boot-check.service
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Run as root for system access
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Run scenes_manager_service.py from the new location
+# This handles polling for content updates and downloading media
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/scenes_manager_service.py
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-content-manager
+
+[Install]
+WantedBy=multi-user.target

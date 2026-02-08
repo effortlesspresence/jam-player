@@ -1,0 +1,38 @@
+[Unit]
+Description=JAM Player Tailscale - Ensures remote access is configured
+Documentation=https://github.com/effortlesspresence/jam-player
+
+# Requires network
+After=network-online.target
+Wants=network-online.target
+
+# Run after first boot (ensures device UUID exists for hostname)
+After=jam-first-boot.service
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+
+# Run as root for systemctl access
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Main script - checks/configures Tailscale
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_tailscale.py
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-tailscale
+
+[Install]
+WantedBy=multi-user.target

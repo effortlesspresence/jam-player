@@ -1,0 +1,37 @@
+[Unit]
+Description=JAM Player Registration Status Poller - Checks if device has been registered
+Documentation=https://github.com/anthropics/jam-player
+
+# Only run if not yet registered
+ConditionPathExists=!/etc/jam/device_data/.registered
+
+# Requires announce to have completed first (device must be in backend)
+ConditionPathExists=/etc/jam/device_data/.announced
+
+# Requires network
+After=network-online.target
+Wants=network-online.target
+
+# Run after announce service
+After=jam-announce.service
+
+[Service]
+Type=oneshot
+
+# Run as root
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Main script - checks registration status, creates .registered flag if REGISTERED
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_registration_poller.py
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-registration-poller

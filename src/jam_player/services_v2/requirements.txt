@@ -1,0 +1,29 @@
+# JAM Player 2.0 Services - Shared Dependencies
+# All jam-* systemd services use the same venv: /opt/jam/venv
+#
+# IMPORTANT: Versions are pinned for stability. Update deliberately after testing.
+
+# UUID v7 support (timestamp-sortable UUIDs for efficient DB queries)
+uuid6==2024.7.10
+
+# Ed25519 key generation for API request signing
+pynacl==1.5.0
+
+# D-Bus bindings for NetworkManager and BlueZ integration
+dbus-python==1.3.2
+
+# systemd integration (watchdog, notify)
+sdnotify==0.3.2
+
+# HTTP requests (for health checks, API calls)
+requests==2.32.3
+certifi==2024.8.30
+
+# Image generation for error screens (writes directly to /dev/fb0)
+pillow==10.4.0
+
+# QR code generation for setup screen
+qrcode==7.4.2
+
+# Note: Also requires system packages:
+#   apt install python3-dbus bluez libdbus-1-dev libglib2.0-dev

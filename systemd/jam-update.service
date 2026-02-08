@@ -1,0 +1,48 @@
+[Unit]
+Description=JAM Player Update Service - Checks for and installs updates on boot
+Documentation=https://github.com/anthropics/jam-player
+
+# Run early in boot, after network is available
+After=network-online.target
+Wants=network-online.target
+
+# Run after first boot completes (credentials must exist for error reporting)
+After=jam-first-boot.service
+
+# Run BEFORE other JAM services so they get the updated code
+Before=jam-boot-check.service
+Before=jam-ble-state-manager.service
+Before=jam-content-manager.service
+Before=jam-player-display.service
+Before=jam-heartbeat.service
+Before=jam-health-monitor.service
+
+[Service]
+Type=oneshot
+
+# Run as root - needs to install system-wide updates
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Main script - checks for updates, installs if available, then exits
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_update.py
+
+# Don't restart - this is a one-shot service that runs on boot
+Restart=no
+
+# Give it plenty of time for git operations and install
+TimeoutStartSec=900
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-update
+
+[Install]
+WantedBy=multi-user.target

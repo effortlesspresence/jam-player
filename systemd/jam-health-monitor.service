@@ -1,0 +1,47 @@
+[Unit]
+Description=JAM Player Health Monitor - Monitors and recovers failed services
+Documentation=https://github.com/anthropics/jam-player
+
+# Wait for network to be online
+After=network-online.target
+Wants=network-online.target
+
+# Wait for boot check to complete
+After=jam-boot-check.service
+
+# Wait for setup display to complete (device must be provisioned)
+After=jam-setup-display.service
+
+# Wait for the services we monitor to have a chance to start
+After=jam-ble-state-manager.service
+After=jam-content-manager.service
+After=jam-player-display.service
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_health_monitor.py
+
+# Run as root (needed for systemctl restart commands)
+User=root
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# systemd watchdog - service must ping every 90s
+WatchdogSec=90
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-health-monitor
+
+[Install]
+WantedBy=multi-user.target

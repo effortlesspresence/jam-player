@@ -1,0 +1,55 @@
+[Unit]
+Description=JAM Player Setup Display - Shows welcome screen until device is registered
+Documentation=https://github.com/anthropics/jam-player
+
+# Only run if device is not yet registered
+ConditionPathExists=!/etc/jam/device_data/.registered
+
+# Start after first boot completes and BLE provisioning is available
+After=network.target
+After=jam-first-boot.service
+After=jam-ble-provisioning.service
+
+# TODO DELETE THIS ENTIRE SERVICE!!! IT'S BEEN REPLCAED BY ONE OF THE 4 MODES IN JAM-PLAYER-DISPLAY.SERVICj
+
+# jam-player-display waits for this service to complete
+# If device is provisioned, this exits immediately
+# If not provisioned, this waits until provisioning is complete
+Before=jam-player-display.service
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=notify
+
+# Run as root for display access
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Main script - exits when provisioned (or already provisioned)
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_setup_display.py
+
+# Cleanup any leftover display processes
+ExecStopPost=/usr/bin/pkill -f 'feh.*jam_setup.png' || true
+
+# Don't restart - this service completes its job and exits
+Restart=no
+
+# Watchdog (optional - 60 second timeout)
+WatchdogSec=60
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-setup-display
+
+[Install]
+WantedBy=multi-user.target

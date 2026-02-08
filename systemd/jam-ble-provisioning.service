@@ -1,0 +1,43 @@
+[Unit]
+Description=JAM Player BLE Provisioning - WiFi setup via Bluetooth
+Documentation=https://github.com/anthropics/jam-player
+
+# Wait for Bluetooth to be ready
+After=bluetooth.target
+Requires=bluetooth.target
+
+# Wait for first boot to complete (credentials generated)
+After=jam-first-boot.service
+
+# Wait for boot check to complete (system validation)
+After=jam-boot-check.service
+
+# Restart limits (in Unit section for older systemd versions)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_ble_provisioning.py
+
+# Run as root (needed for Bluetooth/D-Bus access)
+User=root
+
+# Restart on failure with backoff
+Restart=on-failure
+RestartSec=5
+
+# systemd watchdog - service must ping every 90s or it gets restarted
+# (Service pings every 30s, so 90s gives 3 chances)
+WatchdogSec=90
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-ble-provisioning
+
+[Install]
+WantedBy=multi-user.target

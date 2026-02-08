@@ -1,0 +1,22 @@
+[Unit]
+Description=Poll JAM backend for registration status every 30 minutes
+Documentation=https://github.com/anthropics/jam-player
+
+# Only run if not yet registered
+ConditionPathExists=!/etc/jam/device_data/.registered
+
+# Requires announce to have completed first
+ConditionPathExists=/etc/jam/device_data/.announced
+
+[Timer]
+# First run 2 minutes after boot (gives time for network to stabilize)
+OnBootSec=2min
+
+# Then every 30 minutes
+OnUnitActiveSec=30min
+
+# Persist timer across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

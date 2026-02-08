@@ -1,0 +1,39 @@
+[Unit]
+Description=JAM Player BLE State Manager - Controls BLE provisioning based on network state
+Documentation=https://github.com/anthropics/jam-player
+
+# Wait for NetworkManager to be ready (we monitor it via D-Bus)
+After=NetworkManager.service
+Requires=NetworkManager.service
+
+# Wait for boot check to complete
+After=jam-boot-check.service
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_ble_state_manager.py
+
+# Run as root (needed for D-Bus and systemctl access)
+User=root
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# systemd watchdog - service must ping every 90s
+WatchdogSec=90
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-ble-state-manager
+
+[Install]
+WantedBy=multi-user.target

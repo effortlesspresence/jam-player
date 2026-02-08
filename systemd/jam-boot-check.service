@@ -1,0 +1,35 @@
+[Unit]
+Description=JAM Player Boot Check - Validate system state on boot
+Documentation=https://github.com/effortlesspresence/jam-player-v2
+
+# Run after first-boot completes
+After=jam-first-boot.service
+After=network-online.target
+Wants=network-online.target
+
+# Run before other JAM services that depend on system state
+Before=jam-announce.service
+Before=jam-ble-provisioning.service
+Before=jam-content-manager.service
+Before=jam-player-display.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Run as root (needed to manage other services)
+User=root
+Group=root
+
+# Use the shared JAM venv
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_boot_check.py
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-boot-check
+
+# No restart - oneshot service, runs once per boot
+
+[Install]
+WantedBy=multi-user.target

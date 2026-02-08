@@ -1,0 +1,49 @@
+[Unit]
+Description=JAM Player Heartbeat - Reports device status to JAM backend
+Documentation=https://github.com/anthropics/jam-player
+
+# Only run when device is registered
+ConditionPathExists=/etc/jam/device_data/.registered
+
+# Requires first boot to have completed (credentials must exist)
+Requires=jam-first-boot.service
+After=jam-first-boot.service
+
+# Requires network
+After=network-online.target
+Wants=network-online.target
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+
+# Run as root
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Main script - sends heartbeat every 5 minutes
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_heartbeat.py
+
+# Always restart - this is critical for monitoring
+Restart=always
+RestartSec=30
+
+# Watchdog - must ping within 420 seconds (heartbeat interval is 5 min + buffer)
+WatchdogSec=420
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-heartbeat
+
+[Install]
+WantedBy=multi-user.target

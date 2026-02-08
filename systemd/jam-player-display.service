@@ -1,0 +1,53 @@
+[Unit]
+Description=JAM Player Display - Digital signage video playback
+Documentation=https://github.com/anthropics/jam-player
+
+# Wait for network to be online
+After=network-online.target
+Wants=network-online.target
+
+# Wait for content manager to start (it downloads the media we display)
+After=jam-content-manager.service
+Wants=jam-content-manager.service
+
+# Wait for boot check to complete
+After=jam-boot-check.service
+
+# Restart limits
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Run as root for display access
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/jam/services
+
+# Environment - DISPLAY and XAUTHORITY are required for MPV to render to the screen
+# XAUTHORITY points to comitup's X session cookie
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/comitup/.Xauthority
+Environment=PYTHONUNBUFFERED=1
+
+# Give content manager time to download initial content on first boot
+ExecStartPre=/bin/sleep 15
+
+# Run jam_player_app.py from the new location
+# Args: media_dir scenes_dir (still use legacy data dirs for now)
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_player_app.py /home/comitup/.jam/app_data/live_media /home/comitup/.jam/app_data/live_scenes
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-player-display
+
+[Install]
+WantedBy=multi-user.target
