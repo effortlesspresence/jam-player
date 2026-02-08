@@ -261,7 +261,6 @@ class MediaPlayer:
     def __init__(self, media_directory, scenes_directory):
         self.media_directory = Path(media_directory)
         self.scenes_directory = Path(scenes_directory)
-        self.default_image_path = Path('/home/comitup/.jam/static_images/ready_for_content.jpeg')
         self.running = True
 
         # Loop video state
@@ -286,7 +285,8 @@ class MediaPlayer:
             class OfflineApiClient:
                 jam_player_info = {}
                 try:
-                    json_path = "/home/comitup/.jam/device_data/jam_player_info.json"
+                    # JAM 2.0 uses /etc/jam for device data
+                    json_path = "/etc/jam/device_data/jam_player_info.json"
                     if os.path.exists(json_path):
                         with open(json_path, 'r') as f:
                             jam_player_info = json.load(f)

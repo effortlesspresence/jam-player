@@ -170,9 +170,9 @@ class JamApiClient:
             # Get the jam_player info
             jam_player_info = response.get("jam_player")
 
-            # Write the info to a file
-            os.makedirs(os.path.dirname("/home/comitup/.jam/device_data/jam_player_info.json"), exist_ok=True)
-            with open("/home/comitup/.jam/device_data/jam_player_info.json", 'w') as file:
+            # Write the info to a file (JAM 2.0 uses /etc/jam for device data)
+            os.makedirs("/etc/jam/device_data", exist_ok=True)
+            with open("/etc/jam/device_data/jam_player_info.json", 'w') as file:
                 json.dump(jam_player_info, file, indent=4)
 
             return jam_player_info
