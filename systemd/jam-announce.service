@@ -9,6 +9,9 @@ ConditionPathExists=!/etc/jam/device_data/.announced
 Requires=jam-first-boot.service
 After=jam-first-boot.service
 
+# Wait for update service to complete (ensures we have latest code)
+After=jam-update.service
+
 # Wait for boot check to complete (network readiness, system validation)
 After=jam-boot-check.service
 

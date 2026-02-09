@@ -7,6 +7,9 @@ After=jam-first-boot.service
 After=network-online.target
 Wants=network-online.target
 
+# Run after update service completes (ensures we have latest code)
+After=jam-update.service
+
 # Run before other JAM services that depend on system state
 Before=jam-announce.service
 Before=jam-ble-provisioning.service
