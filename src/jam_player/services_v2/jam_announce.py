@@ -31,6 +31,7 @@ from common.credentials import (
 )
 from common.api import get_api_base_url, api_request
 from common.paths import ANNOUNCED_FLAG
+from common.system import start_service
 
 logger = setup_service_logging('jam-announce')
 
@@ -125,7 +126,16 @@ def main():
         logger.info("Creating announced flag file")
         if set_device_announced():
             logger.info(f"Created {ANNOUNCED_FLAG}")
-            logger.info("Announcement complete! jam-registration-poller.timer will now start.")
+            logger.info("Announcement complete!")
+
+            # Start jam-tailscale.service now that we're announced
+            # On first boot, jam-tailscale.service may have already run and exited
+            # because the device wasn't announced yet. Now that we're announced,
+            # we can set up Tailscale for remote access.
+            if not start_service('jam-tailscale.service'):
+                # Not fatal - Tailscale can be set up on next boot
+                logger.warning("jam-tailscale.service did not start - will retry on next boot")
+
             sys.exit(0)
         else:
             logger.error("Failed to create announced flag file")
