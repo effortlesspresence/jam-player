@@ -109,7 +109,7 @@ logger = setup_service_logging('jam-ble-provisioning')
 # systemd Integration
 # ============================================================================
 
-from common.system import get_systemd_notifier, setup_signal_handlers, setup_glib_watchdog, manage_service
+from common.system import get_systemd_notifier, setup_signal_handlers, setup_glib_watchdog, manage_service, restart_service
 
 # SystemdNotifier lets us tell systemd:
 # - READY=1: Service has started successfully
@@ -992,6 +992,10 @@ class ProvisioningConfirmCharacteristic(Characteristic):
                 # its ConditionPathExists was evaluated at boot when .registered
                 # didn't exist yet.
                 manage_service('jam-heartbeat.service', should_run=True)
+
+                # Restart jam-player-display.service so it stops showing
+                # "Registered! Open JAM Setup..." and starts playing content
+                restart_service('jam-player-display.service')
             else:
                 logger.error("Failed to store provisioning confirmation")
 
