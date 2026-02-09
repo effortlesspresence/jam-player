@@ -228,8 +228,8 @@ def fetch_tailscale_credentials() -> Optional[Tuple[str, str]]:
     logger.info("Fetching Tailscale credentials from backend...")
 
     response = api_request(
-        method='POST',
-        path='/jam-players/tailscale-credentials',
+        method='GET',
+        path='/jam-players/tailscale-conn-info',
         signed=True,
         timeout=30
     )
