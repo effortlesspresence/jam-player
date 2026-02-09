@@ -35,6 +35,13 @@ from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import is_device_registered
 from common.api import api_request
 
+# Try to import PIL for update screen display
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 logger = setup_service_logging('jam-update')
 
 # =============================================================================
@@ -195,6 +202,157 @@ def get_latest_version(branch: str) -> Optional[str]:
 
     logger.error(f"Failed to get remote HEAD: {stderr}")
     return None
+
+
+# =============================================================================
+# Update Display Functions
+# =============================================================================
+
+# Display configuration
+BACKGROUND_COLOR = (20, 20, 30)  # Dark blue-grey
+TEXT_COLOR = (255, 255, 255)
+ACCENT_COLOR = (0, 180, 255)  # JAM blue
+
+# Global to track if we're showing the update screen
+_update_display_process = None
+
+
+def get_fb_size() -> tuple:
+    """Get framebuffer dimensions."""
+    try:
+        with open('/sys/class/graphics/fb0/virtual_size', 'r') as f:
+            w, h = f.read().strip().split(',')
+            return int(w), int(h)
+    except:
+        return 1920, 1080
+
+
+def get_font(size: int):
+    """Get a font, falling back to default if needed."""
+    if not HAS_PIL:
+        return None
+
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def create_updating_screen(width: int, height: int) -> Optional[Image.Image]:
+    """Create the 'Updating...' screen image."""
+    if not HAS_PIL:
+        logger.warning("PIL not available for creating update screen")
+        return None
+
+    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(72)
+    subtitle_font = get_font(36)
+
+    center_x = width // 2
+    center_y = height // 2
+
+    # Title
+    title = "Updating JAM Player..."
+    bbox = draw.textbbox((0, 0), title, font=title_font)
+    x = center_x - bbox[2] // 2
+    y = center_y - bbox[3] - 30
+    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
+
+    # Subtitle
+    subtitle = "Please wait. This may take a few minutes."
+    bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
+    x = center_x - bbox[2] // 2
+    y = center_y + 30
+    draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
+
+    # Warning
+    warning = "Do not disconnect power."
+    warning_font = get_font(28)
+    bbox = draw.textbbox((0, 0), warning, font=warning_font)
+    x = center_x - bbox[2] // 2
+    y = center_y + 100
+    draw.text((x, y), warning, font=warning_font, fill=(255, 100, 100))  # Red warning
+
+    return img
+
+
+def show_updating_screen():
+    """Display the updating screen using feh."""
+    global _update_display_process
+
+    if not HAS_PIL:
+        logger.warning("PIL not available, skipping update screen display")
+        return
+
+    logger.info("Displaying update screen...")
+
+    try:
+        # Get screen size and create image
+        width, height = get_fb_size()
+        img = create_updating_screen(width, height)
+        if img is None:
+            return
+
+        # Save to temp file
+        img_path = '/tmp/jam_updating.png'
+        img.save(img_path, 'PNG')
+        os.chmod(img_path, 0o644)
+
+        # Kill any existing feh processes first
+        subprocess.run(['pkill', '-f', 'feh'], capture_output=True, timeout=5)
+
+        # Wait for X display to be available (might not be ready yet on boot)
+        for _ in range(30):
+            result = subprocess.run(
+                ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'xdpyinfo'],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                break
+            import time
+            time.sleep(1)
+        else:
+            logger.warning("X display not available, skipping update screen")
+            return
+
+        # Display with feh
+        _update_display_process = subprocess.Popen(
+            ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'feh', '-F', '--hide-pointer', img_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        logger.info("Update screen displayed")
+
+    except Exception as e:
+        logger.warning(f"Failed to display update screen: {e}")
+
+
+def hide_updating_screen():
+    """Kill the updating screen display."""
+    global _update_display_process
+
+    if _update_display_process:
+        try:
+            _update_display_process.terminate()
+            _update_display_process.wait(timeout=5)
+        except:
+            pass
+        _update_display_process = None
+
+    # Also kill any feh showing our image
+    try:
+        subprocess.run(['pkill', '-f', 'feh.*jam_updating'], capture_output=True, timeout=5)
+    except:
+        pass
 
 
 # =============================================================================
@@ -543,28 +701,36 @@ def main():
     else:
         logger.info(f"Update available: {current_version[:12]}... -> {latest_version[:12]}...")
 
+    # Show updating screen to user
+    show_updating_screen()
+
     # Pull latest code
     if not pull_latest(branch):
+        hide_updating_screen()
         report_error("Failed to pull latest code from git")
         sys.exit(1)
 
     # Ensure venv exists
     if not ensure_venv_exists():
+        hide_updating_screen()
         report_error("Failed to create/verify virtual environment")
         sys.exit(1)
 
     # Install services
     if not install_services():
+        hide_updating_screen()
         report_error("Failed to install services")
         sys.exit(1)
 
     # Install dependencies
     if not install_dependencies():
+        hide_updating_screen()
         report_error("Failed to install dependencies")
         sys.exit(1)
 
     # Install systemd units
     if not install_systemd_units():
+        hide_updating_screen()
         report_error("Failed to install systemd units")
         sys.exit(1)
 
@@ -582,6 +748,9 @@ def main():
 
     # Restart services to pick up changes
     restart_services()
+
+    # Hide updating screen (jam-player-display.service will take over)
+    hide_updating_screen()
 
     logger.info("Update completed successfully!")
     sys.exit(0)

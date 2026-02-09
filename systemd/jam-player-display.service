@@ -1,24 +1,23 @@
 [Unit]
-Description=JAM Player Display - Digital signage video playback
+Description=JAM Player Display - Unified display manager for all display states
 Documentation=https://github.com/anthropics/jam-player
 
-# Wait for network to be online
-After=network-online.target
-Wants=network-online.target
+# Wait for first boot to complete (credentials must exist)
+After=jam-first-boot.service
 
-# Wait for content manager to start (it downloads the media we display)
-After=jam-content-manager.service
-Wants=jam-content-manager.service
-
-# Wait for boot check to complete
+# Wait for boot check to complete (validates system state)
 After=jam-boot-check.service
+
+# Wait for clock sync (for video wall-clock sync)
+After=time-sync.target
+Wants=time-sync.target
 
 # Restart limits
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
 
 # Run as root for display access
 User=root
@@ -27,22 +26,24 @@ Group=root
 # Working directory
 WorkingDirectory=/opt/jam/services
 
-# Environment - DISPLAY and XAUTHORITY are required for MPV to render to the screen
-# XAUTHORITY points to comitup's X session cookie
+# Environment - DISPLAY and XAUTHORITY are required for MPV/feh to render
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/comitup/.Xauthority
 Environment=PYTHONUNBUFFERED=1
 
-# Give content manager time to download initial content on first boot
-ExecStartPre=/bin/sleep 15
+# Run the unified display manager (handles all 4 display modes)
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_player_display.py
 
-# Run jam_player_app.py from the new location
-# Args: media_dir scenes_dir (still use legacy data dirs for now)
-ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_player_app.py /home/comitup/.jam/app_data/live_media /home/comitup/.jam/app_data/live_scenes
+# Clean up any display processes on stop
+ExecStopPost=-/usr/bin/pkill -f 'feh.*jam_display'
+ExecStopPost=-/usr/bin/pkill -f 'mpv.*mpv-socket'
 
-# Restart on failure
-Restart=on-failure
+# Always restart - display must always be running
+Restart=always
 RestartSec=5
+
+# Watchdog - service must ping within 60 seconds
+WatchdogSec=60
 
 # Logging
 StandardOutput=journal
