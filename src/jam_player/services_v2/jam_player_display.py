@@ -276,6 +276,10 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
             anchor="mm"
         )
 
+    # Version indicator in bottom-right corner (temporary - to verify deployment)
+    version_font = get_font(16)
+    draw.text((width - 50, height - 30), "v2", font=version_font, fill=SECONDARY_COLOR)
+
     return img
 
 
