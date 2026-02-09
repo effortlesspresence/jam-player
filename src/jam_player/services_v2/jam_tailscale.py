@@ -225,25 +225,29 @@ def fetch_tailscale_credentials() -> Optional[Tuple[str, str]]:
     Returns:
         Tuple of (client_id, client_secret) or None on failure.
     """
-    logger.info("Fetching Tailscale credentials from backend...")
+    from common.api import get_api_base_url
+
+    base_url = get_api_base_url()
+    endpoint = '/jam-players/tailscale-conn-info'
+    logger.info(f"Fetching Tailscale credentials from {base_url}{endpoint}")
 
     response = api_request(
         method='GET',
-        path='/jam-players/tailscale-conn-info',
+        path=endpoint,
         signed=True,
         timeout=30
     )
 
     if not response:
-        logger.error("No response from backend")
+        logger.error(f"No response from backend - request to {base_url}{endpoint} failed (timeout, connection error, or signing failure)")
         return None
 
     if response.status_code == 401:
-        logger.error("Authentication failed - device may not be announced yet")
+        logger.error(f"Authentication failed (401) - device may not be announced or signature invalid. Response: {response.text}")
         return None
 
     if response.status_code != 200:
-        logger.error(f"Backend returned status {response.status_code}")
+        logger.error(f"Backend returned status {response.status_code}: {response.text}")
         return None
 
     try:
@@ -252,13 +256,13 @@ def fetch_tailscale_credentials() -> Optional[Tuple[str, str]]:
         client_secret = data.get('clientSecret')
 
         if client_id and client_secret:
-            logger.info("Received Tailscale credentials")
+            logger.info("Received Tailscale credentials successfully")
             return client_id, client_secret
         else:
-            logger.error("Invalid credentials response from backend")
+            logger.error(f"Invalid credentials response - missing clientId or clientSecret. Response: {data}")
             return None
     except Exception as e:
-        logger.error(f"Error parsing credentials response: {e}")
+        logger.error(f"Error parsing credentials response: {e}. Raw response: {response.text}")
         return None
 
 
