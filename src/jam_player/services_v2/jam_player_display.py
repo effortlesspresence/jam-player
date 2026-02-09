@@ -871,6 +871,14 @@ class JamPlayerDisplayManager:
 
             current_scene_index += 1
 
+    def _check_content_updated(self) -> bool:
+        """Check if scenes.json has been updated since we last loaded it."""
+        scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
+        if not scenes_file.exists():
+            return False
+        current_mtime = scenes_file.stat().st_mtime
+        return hasattr(self, '_last_scenes_mtime') and current_mtime != self._last_scenes_mtime
+
     def _wait_for_video_end(self) -> bool:
         """Wait for the current video to finish. Returns False if interrupted."""
         # Get video duration
@@ -890,11 +898,21 @@ class JamPlayerDisplayManager:
         logger.info(f"Video duration: {duration:.1f}s")
 
         start_time = time.time()
+        last_content_check = start_time
         while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
+            current_time = time.time()
+
             # Check for state changes
-            if time.time() - start_time > 5:
+            if current_time - start_time > 5:
                 new_mode = self.determine_display_mode()
                 if new_mode != self.current_mode:
+                    return False
+
+            # Check for content updates every second
+            if current_time - last_content_check >= 1:
+                last_content_check = current_time
+                if self._check_content_updated():
+                    logger.info("Content updated during video playback, interrupting")
                     return False
 
             # Check if video ended
@@ -904,7 +922,7 @@ class JamPlayerDisplayManager:
                 return True
 
             # Safety timeout
-            if time.time() - start_time > duration + 5:
+            if current_time - start_time > duration + 5:
                 logger.warning("Video timeout, moving to next scene")
                 return True
 
@@ -919,18 +937,27 @@ class JamPlayerDisplayManager:
 
         start_time = time.time()
         last_state_check = start_time
+        last_content_check = start_time
 
         while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
-            elapsed = time.time() - start_time
+            current_time = time.time()
+            elapsed = current_time - start_time
 
             if elapsed >= duration_seconds:
                 return True
 
             # Check for state changes periodically
-            if time.time() - last_state_check >= 5:
-                last_state_check = time.time()
+            if current_time - last_state_check >= 5:
+                last_state_check = current_time
                 new_mode = self.determine_display_mode()
                 if new_mode != self.current_mode:
+                    return False
+
+            # Check for content updates every second
+            if current_time - last_content_check >= 1:
+                last_content_check = current_time
+                if self._check_content_updated():
+                    logger.info("Content updated during image display, interrupting")
                     return False
 
             sd_notifier.notify("WATCHDOG=1")

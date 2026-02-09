@@ -33,7 +33,7 @@ LIVE_MEDIA_DIR = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
 STAGED_SCENES_DIR = Path(constants.APP_DATA_STAGED_SCENES_DIR)
 
 # Polling interval in seconds
-POLL_INTERVAL_SECONDS = 9
+POLL_INTERVAL_SECONDS = 7
 
 
 def hash_string(input_string: str) -> str:
