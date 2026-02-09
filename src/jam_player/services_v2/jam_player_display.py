@@ -1031,7 +1031,10 @@ class JamPlayerDisplayManager:
         logger.info(f"Screen: {self.screen_width}x{self.screen_height}")
         logger.info("=" * 60)
 
+        # Send READY=1 immediately - we're initialized and entering main loop
+        # Display availability is handled within the loop, not a startup blocker
         sd_notifier.notify("READY=1")
+        logger.info("Service ready, entering main loop")
 
         last_state_check = 0
 

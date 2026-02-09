@@ -597,25 +597,72 @@ def install_logrotate_config():
 
 
 def restart_services():
-    """Restart JAM services to pick up new code."""
+    """
+    Restart JAM services to pick up new code.
+
+    Uses --no-block to avoid waiting for each service to fully start.
+    Type=notify services can take time to initialize, and we don't want
+    the update process to hang waiting for them.
+
+    After triggering all restarts, we verify services are starting correctly.
+    """
     logger.info("Restarting JAM services...")
 
+    # Services to restart - ordered by dependency (independent ones first)
     services_to_restart = [
-        'jam-content-manager.service',
-        'jam-player-display.service',
-        'jam-ble-state-manager.service',
-        'jam-health-monitor.service',
-        'jam-heartbeat.service',
-        'jam-tailscale.service',
+        'jam-content-manager.service',    # Type=simple, starts fast
+        'jam-ble-state-manager.service',  # Type=notify, but sends READY=1 early
+        'jam-player-display.service',     # Type=notify, sends READY=1 early
+        'jam-health-monitor.service',     # Type=notify, sends READY=1 early
+        'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
+        'jam-tailscale.service',          # Type=oneshot, runs once
     ]
 
+    # Trigger all restarts with --no-block to avoid waiting
+    # This is more reliable than waiting for Type=notify services
+    logger.info("  Triggering service restarts (non-blocking)...")
     for service in services_to_restart:
-        # Use shorter timeout - if restart takes >30s something is wrong
-        success, _, stderr = run_command(['systemctl', 'restart', service], timeout=30)
+        success, _, stderr = run_command(
+            ['systemctl', 'restart', '--no-block', service],
+            timeout=10
+        )
         if success:
-            logger.info(f"  Restarted {service}")
+            logger.info(f"    Triggered restart: {service}")
         else:
-            logger.warning(f"  Failed to restart {service}: {stderr[:100] if stderr else 'timeout'}")
+            # Log warning but continue - the service might just not be enabled
+            logger.warning(f"    Failed to trigger restart for {service}: {stderr[:100] if stderr else 'unknown'}")
+
+    # Give services a moment to start
+    import time
+    logger.info("  Waiting for services to initialize...")
+    time.sleep(5)
+
+    # Verify critical services are running or starting
+    # We check for 'active' or 'activating' status
+    logger.info("  Verifying service status...")
+    critical_services = [
+        'jam-player-display.service',
+        'jam-ble-state-manager.service',
+        'jam-content-manager.service',
+    ]
+
+    all_ok = True
+    for service in critical_services:
+        success, stdout, _ = run_command(
+            ['systemctl', 'is-active', service],
+            timeout=5
+        )
+        status = stdout.strip() if stdout else 'unknown'
+        if status in ('active', 'activating'):
+            logger.info(f"    {service}: {status}")
+        else:
+            logger.warning(f"    {service}: {status} (may need attention)")
+            all_ok = False
+
+    if all_ok:
+        logger.info("  All critical services running")
+    else:
+        logger.warning("  Some services may not have started correctly - health monitor will handle recovery")
 
 
 # =============================================================================

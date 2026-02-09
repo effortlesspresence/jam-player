@@ -573,10 +573,16 @@ class BLEStateManager:
         """
         self.mainloop = mainloop
 
+        # Notify systemd we're ready IMMEDIATELY
+        # Initial state check happens asynchronously - don't block service startup
+        sd_notifier.notify("READY=1")
+        logger.info("BLE state manager service ready, starting initialization...")
+
         # Setup signal handler for NM state changes
         self.setup_signal_handler()
 
         # Check and apply initial state
+        # This may take several seconds for connectivity checks, but service is already "ready"
         self.check_initial_state()
 
         # Setup periodic internet connectivity checks
@@ -594,9 +600,7 @@ class BLEStateManager:
         # Setup watchdog pinging
         setup_glib_watchdog(WATCHDOG_INTERVAL)
 
-        # Notify systemd we're ready
-        sd_notifier.notify("READY=1")
-        logger.info("BLE state manager ready and monitoring internet connectivity")
+        logger.info("BLE state manager fully initialized and monitoring")
 
 
 # ============================================================================

@@ -9,9 +9,6 @@ Wants=network-online.target
 # Wait for boot check to complete
 After=jam-boot-check.service
 
-# Wait for setup display to complete (device must be provisioned)
-After=jam-setup-display.service
-
 # Wait for the services we monitor to have a chance to start
 After=jam-ble-state-manager.service
 After=jam-content-manager.service

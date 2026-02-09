@@ -151,15 +151,16 @@ def main():
         logger.error("Device is not registered - heartbeat service should not be running")
         sys.exit(1)
 
+    # Tell systemd we're ready IMMEDIATELY - don't block on timezone application
+    notifier.notify("READY=1")
+    logger.info("Service started, sending heartbeats every 5 minutes")
+
     # Apply stored timezone on startup (in case device rebooted)
+    # This happens AFTER READY=1 to avoid blocking service startup
     stored_timezone = get_location_timezone()
     if stored_timezone:
         logger.info(f"Applying stored timezone on startup: {stored_timezone}")
         apply_system_timezone(stored_timezone)
-
-    # Tell systemd we're ready
-    notifier.notify("READY=1")
-    logger.info("Service started, sending heartbeats every 5 minutes")
 
     consecutive_failures = 0
     current_retry_delay = INITIAL_RETRY_DELAY
