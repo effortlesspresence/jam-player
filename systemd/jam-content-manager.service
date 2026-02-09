@@ -2,9 +2,9 @@
 Description=JAM Player Content Manager - Downloads and manages content
 Documentation=https://github.com/anthropics/jam-player
 
-# Wait for network to be online
-After=network-online.target
-Wants=network-online.target
+# Wait for network and synced clock (for SSL certificate validation)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 # Wait for boot check to complete
 After=jam-boot-check.service

@@ -9,9 +9,9 @@ ConditionPathExists=/etc/jam/device_data/.registered
 Requires=jam-first-boot.service
 After=jam-first-boot.service
 
-# Requires network
-After=network-online.target
-Wants=network-online.target
+# Requires network and synced clock (for SSL certificate validation)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 # Restart limits
 StartLimitIntervalSec=300

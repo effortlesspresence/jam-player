@@ -2,9 +2,10 @@
 Description=JAM Player Update Service - Checks for and installs updates on boot
 Documentation=https://github.com/anthropics/jam-player
 
-# Run early in boot, after network is available
-After=network-online.target
-Wants=network-online.target
+# Run early in boot, after network is available and clock is synced
+# time-sync.target ensures NTP has synced (critical for SSL certificate validation)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 # Run after first boot completes (credentials must exist for error reporting)
 After=jam-first-boot.service

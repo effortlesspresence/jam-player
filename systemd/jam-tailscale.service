@@ -2,9 +2,9 @@
 Description=JAM Player Tailscale - Ensures remote access is configured
 Documentation=https://github.com/effortlesspresence/jam-player
 
-# Requires network
-After=network-online.target
-Wants=network-online.target
+# Requires network and synced clock (for SSL certificate validation)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 # Run after first boot (ensures device UUID exists for hostname)
 After=jam-first-boot.service
