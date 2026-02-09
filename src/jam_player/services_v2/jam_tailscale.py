@@ -50,7 +50,7 @@ TAILSCALE_OAUTH_URL = f"{TAILSCALE_API}/oauth/token"
 TAILSCALE_TAILNET = "effortlesspresence.com"
 
 # Connection check settings
-MAX_CONNECTION_WAIT = 120  # seconds to wait for existing connection
+MAX_CONNECTION_WAIT = 60  # seconds to wait for existing connection
 
 
 def run_command(cmd: list, timeout: int = 30) -> Tuple[bool, str, str]:
