@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import is_device_registered
 from common.api import api_request
+from common.paths import ENVIRONMENT_FILE
 
 # Try to import PIL for update screen display
 try:
@@ -72,9 +73,6 @@ LEGACY_APP_VENV = LEGACY_JAM_DIR / 'jam_player_virtual_env'
 LEGACY_SCRIPTS_VENV = LEGACY_JAM_DIR / 'scripts' / 'jam_scripts_venv'
 LEGACY_JAM_REPO = Path('/home/comitup/jam')  # Old combined repo
 
-# Demo mode file - if exists and not "false", use its contents as git branch
-DEMO_MODE_FILE = Path('/home/comitup/.DEMO_MODE')
-
 # Git settings
 GIT_REMOTE = 'origin'
 GIT_BRANCH_DEFAULT = 'main'
@@ -86,13 +84,15 @@ def get_git_branch() -> str:
     """
     Get the git branch to use for updates.
 
-    If ~/.DEMO_MODE exists and contains a value other than "false",
-    use that value as the branch name. Otherwise use 'main'.
+    If /etc/jam/config/environment exists and contains a value other than
+    "false" or "prod", use that value as the branch name. Otherwise use 'main'.
+
+    The environment file is set during device provisioning or migration from 1.0.
     """
-    if DEMO_MODE_FILE.exists():
+    if ENVIRONMENT_FILE.exists():
         try:
-            content = DEMO_MODE_FILE.read_text().strip()
-            if content and content.lower() != 'false':
+            content = ENVIRONMENT_FILE.read_text().strip()
+            if content and content.lower() not in ('false', 'prod'):
                 return content
         except Exception:
             pass
@@ -713,10 +713,10 @@ def main():
     # Configure git to trust the repo (runs as root, repo owned by comitup)
     configure_git_safe_directory()
 
-    # Determine which branch to use (supports DEMO_MODE)
+    # Determine which branch to use (supports non-prod environments)
     branch = get_git_branch()
     if branch != GIT_BRANCH_DEFAULT:
-        logger.info(f"DEMO_MODE active: using branch '{branch}'")
+        logger.info(f"Environment override: using branch '{branch}'")
 
     # Get current version
     current_version = get_current_version()
