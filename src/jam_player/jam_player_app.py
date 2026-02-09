@@ -1,20 +1,12 @@
 """
-JAM Player Application with Enterprise-Grade Wall-Clock Synchronization
+JAM Player 2.0 - Media Player Application
 
-This player uses epoch-based timing with continuous speed adjustment to ensure
-multiple devices displaying the same content stay perfectly in sync (<50ms).
+This player displays scenes sequentially:
+- Images are displayed for their configured timeToDisplay duration
+- Videos play fully before moving to the next scene
+- Scenes cycle continuously in order
 
-Sync Strategy:
-1. All devices calculate expected position from wall clock: position = time % duration
-2. Continuous monitoring compares actual vs expected position
-3. Speed adjustment (not seeking) corrects drift smoothly without visual glitches
-4. Seek is only used for large offsets (>500ms) or initial sync
-
-This approach handles:
-- Devices starting at different times
-- Devices restarting independently
-- Content updates at different times
-- One device being unplugged and reconnected
+Uses MPV for all media playback (both images and videos).
 """
 
 import os
@@ -25,41 +17,20 @@ import subprocess
 from pathlib import Path
 import signal
 import sys
-from datetime import datetime
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Dict, Any
 
+from jam_player import constants
 from jam_player.utils import scene_update_flag_utils as sufu
 from jam_player.utils import logging_utils as lu
 from jam_player.utils import system_utils as su
-from jam_player.clients.jam_api_client import JamApiClient
 
 logger = lu.get_logger("jam_player_app")
 
 
-# Sync configuration constants
-SYNC_CHECK_INTERVAL_MS = 200      # Check sync every 200ms
-SEEK_THRESHOLD_MS = 500           # Only seek if drift > 500ms (emergency)
-TARGET_SYNC_TOLERANCE_MS = 10     # Consider "in sync" if within 10ms
-
-# Proportional speed control thresholds and speeds
-# Offset ranges and corresponding speed adjustments:
-#   0-10ms:   normal speed (1.0x)
-#   10-30ms:  gentle correction (1.01x / 0.99x)
-#   30-100ms: moderate correction (1.03x / 0.97x)
-#   100-500ms: aggressive correction (1.05x / 0.95x)
-SPEED_NORMAL = 1.0
-SPEED_GENTLE_FAST = 1.01
-SPEED_GENTLE_SLOW = 0.99
-SPEED_MODERATE_FAST = 1.03
-SPEED_MODERATE_SLOW = 0.97
-SPEED_AGGRESSIVE_FAST = 1.05
-SPEED_AGGRESSIVE_SLOW = 0.95
-
-
-class MpvIpcClient:
+class MpvController:
     """
-    Client for controlling MPV via JSON IPC protocol.
-    Embedded here to avoid import issues during deployment.
+    Controller for MPV media player via JSON IPC protocol.
+    Handles both video and image display.
     """
 
     def __init__(self, socket_path: str = "/tmp/mpv-socket"):
@@ -68,7 +39,7 @@ class MpvIpcClient:
         self.socket: Optional[socket.socket] = None
         self._request_id = 0
 
-    def start_mpv(self, rotation_angle: int = 0) -> bool:
+    def start(self, rotation_angle: int = 0) -> bool:
         """Start MPV process with IPC socket enabled."""
         if os.path.exists(self.socket_path):
             try:
@@ -76,7 +47,7 @@ class MpvIpcClient:
             except OSError:
                 pass
 
-        self.stop_mpv()
+        self.stop()
 
         args = [
             'mpv',
@@ -89,10 +60,8 @@ class MpvIpcClient:
             '--force-window=yes',
             '--no-terminal',
             '--keep-open=yes',
-            '--loop-file=inf',
+            '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
-            '--hr-seek-framedrop=no',  # Don't drop frames during seek
-            '--video-sync=audio',       # Sync video to audio clock
             '--cache=yes',
             '--demuxer-max-bytes=150M',
             '--demuxer-readahead-secs=20',
@@ -108,6 +77,7 @@ class MpvIpcClient:
                 stderr=subprocess.DEVNULL
             )
 
+            # Wait for socket to be created
             for _ in range(50):
                 if os.path.exists(self.socket_path):
                     time.sleep(0.1)
@@ -121,7 +91,7 @@ class MpvIpcClient:
             logger.error(f"Failed to start MPV: {e}")
             return False
 
-    def stop_mpv(self):
+    def stop(self):
         """Stop the MPV process and clean up."""
         if self.socket:
             try:
@@ -204,7 +174,6 @@ class MpvIpcClient:
                                 if resp.get('error') == 'success':
                                     return resp.get('data')
                                 else:
-                                    # Don't log for common "property unavailable" errors
                                     err = resp.get('error', '')
                                     if 'unavailable' not in err.lower():
                                         logger.warning(f"MPV command {command[0]} error: {err}")
@@ -225,20 +194,16 @@ class MpvIpcClient:
 
     def load_file(self, filepath: str) -> bool:
         """Load a media file into MPV."""
-        result = self._send_command(['loadfile', filepath, 'replace'])
+        self._send_command(['loadfile', filepath, 'replace'])
         return True
-
-    def seek(self, position_seconds: float) -> bool:
-        """Seek to a position in seconds (absolute)."""
-        return self._send_command(['seek', str(position_seconds), 'absolute']) is not None
-
-    def set_property(self, name: str, value: Any) -> bool:
-        """Set an MPV property value."""
-        return self._send_command(['set_property', name, value]) is not None
 
     def get_property(self, name: str) -> Optional[Any]:
         """Get an MPV property value."""
         return self._send_command(['get_property', name])
+
+    def set_property(self, name: str, value: Any) -> bool:
+        """Set an MPV property value."""
+        return self._send_command(['set_property', name, value]) is not None
 
     def get_duration(self) -> Optional[float]:
         """Get the duration of the current file in seconds."""
@@ -248,367 +213,278 @@ class MpvIpcClient:
         """Get the current playback position in seconds."""
         return self.get_property('playback-time')
 
-    def set_speed(self, speed: float) -> bool:
-        """Set playback speed (1.0 = normal)."""
-        return self.set_property('speed', speed)
+    def is_paused(self) -> bool:
+        """Check if playback is paused."""
+        return self.get_property('pause') == True
 
-    def get_speed(self) -> Optional[float]:
-        """Get current playback speed."""
-        return self.get_property('speed')
+    def get_eof_reached(self) -> bool:
+        """Check if end of file has been reached."""
+        return self.get_property('eof-reached') == True
 
 
-class MediaPlayer:
-    def __init__(self, media_directory, scenes_directory):
+class JamPlayer:
+    """
+    Main JAM Player application.
+    Displays scenes sequentially, cycling continuously.
+    """
+
+    def __init__(self, media_directory: str, scenes_directory: str):
         self.media_directory = Path(media_directory)
         self.scenes_directory = Path(scenes_directory)
         self.running = True
 
-        # Loop video state
-        self.loop_video_path: Optional[Path] = None
-        self.loop_duration_ms: int = 0
-        self.is_playing: bool = False
+        # Scene state
+        self.scenes: List[Dict[str, Any]] = []
+        self.current_scene_index = 0
 
-        # Sync state
-        self.current_speed: float = SPEED_NORMAL
-        self.last_sync_log_time: float = 0
-        self.sync_stats = {'adjustments': 0, 'seeks': 0, 'in_sync_count': 0}
+        # Initialize MPV controller
+        self.mpv = MpvController()
 
-        # Initialize MPV IPC client
-        self.mpv = MpvIpcClient()
+        # Get screen orientation
+        self.rotation_angle = self._get_rotation_angle()
 
-        # Get orientation from JAM client
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _get_rotation_angle(self) -> int:
+        """Get the screen rotation angle from JAM player info."""
         try:
-            self.jam_client = JamApiClient(logger)
+            # Try to read orientation from jam_player_info.json
+            json_path = Path("/etc/jam/device_data/jam_player_info.json")
+            if json_path.exists():
+                with open(json_path, 'r') as f:
+                    info = json.load(f)
+                    orientation = info.get("orientation", "LANDSCAPE")
+                    screen_config = su.get_screen_config(orientation)
+                    return screen_config.get_pygame_rotation()
         except Exception as e:
-            logger.error(f"Caught exception initializing JamApiClient: {e}")
+            logger.warning(f"Could not read orientation: {e}")
 
-            class OfflineApiClient:
-                jam_player_info = {}
-                try:
-                    # JAM 2.0 uses /etc/jam for device data
-                    json_path = "/etc/jam/device_data/jam_player_info.json"
-                    if os.path.exists(json_path):
-                        with open(json_path, 'r') as f:
-                            jam_player_info = json.load(f)
-                except Exception as e:
-                    logger.error(f"Error reading jam_player_info.json: {e}")
+        return 0  # Default to no rotation
 
-            self.jam_client = OfflineApiClient()
-            logger.info(
-                f"Using offline API client ... jam_player_info: {self.jam_client.jam_player_info}"
-            )
-
-        orientation = self.jam_client.jam_player_info.get("orientation", "LANDSCAPE")
-        logger.info(f"    Detected JAM Player Orientation: {orientation}")
-        self.screen_config = su.get_screen_config(orientation)
-
-        # Set up signal handler for graceful shutdown
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-
-    def signal_handler(self, signum, frame):
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals."""
+        logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
-        self.cleanup()
-        sys.exit(0)
 
-    def cleanup(self):
-        """Clean up resources and ensure process termination"""
-        logger.info("Cleaning up MPV...")
-        self.mpv.stop_mpv()
-
-    def get_current_wall_clock_ms(self) -> int:
-        """Get current wall clock time in milliseconds since epoch."""
-        return int(time.time() * 1000)
-
-    def find_loop_video(self) -> Optional[Path]:
+    def load_scenes(self) -> bool:
         """
-        Find the video to play as the loop.
-
-        Priority:
-        1. loop.mp4 in media directory (backend-generated stitched video)
-        2. Single video scene (for testing)
-        """
-        # Check for backend-generated loop file
-        loop_file = self.media_directory / "loop.mp4"
-        if loop_file.exists():
-            logger.info(f"Found backend-generated loop: {loop_file}")
-            return loop_file
-
-        # Fall back to finding a single video scene (for testing)
-        video_files = []
-        for scene_file in self.scenes_directory.glob('*.json'):
-            try:
-                with open(scene_file, 'r') as f:
-                    scene = json.load(f)
-                    if scene.get('media_type') in ('VIDEO', 'BRAND_VIDEO'):
-                        media_path = self.media_directory / scene['media_file']
-                        if media_path.exists():
-                            video_files.append(media_path)
-            except Exception as e:
-                logger.error(f"Error reading scene file {scene_file}: {e}")
-
-        if len(video_files) == 1:
-            logger.info(f"Found single video scene for loop testing: {video_files[0]}")
-            return video_files[0]
-        elif len(video_files) > 1:
-            logger.info(f"Found {len(video_files)} video scenes - using first one for testing")
-            return video_files[0]
-
-        logger.warning("No loop video found")
-        return None
-
-    def calculate_expected_position_ms(self, duration_ms: int) -> int:
-        """
-        Calculate where in the loop we should be right now based on wall clock.
-
-        This is the core sync algorithm - all devices with the same duration
-        will calculate the same position at the same wall clock time.
-        """
-        current_time_ms = self.get_current_wall_clock_ms()
-        position_ms = current_time_ms % duration_ms
-        return position_ms
-
-    def get_sync_offset_ms(self, duration_ms: int) -> Optional[int]:
-        """
-        Calculate the offset between actual and expected position.
+        Load scenes from the scenes.json file.
 
         Returns:
-            Positive value = actual is AHEAD of expected (need to slow down)
-            Negative value = actual is BEHIND expected (need to speed up)
-            None if unable to determine
+            True if scenes were loaded successfully.
         """
-        expected_ms = self.calculate_expected_position_ms(duration_ms)
-        actual_sec = self.mpv.get_playback_time()
+        scenes_file = self.scenes_directory / "scenes.json"
 
-        if actual_sec is None:
-            return None
+        if not scenes_file.exists():
+            logger.warning(f"Scenes file not found: {scenes_file}")
+            return False
 
-        actual_ms = int(actual_sec * 1000)
+        try:
+            with open(scenes_file, 'r') as f:
+                scenes = json.load(f)
 
-        # Calculate raw offset
-        offset_ms = actual_ms - expected_ms
+            # Sort by order to ensure correct display sequence
+            scenes.sort(key=lambda s: s.get('order', 0))
 
-        # Handle wrap-around near loop boundary
-        # If offset is more than half the duration, we wrapped
-        if offset_ms > duration_ms / 2:
-            offset_ms = offset_ms - duration_ms
-        elif offset_ms < -duration_ms / 2:
-            offset_ms = offset_ms + duration_ms
+            self.scenes = scenes
+            logger.info(f"Loaded {len(self.scenes)} scenes")
 
-        return offset_ms
+            for i, scene in enumerate(self.scenes):
+                logger.info(f"  Scene {i}: {scene.get('id')} - {scene.get('media_type')} - {scene.get('media_file')}")
 
-    def adjust_sync(self, duration_ms: int) -> None:
+            return len(self.scenes) > 0
+
+        except Exception as e:
+            logger.error(f"Error loading scenes: {e}", exc_info=True)
+            return False
+
+    def display_scene(self, scene: Dict[str, Any]) -> bool:
         """
-        Core sync adjustment logic using proportional speed control.
+        Display a single scene.
 
-        This is called frequently (every ~200ms) and makes speed
-        adjustments proportional to the offset magnitude.
+        For images: displays for timeToDisplay seconds
+        For videos: plays the full video
+
+        Args:
+            scene: Scene dict with media_file, media_type, time_to_display
+
+        Returns:
+            True if scene was displayed successfully.
         """
-        offset_ms = self.get_sync_offset_ms(duration_ms)
+        media_file = scene.get('media_file')
+        media_type = scene.get('media_type', 'IMAGE')
+        time_to_display = scene.get('time_to_display', 15)
 
-        if offset_ms is None:
-            return
+        media_path = self.media_directory / media_file
 
-        abs_offset = abs(offset_ms)
-        current_time = time.time()
+        if not media_path.exists():
+            logger.error(f"Media file not found: {media_path}")
+            return False
 
-        # Determine action based on offset magnitude (proportional control)
-        if abs_offset > SEEK_THRESHOLD_MS:
-            # Very large offset - emergency seek required
-            expected_ms = self.calculate_expected_position_ms(duration_ms)
-            expected_sec = expected_ms / 1000.0
-            logger.warning(f"EMERGENCY SEEK: offset={offset_ms}ms, seeking to {expected_sec:.2f}s")
-            self.mpv.seek(expected_sec)
-            self.mpv.set_speed(SPEED_NORMAL)
-            self.current_speed = SPEED_NORMAL
-            self.sync_stats['seeks'] += 1
+        logger.info(f"Displaying scene: {scene.get('id')} ({media_type})")
 
-        elif abs_offset > 100:
-            # Large offset (100-500ms) - aggressive correction
-            new_speed = SPEED_AGGRESSIVE_FAST if offset_ms < 0 else SPEED_AGGRESSIVE_SLOW
-            if new_speed != self.current_speed:
-                self.mpv.set_speed(new_speed)
-                self.current_speed = new_speed
-                self.sync_stats['adjustments'] += 1
+        # Load the file
+        self.mpv.load_file(str(media_path))
 
-        elif abs_offset > 30:
-            # Moderate offset (30-100ms) - moderate correction
-            new_speed = SPEED_MODERATE_FAST if offset_ms < 0 else SPEED_MODERATE_SLOW
-            if new_speed != self.current_speed:
-                self.mpv.set_speed(new_speed)
-                self.current_speed = new_speed
-                self.sync_stats['adjustments'] += 1
-
-        elif abs_offset > TARGET_SYNC_TOLERANCE_MS:
-            # Small offset (10-30ms) - gentle correction
-            new_speed = SPEED_GENTLE_FAST if offset_ms < 0 else SPEED_GENTLE_SLOW
-            if new_speed != self.current_speed:
-                self.mpv.set_speed(new_speed)
-                self.current_speed = new_speed
-                self.sync_stats['adjustments'] += 1
-
-        else:
-            # In sync (0-10ms) - normal speed
-            if self.current_speed != SPEED_NORMAL:
-                self.mpv.set_speed(SPEED_NORMAL)
-                self.current_speed = SPEED_NORMAL
-            self.sync_stats['in_sync_count'] += 1
-
-        # Log sync status periodically (every 5 seconds)
-        if current_time - self.last_sync_log_time >= 5.0:
-            self.last_sync_log_time = current_time
-            speed_str = f"{self.current_speed:.2f}x" if self.current_speed != 1.0 else "1.0x"
-            status = "IN_SYNC" if abs_offset <= TARGET_SYNC_TOLERANCE_MS else "ADJUSTING"
-
-            # Get detailed position info for diagnostics
-            wall_clock_ms = self.get_current_wall_clock_ms()
-            expected_ms = self.calculate_expected_position_ms(duration_ms)
-            actual_sec = self.mpv.get_playback_time()
-            actual_ms = int(actual_sec * 1000) if actual_sec else 0
-
-            logger.info(
-                f"SYNC [{status}]: offset={offset_ms:+d}ms speed={speed_str} "
-                f"| wall={wall_clock_ms} expected={expected_ms}ms actual={actual_ms}ms "
-                f"| stats={{seeks:{self.sync_stats['seeks']}, adj:{self.sync_stats['adjustments']}, sync:{self.sync_stats['in_sync_count']}}}"
-            )
-
-    def initial_sync(self, duration_ms: int) -> bool:
-        """
-        Perform initial synchronization when starting playback.
-
-        Waits for a "clean" time boundary to minimize initial offset variance.
-        """
-        # Calculate target position
-        expected_ms = self.calculate_expected_position_ms(duration_ms)
-        expected_sec = expected_ms / 1000.0
-
-        wall_clock_ms = self.get_current_wall_clock_ms()
-        logger.info(
-            f"INITIAL SYNC: wall_clock={wall_clock_ms} "
-            f"duration={duration_ms}ms target_position={expected_ms}ms ({expected_sec:.3f}s)"
-        )
-
-        # Seek to calculated position
-        self.mpv.seek(expected_sec)
-
-        # Ensure playing at normal speed
-        self.mpv.set_property('pause', False)
-        self.mpv.set_speed(SPEED_NORMAL)
-        self.current_speed = SPEED_NORMAL
-
-        # Wait a moment for seek to complete, then verify
+        # Wait a moment for file to load
         time.sleep(0.3)
 
-        # Check initial offset
-        offset_ms = self.get_sync_offset_ms(duration_ms)
-        if offset_ms is not None:
-            logger.info(f"INITIAL SYNC COMPLETE: initial_offset={offset_ms:+d}ms")
+        if media_type == 'VIDEO':
+            # For videos, wait until the video ends
+            return self._wait_for_video_end()
         else:
-            logger.warning("INITIAL SYNC: Could not verify offset")
+            # For images, wait for the configured duration
+            return self._wait_for_duration(time_to_display)
 
-        return True
+    def _wait_for_video_end(self) -> bool:
+        """
+        Wait for the current video to finish playing.
+
+        Returns:
+            True if video finished, False if interrupted.
+        """
+        # First, wait for duration to become available
+        duration = None
+        for _ in range(30):  # Wait up to 15 seconds
+            if not self.running:
+                return False
+            if sufu.should_reload_scenes():
+                return False
+
+            duration = self.mpv.get_duration()
+            if duration is not None and duration > 0:
+                break
+            time.sleep(0.5)
+
+        if duration is None:
+            logger.warning("Could not get video duration, using 30s fallback")
+            duration = 30
+
+        logger.info(f"Video duration: {duration:.1f}s")
+
+        # Wait for video to finish
+        start_time = time.time()
+        while self.running:
+            # Check for content updates
+            if sufu.should_reload_scenes():
+                logger.info("Content update detected during video playback")
+                return False
+
+            # Check if video has ended
+            if self.mpv.get_eof_reached():
+                logger.info("Video playback complete")
+                return True
+
+            # Safety timeout (duration + 5 seconds buffer)
+            elapsed = time.time() - start_time
+            if elapsed > duration + 5:
+                logger.warning("Video playback timeout, moving to next scene")
+                return True
+
+            time.sleep(0.1)
+
+        return False
+
+    def _wait_for_duration(self, duration_seconds: int) -> bool:
+        """
+        Wait for the specified duration.
+
+        Args:
+            duration_seconds: How long to display the image
+
+        Returns:
+            True if duration completed, False if interrupted.
+        """
+        logger.info(f"Displaying image for {duration_seconds}s")
+
+        start_time = time.time()
+        while self.running:
+            # Check for content updates
+            if sufu.should_reload_scenes():
+                logger.info("Content update detected during image display")
+                return False
+
+            # Check if duration has elapsed
+            elapsed = time.time() - start_time
+            if elapsed >= duration_seconds:
+                return True
+
+            time.sleep(0.1)
+
+        return False
 
     def run(self):
-        """Main loop - plays video on infinite loop with continuous sync adjustment."""
+        """Main player loop."""
         logger.info("=" * 60)
-        logger.info("STARTING JAM PLAYER - ENTERPRISE SYNC MODE v2 (Proportional)")
-        logger.info(f"Sync config: check={SYNC_CHECK_INTERVAL_MS}ms, "
-                   f"tolerance={TARGET_SYNC_TOLERANCE_MS}ms, "
-                   f"seek_threshold={SEEK_THRESHOLD_MS}ms")
-        logger.info(f"Speed tiers: 0-{TARGET_SYNC_TOLERANCE_MS}ms=1.0x, "
-                   f"{TARGET_SYNC_TOLERANCE_MS}-30ms=±1%, 30-100ms=±3%, 100-500ms=±5%")
+        logger.info("JAM Player 2.0 - Starting")
         logger.info("=" * 60)
 
-        # Start MPV with IPC
-        rotation = self.screen_config.get_pygame_rotation()
-        if not self.mpv.start_mpv(rotation_angle=rotation):
+        # Start MPV
+        if not self.mpv.start(rotation_angle=self.rotation_angle):
             logger.error("Failed to start MPV, exiting")
             return
 
-        logger.info("MPV started successfully with IPC control")
-
-        last_sync_check = time.time()
+        logger.info("MPV started successfully")
 
         try:
             while self.running:
-                # Check for scene updates from backend
+                # Check for content updates
                 if sufu.should_reload_scenes():
-                    logger.info("Content update detected - reloading")
+                    logger.info("Content update detected, reloading scenes")
                     sufu.reset_update_flag_to_zero()
-                    self.is_playing = False
-                    self.loop_video_path = None
-                    self.sync_stats = {'adjustments': 0, 'seeks': 0, 'in_sync_count': 0}
+                    self.current_scene_index = 0
 
-                # Find loop video if we don't have one
-                if self.loop_video_path is None:
-                    self.loop_video_path = self.find_loop_video()
-
-                    if self.loop_video_path is None:
-                        logger.info("No loop video available, waiting...")
+                # Load scenes if needed
+                if not self.scenes:
+                    if not self.load_scenes():
+                        logger.info("No scenes available, waiting...")
                         time.sleep(5)
                         continue
 
-                # Start playback if not playing
-                if not self.is_playing:
-                    logger.info(f"Loading loop video: {self.loop_video_path}")
-                    self.mpv.load_file(str(self.loop_video_path))
+                # Get current scene
+                if self.current_scene_index >= len(self.scenes):
+                    self.current_scene_index = 0
 
-                    # Poll for duration to become available
-                    duration_sec = None
-                    for attempt in range(30):  # Try for up to 15 seconds
-                        time.sleep(0.5)
-                        duration_sec = self.mpv.get_duration()
-                        if duration_sec is not None and duration_sec > 0:
-                            break
-                        if attempt % 4 == 0:  # Log every 2 seconds
-                            logger.info(f"Waiting for video duration... attempt {attempt + 1}/30")
+                scene = self.scenes[self.current_scene_index]
 
-                    if duration_sec is None or duration_sec <= 0:
-                        logger.error("Could not get video duration after 15 seconds, restarting MPV...")
-                        self.mpv.stop_mpv()
-                        time.sleep(1)
-                        if not self.mpv.start_mpv(rotation_angle=rotation):
-                            logger.error("Failed to restart MPV")
-                            time.sleep(5)
-                        self.loop_video_path = None
-                        continue
-
-                    self.loop_duration_ms = int(duration_sec * 1000)
-                    logger.info(f"Loop duration: {self.loop_duration_ms}ms ({duration_sec:.2f}s)")
-
-                    # Perform initial synchronization
-                    self.initial_sync(self.loop_duration_ms)
-                    self.is_playing = True
-                    last_sync_check = time.time()
-
-                # Continuous sync adjustment
-                current_time = time.time()
-                if (current_time - last_sync_check) * 1000 >= SYNC_CHECK_INTERVAL_MS:
-                    last_sync_check = current_time
-                    self.adjust_sync(self.loop_duration_ms)
-
-                # Small sleep to prevent CPU spinning
-                time.sleep(0.05)  # 50ms
+                # Display the scene
+                if self.display_scene(scene):
+                    # Move to next scene
+                    self.current_scene_index += 1
+                    if self.current_scene_index >= len(self.scenes):
+                        self.current_scene_index = 0
+                        logger.info("Completed scene cycle, starting over")
+                else:
+                    # Scene was interrupted (likely content update)
+                    # Reset scenes to force reload
+                    self.scenes = []
 
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
         finally:
             self.cleanup()
 
+    def cleanup(self):
+        """Clean up resources."""
+        logger.info("Cleaning up...")
+        self.mpv.stop()
 
-if __name__ == "__main__":
+
+def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='JAM Player - Enterprise Sync Mode')
+    parser = argparse.ArgumentParser(description='JAM Player 2.0')
     parser.add_argument('media_directory', help='Directory containing media files')
-    parser.add_argument('scenes_directory', help='Directory containing scene configuration JSON files')
+    parser.add_argument('scenes_directory', help='Directory containing scene configuration')
 
     args = parser.parse_args()
 
-    player = MediaPlayer(args.media_directory, args.scenes_directory)
+    player = JamPlayer(args.media_directory, args.scenes_directory)
     player.run()
 
-    try:
-        subprocess.run(['pkill', 'feh'], check=False)
-    except Exception as e:
-        logger.error(f"Error killing feh processes: {e}")
+
+if __name__ == "__main__":
+    logger.info("Starting JAM Player Application")
+    main()

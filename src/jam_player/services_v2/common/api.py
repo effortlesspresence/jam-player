@@ -104,11 +104,15 @@ def sign_request(method: str, path: str, body: str = "") -> Optional[Dict[str, s
     """
     Generate signature headers for an API request.
 
-    Creates the X-Device-ID, X-Timestamp, and X-Signature headers
+    Creates the X-Device-ID, X-Timestamp, X-Body-Hash, and X-Signature headers
     required by the jam-player API authorizer.
 
     Signature format: "{method}:{path}:{timestamp}:{body_hash}"
     signed with Ed25519 private key.
+
+    Note: X-Body-Hash is sent as a header because API Gateway REQUEST authorizers
+    don't have access to the request body. The authorizer uses this header to
+    reconstruct the signed payload.
 
     Args:
         method: HTTP method (GET, POST, etc.)
@@ -149,6 +153,7 @@ def sign_request(method: str, path: str, body: str = "") -> Optional[Dict[str, s
         return {
             'X-Device-ID': device_uuid,
             'X-Timestamp': timestamp,
+            'X-Body-Hash': body_hash,
             'X-Signature': signature,
         }
 
