@@ -401,6 +401,47 @@ def setup_tailscale(auth_key: str) -> bool:
         return False
 
 
+def report_tailscale_ip_to_backend(ip: str) -> bool:
+    """
+    Report the Tailscale IP address to the JAM backend.
+
+    This is called every time jam-tailscale.service runs and has a Tailscale IP,
+    even if the IP hasn't changed. This ensures the backend always has the
+    current IP for remote support access.
+
+    Args:
+        ip: The Tailscale IP address (e.g., "100.64.1.123")
+
+    Returns:
+        True if successfully reported, False otherwise.
+    """
+    device_uuid = get_device_uuid()
+    if not device_uuid:
+        logger.warning("No device UUID - cannot report Tailscale IP")
+        return False
+
+    logger.info(f"Reporting Tailscale IP {ip} to backend...")
+
+    response = api_request(
+        method='PUT',
+        path=f'/jam-players/{device_uuid}/set-ip',
+        body={'tailscaleIpAddress': ip},
+        signed=True,
+        timeout=30
+    )
+
+    if not response:
+        logger.warning("No response from backend when reporting Tailscale IP")
+        return False
+
+    if response.status_code == 200:
+        logger.info("Tailscale IP reported to backend successfully")
+        return True
+    else:
+        logger.warning(f"Failed to report Tailscale IP: {response.status_code} {response.text}")
+        return False
+
+
 def main():
     log_service_start(logger, 'JAM Tailscale Service')
 
@@ -411,7 +452,11 @@ def main():
 
     # Wait for existing connection (may reconnect after boot)
     if wait_for_existing_connection():
-        logger.info("Tailscale already connected - nothing to do")
+        logger.info("Tailscale already connected")
+        # Report IP to backend (even if already connected - ensures backend has current IP)
+        ip = get_tailscale_ip()
+        if ip:
+            report_tailscale_ip_to_backend(ip)
         sys.exit(0)
 
     # Tailscale not connected - need to set it up
@@ -452,6 +497,10 @@ def main():
     # Set up Tailscale
     if setup_tailscale(auth_key):
         logger.info("Tailscale setup completed successfully")
+        # Report IP to backend
+        ip = get_tailscale_ip()
+        if ip:
+            report_tailscale_ip_to_backend(ip)
         sys.exit(0)
     else:
         logger.error("Tailscale setup failed")
