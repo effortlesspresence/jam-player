@@ -16,11 +16,11 @@ This service handles all display states for the JAM Player:
    - Display: "Waiting for content..." message
 
 4. PLAYING_CONTENT (screen_id.txt exists, content is available)
-   - Display: The main stitched content video on infinite loop
-   - Uses wall-clock synchronization for multi-screen sync (<50ms drift)
+   - Display: Plays scenes sequentially from scenes.json
+   - Videos play fully, images display for their configured duration
+   - Automatically reloads when content is updated
 
 This service monitors state changes and transitions between display modes automatically.
-It should be ultra-stable - the PLAYING_CONTENT mode remains "dumb" and just loops video.
 """
 
 import sys
@@ -50,12 +50,8 @@ from common.system import get_systemd_notifier, setup_signal_handlers
 from common.paths import (
     SCREEN_ID_FILE,
     REGISTERED_FLAG,
-    CONTENT_DIR,
-    MEDIA_DIR,
-    LOOP_VIDEO_PATH,
-    LEGACY_MEDIA_DIR,
-    LEGACY_LOOP_VIDEO_PATH,
 )
+from jam_player import constants
 
 # Try to import PIL for setup screens
 try:
@@ -87,9 +83,6 @@ class DisplayMode(Enum):
 # Configuration Constants
 # =============================================================================
 
-# Note: Content paths (CONTENT_DIR, MEDIA_DIR, LOOP_VIDEO_PATH, LEGACY_*)
-# are imported from common.paths
-
 # Display configuration
 BACKGROUND_COLOR = (20, 20, 30)  # Dark blue-grey
 TEXT_COLOR = (255, 255, 255)
@@ -108,20 +101,6 @@ UNIVERSAL_SETUP_URL = "https://setup.justamenu.com"
 
 # State checking intervals
 STATE_CHECK_INTERVAL_SEC = 5
-
-# Sync configuration for video playback
-SYNC_CHECK_INTERVAL_MS = 200
-SEEK_THRESHOLD_MS = 500
-TARGET_SYNC_TOLERANCE_MS = 10
-
-# Speed adjustment tiers
-SPEED_NORMAL = 1.0
-SPEED_GENTLE_FAST = 1.01
-SPEED_GENTLE_SLOW = 0.99
-SPEED_MODERATE_FAST = 1.03
-SPEED_MODERATE_SLOW = 0.97
-SPEED_AGGRESSIVE_FAST = 1.05
-SPEED_AGGRESSIVE_SLOW = 0.95
 
 
 # =============================================================================
@@ -457,8 +436,13 @@ class MpvIpcClient:
         self.socket: Optional[socket.socket] = None
         self._request_id = 0
 
-    def start_mpv(self, rotation_angle: int = 0) -> bool:
-        """Start MPV process with IPC socket enabled."""
+    def start_mpv(self, rotation_angle: int = 0, loop: bool = True) -> bool:
+        """Start MPV process with IPC socket enabled.
+
+        Args:
+            rotation_angle: Video rotation in degrees
+            loop: If True, loop videos infinitely (legacy mode). If False, play once (scene mode).
+        """
         if os.path.exists(self.socket_path):
             try:
                 os.unlink(self.socket_path)
@@ -478,16 +462,20 @@ class MpvIpcClient:
             '--force-window=yes',
             '--no-terminal',
             '--keep-open=yes',
-            '--loop-file=inf',
+            '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
-            '--hr-seek-framedrop=no',
-            '--video-sync=audio',
             '--cache=yes',
             '--demuxer-max-bytes=150M',
             '--demuxer-readahead-secs=20',
             f'--video-rotate={rotation_angle}',
             f'--input-ipc-server={self.socket_path}',
         ]
+
+        # Add loop option only for legacy single-video mode
+        if loop:
+            args.insert(-1, '--loop-file=inf')
+            args.insert(-1, '--hr-seek-framedrop=no')
+            args.insert(-1, '--video-sync=audio')
 
         try:
             logger.info(f"Starting MPV with IPC socket at {self.socket_path}")
@@ -662,13 +650,7 @@ class JamPlayerDisplayManager:
         self.current_mode: Optional[DisplayMode] = None
         self.feh_process: Optional[subprocess.Popen] = None
         self.mpv: Optional[MpvIpcClient] = None
-
-        # Video playback state
-        self.loop_duration_ms: int = 0
         self.is_playing: bool = False
-        self.current_speed: float = SPEED_NORMAL
-        self.last_sync_log_time: float = 0
-        self.sync_stats = {'adjustments': 0, 'seeks': 0, 'in_sync_count': 0}
 
         # Get screen dimensions
         self.screen_width, self.screen_height = get_fb_size()
@@ -722,39 +704,24 @@ class JamPlayerDisplayManager:
 
     def _has_content(self) -> bool:
         """Check if we have content to display."""
-        # Check new JAM 2.0 content path
-        if LOOP_VIDEO_PATH.exists():
-            return True
+        scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
+        return scenes_file.exists()
 
-        # Check legacy content path
-        if LEGACY_LOOP_VIDEO_PATH.exists():
-            return True
+    def _load_scenes(self) -> list:
+        """Load scenes from the scenes.json file."""
+        scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
+        if not scenes_file.exists():
+            return []
 
-        # Check for any video in legacy media dir
-        if LEGACY_MEDIA_DIR.exists():
-            for f in LEGACY_MEDIA_DIR.iterdir():
-                if f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.avi'):
-                    return True
-
-        return False
-
-    def _get_content_path(self) -> Optional[Path]:
-        """Get the path to the content video to play."""
-        # Prefer JAM 2.0 path
-        if LOOP_VIDEO_PATH.exists():
-            return LOOP_VIDEO_PATH
-
-        # Fall back to legacy path
-        if LEGACY_LOOP_VIDEO_PATH.exists():
-            return LEGACY_LOOP_VIDEO_PATH
-
-        # Check for any video in legacy media dir
-        if LEGACY_MEDIA_DIR.exists():
-            for f in LEGACY_MEDIA_DIR.iterdir():
-                if f.suffix.lower() in ('.mp4', '.mkv', '.webm', '.avi'):
-                    return f
-
-        return None
+        try:
+            with open(scenes_file, 'r') as f:
+                scenes = json.load(f)
+            # Sort by order
+            scenes.sort(key=lambda s: s.get('order', 0))
+            return scenes
+        except Exception as e:
+            logger.error(f"Error loading scenes: {e}")
+            return []
 
     def transition_to_mode(self, new_mode: DisplayMode):
         """Transition to a new display mode."""
@@ -825,202 +792,151 @@ class JamPlayerDisplayManager:
         # TODO: Get rotation from device configuration
         rotation = 0
 
-        if not self.mpv.start_mpv(rotation_angle=rotation):
+        # Start MPV without looping - we handle scene transitions manually
+        if not self.mpv.start_mpv(rotation_angle=rotation, loop=False):
             logger.error("Failed to start MPV")
             return
 
         logger.info("MPV started successfully")
         self.is_playing = False  # Will be set true once we load a file
 
-    def _get_wall_clock_ms(self) -> int:
-        """Get current wall clock time in milliseconds since epoch."""
-        return int(time.time() * 1000)
-
-    def _calculate_expected_position_ms(self, duration_ms: int) -> int:
-        """Calculate where in the loop we should be based on wall clock."""
-        current_time_ms = self._get_wall_clock_ms()
-        return current_time_ms % duration_ms
-
-    def _get_sync_offset_ms(self, duration_ms: int) -> Optional[int]:
-        """Calculate offset between actual and expected position."""
-        if not self.mpv:
-            return None
-
-        expected_ms = self._calculate_expected_position_ms(duration_ms)
-        actual_sec = self.mpv.get_playback_time()
-
-        if actual_sec is None:
-            return None
-
-        actual_ms = int(actual_sec * 1000)
-        offset_ms = actual_ms - expected_ms
-
-        # Handle wrap-around
-        if offset_ms > duration_ms / 2:
-            offset_ms = offset_ms - duration_ms
-        elif offset_ms < -duration_ms / 2:
-            offset_ms = offset_ms + duration_ms
-
-        return offset_ms
-
-    def _adjust_sync(self, duration_ms: int):
-        """Adjust playback speed to stay in sync with wall clock."""
-        offset_ms = self._get_sync_offset_ms(duration_ms)
-
-        if offset_ms is None:
-            return
-
-        abs_offset = abs(offset_ms)
-        current_time = time.time()
-
-        if abs_offset > SEEK_THRESHOLD_MS:
-            # Emergency seek
-            expected_ms = self._calculate_expected_position_ms(duration_ms)
-            expected_sec = expected_ms / 1000.0
-            logger.warning(f"EMERGENCY SEEK: offset={offset_ms}ms, seeking to {expected_sec:.2f}s")
-            self.mpv.seek(expected_sec)
-            self.mpv.set_speed(SPEED_NORMAL)
-            self.current_speed = SPEED_NORMAL
-            self.sync_stats['seeks'] += 1
-
-        elif abs_offset > 100:
-            new_speed = SPEED_AGGRESSIVE_FAST if offset_ms < 0 else SPEED_AGGRESSIVE_SLOW
-            if new_speed != self.current_speed:
-                self.mpv.set_speed(new_speed)
-                self.current_speed = new_speed
-                self.sync_stats['adjustments'] += 1
-
-        elif abs_offset > 30:
-            new_speed = SPEED_MODERATE_FAST if offset_ms < 0 else SPEED_MODERATE_SLOW
-            if new_speed != self.current_speed:
-                self.mpv.set_speed(new_speed)
-                self.current_speed = new_speed
-                self.sync_stats['adjustments'] += 1
-
-        elif abs_offset > TARGET_SYNC_TOLERANCE_MS:
-            new_speed = SPEED_GENTLE_FAST if offset_ms < 0 else SPEED_GENTLE_SLOW
-            if new_speed != self.current_speed:
-                self.mpv.set_speed(new_speed)
-                self.current_speed = new_speed
-                self.sync_stats['adjustments'] += 1
-
-        else:
-            if self.current_speed != SPEED_NORMAL:
-                self.mpv.set_speed(SPEED_NORMAL)
-                self.current_speed = SPEED_NORMAL
-            self.sync_stats['in_sync_count'] += 1
-
-        # Log periodically
-        if current_time - self.last_sync_log_time >= 30.0:
-            self.last_sync_log_time = current_time
-            status = "IN_SYNC" if abs_offset <= TARGET_SYNC_TOLERANCE_MS else "ADJUSTING"
-            logger.info(
-                f"SYNC [{status}]: offset={offset_ms:+d}ms speed={self.current_speed:.2f}x "
-                f"| stats={{seeks:{self.sync_stats['seeks']}, adj:{self.sync_stats['adjustments']}}}"
-            )
-
-    def _initial_sync(self, duration_ms: int):
-        """Perform initial synchronization when starting playback."""
-        expected_ms = self._calculate_expected_position_ms(duration_ms)
-        expected_sec = expected_ms / 1000.0
-
-        logger.info(f"INITIAL SYNC: duration={duration_ms}ms target_position={expected_ms}ms")
-
-        self.mpv.seek(expected_sec)
-        self.mpv.set_property('pause', False)
-        self.mpv.set_speed(SPEED_NORMAL)
-        self.current_speed = SPEED_NORMAL
-
-        time.sleep(0.3)
-
-        offset_ms = self._get_sync_offset_ms(duration_ms)
-        if offset_ms is not None:
-            logger.info(f"INITIAL SYNC COMPLETE: initial_offset={offset_ms:+d}ms")
-
     def run_video_loop(self):
-        """Main video playback loop - stays here while in PLAYING_CONTENT mode."""
+        """Main content playback loop - plays scenes sequentially."""
         if not self.mpv:
             return
 
-        content_path = self._get_content_path()
-        if not content_path:
-            logger.warning("No content available for playback")
+        logger.info("Starting scene-based content playback")
+
+        media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
+        scenes = self._load_scenes()
+
+        if not scenes:
+            logger.warning("No scenes loaded")
             return
 
-        logger.info(f"Loading content: {content_path}")
-        self.mpv.load_file(str(content_path))
+        logger.info(f"Loaded {len(scenes)} scenes")
+        for i, scene in enumerate(scenes):
+            logger.info(f"  Scene {i}: {scene.get('id')} - {scene.get('media_type')} - {scene.get('media_file')}")
 
-        # Wait for duration
-        duration_sec = None
-        for attempt in range(30):
-            time.sleep(0.5)
-            duration_sec = self.mpv.get_duration()
-            if duration_sec is not None and duration_sec > 0:
-                break
-            if attempt % 4 == 0:
-                logger.info(f"Waiting for video duration... attempt {attempt + 1}/30")
-
-        if duration_sec is None or duration_sec <= 0:
-            logger.error("Could not get video duration")
-            return
-
-        self.loop_duration_ms = int(duration_sec * 1000)
-        logger.info(f"Loop duration: {self.loop_duration_ms}ms ({duration_sec:.2f}s)")
-
-        # Initial sync
-        self._initial_sync(self.loop_duration_ms)
-        self.is_playing = True
-
-        last_sync_check = time.time()
-        last_state_check = time.time()
+        current_scene_index = 0
 
         while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
-            current_time = time.time()
+            # Reload scenes if content was updated
+            scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
+            scenes_mtime = scenes_file.stat().st_mtime if scenes_file.exists() else 0
 
-            # Sync check (every 200ms)
-            if (current_time - last_sync_check) * 1000 >= SYNC_CHECK_INTERVAL_MS:
-                last_sync_check = current_time
-                self._adjust_sync(self.loop_duration_ms)
+            if not hasattr(self, '_last_scenes_mtime') or scenes_mtime != self._last_scenes_mtime:
+                self._last_scenes_mtime = scenes_mtime
+                new_scenes = self._load_scenes()
+                if new_scenes:
+                    scenes = new_scenes
+                    current_scene_index = 0
+                    logger.info(f"Reloaded {len(scenes)} scenes")
 
-            # State check (every 5 seconds) - might need to transition
-            if current_time - last_state_check >= STATE_CHECK_INTERVAL_SEC:
-                last_state_check = current_time
+            if not scenes:
+                time.sleep(1)
+                continue
+
+            # Get current scene
+            if current_scene_index >= len(scenes):
+                current_scene_index = 0
+                logger.info("Completed scene cycle, starting over")
+
+            scene = scenes[current_scene_index]
+            media_file = scene.get('media_file')
+            media_type = scene.get('media_type', 'IMAGE')
+            time_to_display = scene.get('time_to_display', 15)
+
+            media_path = media_dir / media_file
+
+            if not media_path.exists():
+                logger.error(f"Media file not found: {media_path}")
+                current_scene_index += 1
+                continue
+
+            logger.info(f"Displaying scene {current_scene_index}: {scene.get('id')} ({media_type})")
+
+            # Load the file
+            self.mpv.load_file(str(media_path))
+            time.sleep(0.3)
+
+            if media_type == 'VIDEO':
+                # Wait for video to finish
+                if not self._wait_for_video_end():
+                    break  # State changed or interrupted
+            else:
+                # Wait for the configured duration (images)
+                if not self._wait_for_duration(time_to_display):
+                    break  # State changed or interrupted
+
+            current_scene_index += 1
+
+    def _wait_for_video_end(self) -> bool:
+        """Wait for the current video to finish. Returns False if interrupted."""
+        # Get video duration
+        duration = None
+        for _ in range(30):
+            if not self.running or self.current_mode != DisplayMode.PLAYING_CONTENT:
+                return False
+            duration = self.mpv.get_duration()
+            if duration is not None and duration > 0:
+                break
+            time.sleep(0.5)
+
+        if duration is None:
+            logger.warning("Could not get video duration, using 30s fallback")
+            duration = 30
+
+        logger.info(f"Video duration: {duration:.1f}s")
+
+        start_time = time.time()
+        while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
+            # Check for state changes
+            if time.time() - start_time > 5:
                 new_mode = self.determine_display_mode()
                 if new_mode != self.current_mode:
-                    logger.info(f"State change detected: {self.current_mode} -> {new_mode}")
-                    break  # Exit loop to transition
+                    return False
 
-                # Also check if content file changed
-                current_content = self._get_content_path()
-                if current_content != content_path:
-                    logger.info(f"Content changed: {content_path} -> {current_content}")
-                    if current_content:
-                        # Reload the new content
-                        content_path = current_content
-                        logger.info(f"Reloading content: {content_path}")
-                        self.mpv.load_file(str(content_path))
+            # Check if video ended
+            eof = self.mpv.get_property('eof-reached')
+            if eof:
+                logger.info("Video playback complete")
+                return True
 
-                        # Re-get duration
-                        time.sleep(0.5)
-                        for _ in range(10):
-                            duration_sec = self.mpv.get_duration()
-                            if duration_sec and duration_sec > 0:
-                                break
-                            time.sleep(0.5)
+            # Safety timeout
+            if time.time() - start_time > duration + 5:
+                logger.warning("Video timeout, moving to next scene")
+                return True
 
-                        if duration_sec and duration_sec > 0:
-                            self.loop_duration_ms = int(duration_sec * 1000)
-                            self._initial_sync(self.loop_duration_ms)
-                        else:
-                            logger.warning("Could not get new content duration")
-                    else:
-                        # No content anymore
-                        break
-
-            # Send watchdog ping
             sd_notifier.notify("WATCHDOG=1")
+            time.sleep(0.1)
 
-            time.sleep(0.05)
+        return False
+
+    def _wait_for_duration(self, duration_seconds: int) -> bool:
+        """Wait for the specified duration. Returns False if interrupted."""
+        logger.info(f"Displaying image for {duration_seconds}s")
+
+        start_time = time.time()
+        last_state_check = start_time
+
+        while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
+            elapsed = time.time() - start_time
+
+            if elapsed >= duration_seconds:
+                return True
+
+            # Check for state changes periodically
+            if time.time() - last_state_check >= 5:
+                last_state_check = time.time()
+                new_mode = self.determine_display_mode()
+                if new_mode != self.current_mode:
+                    return False
+
+            sd_notifier.notify("WATCHDOG=1")
+            time.sleep(0.1)
+
+        return False
 
     def run(self):
         """Main run loop - monitors state and manages display modes."""

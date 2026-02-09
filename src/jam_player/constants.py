@@ -1,15 +1,16 @@
-import os
+"""
+JAM Player 2.0 - Constants
 
-APP_DATA_DIR = os.path.join(
-    os.path.expanduser('~'), ".jam", "app_data"
-)
-APP_DATA_JSON_DIR = os.path.join(
-    APP_DATA_DIR, "json"
-)
+App data paths for JAM 2.0. Content is stored in /opt/jam/content/.
+Device data is stored in /etc/jam/.
+"""
 
-APP_DATA_LIVE_SCENES_DIR = os.path.join(APP_DATA_DIR, "live_scenes")
-APP_DATA_LIVE_MEDIA_DIR = os.path.join(APP_DATA_DIR, "live_media")
-APP_DATA_STAGED_SCENES_DIR = os.path.join(APP_DATA_DIR, "staged_scenes")
+# JAM 2.0 content directory structure
+APP_DATA_DIR = "/opt/jam/content"
 
-# Device data is stored in /etc/jam in JAM 2.0 (was ~/.jam in 1.0)
+APP_DATA_LIVE_SCENES_DIR = "/opt/jam/content/live_scenes"
+APP_DATA_LIVE_MEDIA_DIR = "/opt/jam/content/live_media"
+APP_DATA_STAGED_SCENES_DIR = "/opt/jam/content/staged_scenes"
+
+# Device data is stored in /etc/jam in JAM 2.0
 DEVICE_UUID_FILE_PATH = "/etc/jam/device_data/device_uuid.txt"
