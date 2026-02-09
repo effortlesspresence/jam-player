@@ -11,6 +11,9 @@ from jam_player.utils import system_utils as su
 from jam_player.utils import logging_utils as lu
 from jam_player.utils import scene_update_flag_utils as sufu
 
+from common.api import api_request
+from common.credentials import get_device_uuid
+
 logger = lu.get_logger("scenes_manager_service")
 
 
@@ -19,6 +22,53 @@ def hash_string(input_string):
     hash_object = hashlib.sha256()
     hash_object.update(encoded_string)
     return hash_object.hexdigest()
+
+
+def check_for_updates() -> bool:
+    """
+    Check for content updates using the JAM 2.0 API.
+
+    TEMPORARY: This polling mechanism will be replaced with WebSocket push
+    notifications in a future release.
+
+    Calls GET /jam-players/{deviceUuid}/update-poll with Ed25519 signing.
+    If hasUnpulledUpdates is true, the backend resets the flag and we return True.
+
+    Returns:
+        True if there are updates available, False otherwise.
+    """
+    device_uuid = get_device_uuid()
+    if not device_uuid:
+        logger.error("No device UUID found - cannot check for updates")
+        return False
+
+    try:
+        response = api_request(
+            method='GET',
+            path=f'/jam-players/{device_uuid}/update-poll',
+            signed=True,
+            timeout=30
+        )
+
+        if not response:
+            logger.warning("No response from update-poll endpoint")
+            return False
+
+        if response.status_code != 200:
+            logger.warning(f"update-poll returned {response.status_code}: {response.text}")
+            return False
+
+        data = response.json()
+        has_updates = data.get('hasUnpulledUpdates', False)
+
+        if has_updates:
+            logger.info("Updates available")
+
+        return has_updates
+
+    except Exception as e:
+        logger.error(f"Error checking for updates: {e}", exc_info=True)
+        return False
 
 
 class ScenesManager:
@@ -138,7 +188,7 @@ class ScenesManager:
 
         while True:
             try:
-                if self.jam_client.check_for_updates():
+                if check_for_updates():
                     logger.info("Updates found! Loading scenes ...")
                     try:
                         self.load_scenes()

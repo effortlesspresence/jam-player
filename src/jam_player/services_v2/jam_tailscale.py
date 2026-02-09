@@ -225,21 +225,50 @@ def fetch_tailscale_credentials() -> Optional[Tuple[str, str]]:
     Returns:
         Tuple of (client_id, client_secret) or None on failure.
     """
-    from common.api import get_api_base_url
+    from common.api import get_api_base_url, sign_request
+    from common.credentials import get_api_signing_private_key
+    import requests
+
+    # Debug: Check credentials before making request
+    device_uuid = get_device_uuid()
+    private_key = get_api_signing_private_key()
+    logger.info(f"Device UUID: {device_uuid}")
+    logger.info(f"Private key exists: {private_key is not None}")
+    if private_key:
+        logger.info(f"Private key length: {len(private_key)}")
 
     base_url = get_api_base_url()
     endpoint = '/jam-players/tailscale-conn-info'
-    logger.info(f"Fetching Tailscale credentials from {base_url}{endpoint}")
+    url = f"{base_url}{endpoint}"
+    logger.info(f"Fetching Tailscale credentials from {url}")
 
-    response = api_request(
-        method='GET',
-        path=endpoint,
-        signed=True,
-        timeout=30
-    )
+    # Debug: Try signing manually to see what happens
+    sign_headers = sign_request('GET', endpoint, '')
+    if not sign_headers:
+        logger.error("Failed to sign request - sign_request returned None")
+        return None
+    logger.info(f"Signed request with headers: X-Device-ID={sign_headers.get('X-Device-ID')}, X-Timestamp={sign_headers.get('X-Timestamp')}")
+
+    # Make request manually with full error details
+    headers = {'Content-Type': 'application/json'}
+    headers.update(sign_headers)
+
+    try:
+        logger.info(f"Making GET request to {url}")
+        response = requests.get(url, headers=headers, timeout=30)
+        logger.info(f"Response status: {response.status_code}")
+    except requests.exceptions.Timeout:
+        logger.error(f"Request timed out after 30s: {url}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error: {url} - {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Request failed: {url} - {type(e).__name__}: {e}")
+        return None
 
     if not response:
-        logger.error(f"No response from backend - request to {base_url}{endpoint} failed (timeout, connection error, or signing failure)")
+        logger.error(f"No response from backend - request to {url} failed")
         return None
 
     if response.status_code == 401:
