@@ -462,11 +462,13 @@ class MpvIpcClient:
             '--force-window=yes',
             '--no-terminal',
             '--keep-open=yes',
+            '--no-audio',  # Silent playback - no audio output
             '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
             '--cache=yes',
             '--demuxer-max-bytes=150M',
             '--demuxer-readahead-secs=20',
+            '--video-sync=display-resample',  # Smooth video playback without audio sync
             f'--video-rotate={rotation_angle}',
             f'--input-ipc-server={self.socket_path}',
         ]
@@ -475,7 +477,6 @@ class MpvIpcClient:
         if loop:
             args.insert(-1, '--loop-file=inf')
             args.insert(-1, '--hr-seek-framedrop=no')
-            args.insert(-1, '--video-sync=audio')
 
         try:
             logger.info(f"Starting MPV with IPC socket at {self.socket_path}")
@@ -606,8 +607,11 @@ class MpvIpcClient:
             return None
 
     def load_file(self, filepath: str) -> bool:
-        """Load a media file into MPV."""
+        """Load a media file into MPV and start playback."""
         self._send_command(['loadfile', filepath, 'replace'])
+        # Ensure playback starts (MPV may be paused in idle mode)
+        time.sleep(0.1)
+        self.set_property('pause', False)
         return True
 
     def seek(self, position_seconds: float) -> bool:
