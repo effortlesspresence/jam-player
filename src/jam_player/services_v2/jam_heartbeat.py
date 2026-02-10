@@ -46,8 +46,8 @@ from common.api import api_request
 logger = setup_service_logging('jam-heartbeat')
 
 # How often to send heartbeats
-HEARTBEAT_INTERVAL_MINUTES = 5
-HEARTBEAT_INTERVAL_SECONDS = 5 * 60
+HEARTBEAT_INTERVAL_MINUTES = 3
+HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MINUTES * 60
 
 # After this many consecutive failures, reduce logging verbosity
 FAILURE_LOG_THRESHOLD = 3
