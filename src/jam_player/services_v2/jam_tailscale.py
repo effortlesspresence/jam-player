@@ -475,6 +475,87 @@ def report_tailscale_ip_to_backend(ip: str) -> bool:
         return False
 
 
+def check_and_clear_cloned_tailscale_state() -> bool:
+    """
+    TEMPORARY: Check if this device was cloned from another device's image.
+
+    If the device UUID doesn't match the UUID stored when Tailscale was last
+    configured, clear the Tailscale state so this device gets its own identity.
+
+    TODO: Remove this once we have a proper image creation process that clears
+    Tailscale state before creating the image.
+
+    Returns:
+        True if state was cleared (Tailscale needs reconfiguration)
+        False if no action needed
+    """
+    device_uuid = get_device_uuid()
+    if not device_uuid:
+        logger.warning("[CLONE-CHECK] No device UUID found, skipping clone detection")
+        return False
+
+    tailscale_state_dir = Path('/var/lib/tailscale')
+    device_marker_file = tailscale_state_dir / '.jam-device-uuid'
+    state_file = tailscale_state_dir / 'tailscaled.state'
+
+    # If no Tailscale state exists, nothing to clear
+    if not state_file.exists():
+        logger.info("[CLONE-CHECK] No Tailscale state file, nothing to clear")
+        # Store marker for future clone detection
+        try:
+            tailscale_state_dir.mkdir(parents=True, exist_ok=True)
+            device_marker_file.write_text(device_uuid)
+            logger.info(f"[CLONE-CHECK] Stored device UUID marker: {device_uuid}")
+        except Exception as e:
+            logger.warning(f"[CLONE-CHECK] Could not store device marker: {e}")
+        return False
+
+    # Check if marker exists and matches
+    if device_marker_file.exists():
+        stored_uuid = device_marker_file.read_text().strip()
+        if stored_uuid == device_uuid:
+            logger.info(f"[CLONE-CHECK] Device UUID matches ({device_uuid}), no clone detected")
+            return False
+        else:
+            logger.warning(f"[CLONE-CHECK] CLONE DETECTED! Stored UUID: {stored_uuid}, Current UUID: {device_uuid}")
+    else:
+        # State exists but no marker - this is a clone from an image without the marker
+        logger.warning(f"[CLONE-CHECK] CLONE DETECTED! Tailscale state exists but no device marker")
+
+    # Clear Tailscale state
+    logger.info("[CLONE-CHECK] Clearing Tailscale state so this device gets its own identity...")
+
+    try:
+        # Stop tailscaled first
+        run_command(['systemctl', 'stop', 'tailscaled'])
+        time.sleep(1)
+
+        # Remove state files
+        if state_file.exists():
+            state_file.unlink()
+            logger.info("[CLONE-CHECK] Removed tailscaled.state")
+
+        # Remove any log files
+        for log_file in tailscale_state_dir.glob('tailscaled.log*'):
+            log_file.unlink()
+            logger.info(f"[CLONE-CHECK] Removed {log_file.name}")
+
+        # Store the new device UUID marker
+        device_marker_file.write_text(device_uuid)
+        logger.info(f"[CLONE-CHECK] Stored new device UUID marker: {device_uuid}")
+
+        # Restart tailscaled
+        run_command(['systemctl', 'start', 'tailscaled'])
+        time.sleep(2)
+
+        logger.info("[CLONE-CHECK] Tailscale state cleared successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"[CLONE-CHECK] Error clearing Tailscale state: {e}")
+        return False
+
+
 def main():
     log_service_start(logger, 'JAM Tailscale Service')
 
@@ -482,6 +563,12 @@ def main():
     if not is_tailscale_installed():
         logger.error("Tailscale is not installed - cannot configure remote access")
         sys.exit(1)
+
+    # TEMPORARY: Check for cloned image and clear Tailscale state if needed
+    # TODO: Remove once proper image creation process is in place
+    clone_cleared = check_and_clear_cloned_tailscale_state()
+    if clone_cleared:
+        logger.info("Tailscale state was cleared due to clone detection - will reconfigure")
 
     # Wait for existing connection (may reconnect after boot)
     if wait_for_existing_connection():
