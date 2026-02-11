@@ -20,7 +20,8 @@ Key behaviors:
 - Notifies systemd watchdog to prove liveness
 - Designed to be extremely stable - never crashes, always recovers
 
-This service only runs when /etc/jam/device_data/.registered exists (enforced by systemd).
+This service runs when /etc/jam/device_data/.announced exists (enforced by systemd).
+This means heartbeats start as soon as the device announces itself, not waiting for registration.
 """
 
 import sys
@@ -36,7 +37,7 @@ import sdnotify
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
-    is_device_registered,
+    is_device_announced,
     update_screen_id_if_changed,
     update_timezone_if_changed,
     get_location_timezone,
@@ -146,14 +147,14 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Verify device is registered (shouldn't happen due to ConditionPathExists, but be safe)
-    if not is_device_registered():
-        logger.error("Device is not registered - heartbeat service should not be running")
+    # Verify device is announced (shouldn't happen due to ConditionPathExists, but be safe)
+    if not is_device_announced():
+        logger.error("Device is not announced - heartbeat service should not be running")
         sys.exit(1)
 
     # Tell systemd we're ready IMMEDIATELY - don't block on timezone application
     notifier.notify("READY=1")
-    logger.info("Service started, sending heartbeats every 5 minutes")
+    logger.info(f"Service started, sending heartbeats every {HEARTBEAT_INTERVAL_MINUTES} minutes")
 
     # Apply stored timezone on startup (in case device rebooted)
     # This happens AFTER READY=1 to avoid blocking service startup

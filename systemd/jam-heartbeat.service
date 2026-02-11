@@ -2,8 +2,8 @@
 Description=JAM Player Heartbeat - Reports device status to JAM backend
 Documentation=https://github.com/anthropics/jam-player
 
-# Only run when device is registered
-ConditionPathExists=/etc/jam/device_data/.registered
+# Only run when device has announced itself to the backend (has a DB record)
+ConditionPathExists=/etc/jam/device_data/.announced
 
 # Requires first boot to have completed (credentials must exist)
 Requires=jam-first-boot.service
