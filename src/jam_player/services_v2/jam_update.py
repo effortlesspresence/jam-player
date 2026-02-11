@@ -514,9 +514,52 @@ def update_version_file(version: str) -> bool:
 # Cleanup Functions
 # =============================================================================
 
+def disable_comitup():
+    """
+    Disable comitup - JAM 2.0 uses its own BLE provisioning instead.
+
+    Comitup creates a WiFi hotspot for provisioning, but JAM 2.0 uses BLE
+    for WiFi provisioning. The comitup hotspot interferes with WiFi connections
+    because it uses the same wlan0 interface.
+    """
+    logger.info("Disabling comitup (JAM 2.0 uses BLE provisioning)...")
+
+    # Stop and disable comitup service
+    run_command(['systemctl', 'stop', 'comitup'], timeout=30)
+    run_command(['systemctl', 'disable', 'comitup'], timeout=30)
+    logger.info("  Stopped and disabled comitup service")
+
+    # Remove the JAM-SETUP hotspot connection profiles
+    result = run_command(
+        ['nmcli', '-t', '-f', 'NAME', 'connection', 'show'],
+        timeout=10
+    )
+    if result[0]:  # success
+        stdout = result[1]
+        for line in stdout.strip().split('\n'):
+            conn_name = line.strip()
+            if conn_name.startswith('JAM-SETUP'):
+                run_command(['nmcli', 'connection', 'delete', conn_name], timeout=10)
+                logger.info(f"  Removed hotspot connection: {conn_name}")
+
+    # Clear comitup state
+    comitup_state = Path('/var/lib/comitup')
+    if comitup_state.exists():
+        try:
+            shutil.rmtree(comitup_state)
+            logger.info("  Cleared comitup state directory")
+        except Exception as e:
+            logger.warning(f"  Failed to clear comitup state: {e}")
+
+    logger.info("  Comitup disabled successfully")
+
+
 def cleanup_legacy_cruft():
     """Remove legacy files/directories that are no longer needed."""
     logger.info("Cleaning up legacy cruft...")
+
+    # Disable comitup first - it interferes with JAM 2.0 BLE provisioning
+    disable_comitup()
 
     # Items to remove (files and directories)
     items_to_remove: List[Path] = [
@@ -704,6 +747,11 @@ def report_error(error_message: str):
 
 def main():
     log_service_start(logger, 'JAM Update Service')
+
+    # Always disable comitup on every run - it interferes with JAM 2.0 BLE provisioning
+    # This is idempotent and safe to run repeatedly, ensuring comitup stays disabled
+    # even if a previous attempt failed or the device was imaged with comitup enabled
+    disable_comitup()
 
     # Check if repo exists
     if not JAM_REPO_DIR.exists():

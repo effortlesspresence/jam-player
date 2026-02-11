@@ -755,14 +755,16 @@ class WiFiCredentialsCharacteristic(Characteristic):
                 return
 
             logger.info(f"Attempting to connect to WiFi: {ssid}")
+            logger.info(f"Password length: {len(password)} chars")
             self.status_characteristic.set_status('connecting', f'Connecting to {ssid}...')
 
             # Run connection in a background thread so we don't block the BLE write.
             # BLE operations should complete quickly; WiFi connection can take 10-30 seconds.
             def connect_async():
+                logger.info(f"[BLE->WiFi] Starting WiFi connection attempt for SSID: {ssid}")
                 success, error_msg = connect_to_wifi(ssid, password)
                 if success:
-                    logger.info(f"Successfully connected to {ssid}")
+                    logger.info(f"[BLE->WiFi] SUCCESS - Connected to {ssid}")
                     self.status_characteristic.set_status('connected', f'Connected to {ssid}')
 
                     # Trigger announce + Tailscale setup in another background thread
@@ -770,16 +772,19 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
                     announce_thread.start()
                 else:
-                    logger.warning(f"Failed to connect to {ssid}: {error_msg}")
+                    logger.error(f"[BLE->WiFi] FAILED - Could not connect to {ssid}")
+                    logger.error(f"[BLE->WiFi] Raw error message: {error_msg}")
                     # Map error messages to iOS-compatible status values
                     if 'password' in error_msg.lower() or 'secrets' in error_msg.lower():
-                        self.status_characteristic.set_status('invalid_password', error_msg)
+                        status_code = 'invalid_password'
                     elif 'not found' in error_msg.lower() or 'no network' in error_msg.lower():
-                        self.status_characteristic.set_status('network_not_found', error_msg)
+                        status_code = 'network_not_found'
                     elif 'timeout' in error_msg.lower():
-                        self.status_characteristic.set_status('timeout', error_msg)
+                        status_code = 'timeout'
                     else:
-                        self.status_characteristic.set_status('failed', error_msg)
+                        status_code = 'failed'
+                    logger.error(f"[BLE->WiFi] Sending status '{status_code}' to iOS app")
+                    self.status_characteristic.set_status(status_code, error_msg)
 
             thread = threading.Thread(target=connect_async, daemon=True)
             thread.start()

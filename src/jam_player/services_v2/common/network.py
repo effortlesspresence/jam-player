@@ -284,6 +284,141 @@ def trigger_wifi_scan():
         logger.error(f"Initial WiFi scan failed: {e}")
 
 
+def _log_network_diagnostic_info():
+    """
+    Log detailed network diagnostic information for debugging WiFi connection issues.
+    This helps diagnose issues like "Connection activation failed: New connection activation was enqueued"
+    """
+    logger.info("=== NETWORK DIAGNOSTIC INFO ===")
+
+    # 1. Log wlan0 interface state
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"Device status:\n{result.stdout.strip()}")
+        else:
+            logger.warning(f"Failed to get device status: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting device status: {e}")
+
+    # 2. Log active connections
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE', 'connection', 'show', '--active'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"Active connections:\n{result.stdout.strip() or '(none)'}")
+        else:
+            logger.warning(f"Failed to get active connections: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting active connections: {e}")
+
+    # 3. Log NetworkManager state
+    try:
+        result = subprocess.run(
+            ['nmcli', 'general', 'status'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"NetworkManager status:\n{result.stdout.strip()}")
+        else:
+            logger.warning(f"Failed to get NM status: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting NM status: {e}")
+
+    # 4. Check if comitup service is running
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', 'comitup'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        comitup_state = result.stdout.strip()
+        logger.info(f"comitup.service state: {comitup_state}")
+    except Exception as e:
+        logger.warning(f"Error checking comitup state: {e}")
+
+    # 5. Check rfkill status (is WiFi blocked?)
+    try:
+        result = subprocess.run(
+            ['rfkill', 'list', 'wifi'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"rfkill wifi status:\n{result.stdout.strip()}")
+        else:
+            logger.warning(f"Failed to get rfkill status: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting rfkill status: {e}")
+
+    logger.info("=== END DIAGNOSTIC INFO ===")
+
+
+def _stop_comitup_hotspot() -> bool:
+    """
+    Stop the comitup hotspot to free up the wlan0 interface for client mode.
+
+    Returns:
+        True if hotspot was stopped or wasn't running, False on error
+    """
+    try:
+        # Check if comitup hotspot is active (connection name starts with JAM-SETUP)
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show', '--active'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        hotspot_name = None
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[0].startswith('JAM-SETUP'):
+                    hotspot_name = parts[0]
+                    break
+
+        if not hotspot_name:
+            logger.info("No comitup hotspot active, proceeding with WiFi connection")
+            return True
+
+        logger.info(f"Stopping comitup hotspot: {hotspot_name}")
+
+        # Bring down the hotspot connection
+        result = subprocess.run(
+            ['nmcli', 'connection', 'down', hotspot_name],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Successfully stopped hotspot: {hotspot_name}")
+            # Give NetworkManager a moment to release the interface
+            time.sleep(1)
+            return True
+        else:
+            logger.warning(f"Failed to stop hotspot: {result.stderr}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error stopping comitup hotspot: {e}")
+        return False
+
+
 def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
     """
     Connect to a WiFi network, preserving existing connection if new attempt fails.
@@ -315,7 +450,15 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
                 return True, ""
             logger.info(f"Connected to {ssid} but no internet - will attempt reconnect")
 
+        # Log diagnostic info before attempting connection (helps debug failures)
+        _log_network_diagnostic_info()
+
+        # Stop comitup hotspot if running - can't use wlan0 for both AP and client mode
+        hotspot_stopped = _stop_comitup_hotspot()
+        logger.info(f"Hotspot stop result: {hotspot_stopped}")
+
         # Try to connect using nmcli
+        logger.info(f"Running: nmcli device wifi connect '{ssid}' password '****'")
         result = subprocess.run(
             ['nmcli', 'device', 'wifi', 'connect', ssid, 'password', password],
             capture_output=True,
@@ -323,12 +466,20 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
             timeout=30  # WiFi connection can take a while
         )
 
+        logger.info(f"nmcli return code: {result.returncode}")
+        logger.info(f"nmcli stdout: {result.stdout.strip()}")
+        logger.info(f"nmcli stderr: {result.stderr.strip()}")
+
         if result.returncode == 0:
             logger.info(f"Successfully connected to {ssid}")
             return True, ""
 
         error_msg = result.stderr.strip() or result.stdout.strip()
-        logger.warning(f"Failed to connect to {ssid}: {error_msg}")
+        logger.error(f"WiFi connection FAILED for {ssid}: {error_msg}")
+
+        # Log diagnostic info again after failure to see what changed
+        logger.info("Post-failure diagnostic info:")
+        _log_network_diagnostic_info()
 
         # If we had a previous working connection, try to restore it
         if previous_connection:
@@ -344,13 +495,17 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
             return False, error_msg or "Connection failed"
 
     except subprocess.TimeoutExpired:
-        logger.error(f"Connection to {ssid} timed out")
+        logger.error(f"Connection to {ssid} timed out after 30 seconds")
+        logger.info("Post-timeout diagnostic info:")
+        _log_network_diagnostic_info()
         # Try to restore previous connection on timeout too
         if previous_connection:
             _restore_wifi_connection(previous_connection['name'])
         return False, "Connection timed out"
     except Exception as e:
-        logger.error(f"Error connecting to WiFi: {e}")
+        logger.error(f"Exception during WiFi connection: {type(e).__name__}: {e}")
+        logger.info("Post-exception diagnostic info:")
+        _log_network_diagnostic_info()
         return False, str(e)
 
 
