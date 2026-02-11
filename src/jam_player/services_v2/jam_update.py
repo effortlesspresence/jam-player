@@ -25,8 +25,11 @@ import sys
 import os
 import subprocess
 import shutil
+import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Callable, TypeVar
+
+T = TypeVar('T')
 
 # Add the services directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,6 +69,12 @@ JAM_PLAYER_SRC = JAM_REPO_DIR / 'src' / 'jam_player'
 SYSTEMD_SRC = JAM_REPO_DIR / 'systemd'
 CRON_SRC = JAM_REPO_DIR / 'cron'
 LOGROTATE_SRC = JAM_REPO_DIR / 'logrotate_config'
+
+# Backup paths (for rollback on failed updates)
+BACKUP_DIR = OPT_JAM_DIR / 'backup'
+SERVICES_BACKUP = BACKUP_DIR / 'services'
+SYSTEMD_BACKUP = BACKUP_DIR / 'systemd'
+VERSION_BACKUP = BACKUP_DIR / 'version.txt'
 
 # Legacy paths (for cleanup)
 LEGACY_JAM_DIR = Path('/home/comitup/.jam')
@@ -120,6 +129,200 @@ def run_command(cmd: list, cwd: Path = None, timeout: int = 120) -> tuple[bool, 
         return False, "", str(e)
 
 
+# Retry configuration for git network operations
+GIT_RETRY_MAX_ATTEMPTS = 5
+GIT_RETRY_INITIAL_DELAY = 5  # seconds
+GIT_RETRY_MAX_DELAY = 60  # seconds
+
+
+def retry_with_backoff(
+    operation: Callable[[], T],
+    operation_name: str,
+    max_attempts: int = GIT_RETRY_MAX_ATTEMPTS,
+    initial_delay: int = GIT_RETRY_INITIAL_DELAY,
+    max_delay: int = GIT_RETRY_MAX_DELAY,
+) -> T:
+    """
+    Retry an operation with exponential backoff.
+
+    Args:
+        operation: A callable that returns a value. Should return None on failure.
+        operation_name: Human-readable name for logging.
+        max_attempts: Maximum number of attempts.
+        initial_delay: Initial delay between retries in seconds.
+        max_delay: Maximum delay between retries in seconds.
+
+    Returns:
+        The result of the operation, or None if all attempts failed.
+    """
+    delay = initial_delay
+
+    for attempt in range(1, max_attempts + 1):
+        result = operation()
+
+        if result is not None and result is not False:
+            if attempt > 1:
+                logger.info(f"{operation_name} succeeded on attempt {attempt}")
+            return result
+
+        if attempt < max_attempts:
+            logger.warning(
+                f"{operation_name} failed (attempt {attempt}/{max_attempts}), "
+                f"retrying in {delay}s..."
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay)
+        else:
+            logger.error(f"{operation_name} failed after {max_attempts} attempts")
+
+    return None
+
+
+# =============================================================================
+# Backup and Rollback Functions
+# =============================================================================
+
+def create_backup() -> bool:
+    """
+    Create a backup of current installation before updating.
+
+    Backs up:
+    - /opt/jam/services/ -> /opt/jam/backup/services/
+    - /etc/systemd/system/jam-*.service -> /opt/jam/backup/systemd/
+    - /etc/jam/version.txt -> /opt/jam/backup/version.txt
+
+    Returns:
+        True if backup was created successfully, False otherwise.
+    """
+    logger.info("Creating backup of current installation...")
+
+    try:
+        # Clean up any existing backup
+        if BACKUP_DIR.exists():
+            shutil.rmtree(BACKUP_DIR)
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Backup services directory
+        if SERVICES_DEST.exists():
+            shutil.copytree(SERVICES_DEST, SERVICES_BACKUP)
+            logger.info(f"  Backed up {SERVICES_DEST}")
+        else:
+            logger.info("  No existing services directory to backup")
+
+        # Backup systemd units
+        SYSTEMD_BACKUP.mkdir(parents=True, exist_ok=True)
+        systemd_dir = Path('/etc/systemd/system')
+        backed_up_units = 0
+        for pattern in ['jam-*.service', 'jam-*.timer']:
+            for unit_file in systemd_dir.glob(pattern):
+                shutil.copy2(unit_file, SYSTEMD_BACKUP / unit_file.name)
+                backed_up_units += 1
+        logger.info(f"  Backed up {backed_up_units} systemd units")
+
+        # Backup version file
+        if VERSION_FILE.exists():
+            shutil.copy2(VERSION_FILE, VERSION_BACKUP)
+            logger.info(f"  Backed up {VERSION_FILE}")
+        else:
+            logger.info("  No existing version file to backup")
+
+        logger.info("Backup created successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to create backup: {e}")
+        # Clean up partial backup
+        if BACKUP_DIR.exists():
+            try:
+                shutil.rmtree(BACKUP_DIR)
+            except:
+                pass
+        return False
+
+
+def rollback_from_backup() -> bool:
+    """
+    Restore the previous installation from backup.
+
+    This is called when an update fails partway through. It restores:
+    - Services directory
+    - Systemd unit files
+    - Version file
+
+    Returns:
+        True if rollback succeeded, False otherwise.
+    """
+    logger.warning("Rolling back to previous installation...")
+
+    if not BACKUP_DIR.exists():
+        logger.error("No backup directory found - cannot rollback")
+        return False
+
+    success = True
+
+    try:
+        # Restore services directory
+        if SERVICES_BACKUP.exists():
+            if SERVICES_DEST.exists():
+                shutil.rmtree(SERVICES_DEST)
+            shutil.copytree(SERVICES_BACKUP, SERVICES_DEST)
+            logger.info(f"  Restored {SERVICES_DEST}")
+        else:
+            logger.warning("  No services backup to restore")
+
+    except Exception as e:
+        logger.error(f"  Failed to restore services: {e}")
+        success = False
+
+    try:
+        # Restore systemd units
+        if SYSTEMD_BACKUP.exists():
+            systemd_dir = Path('/etc/systemd/system')
+            restored_units = 0
+            for unit_file in SYSTEMD_BACKUP.glob('*'):
+                shutil.copy2(unit_file, systemd_dir / unit_file.name)
+                restored_units += 1
+            logger.info(f"  Restored {restored_units} systemd units")
+            # Reload systemd to pick up restored units
+            run_command(['systemctl', 'daemon-reload'])
+        else:
+            logger.warning("  No systemd backup to restore")
+
+    except Exception as e:
+        logger.error(f"  Failed to restore systemd units: {e}")
+        success = False
+
+    try:
+        # Restore version file
+        if VERSION_BACKUP.exists():
+            shutil.copy2(VERSION_BACKUP, VERSION_FILE)
+            logger.info(f"  Restored {VERSION_FILE}")
+        else:
+            logger.warning("  No version backup to restore")
+
+    except Exception as e:
+        logger.error(f"  Failed to restore version file: {e}")
+        success = False
+
+    if success:
+        logger.info("Rollback completed successfully")
+    else:
+        logger.error("Rollback completed with errors - system may be in inconsistent state")
+
+    return success
+
+
+def cleanup_backup():
+    """Remove the backup directory after a successful update."""
+    if BACKUP_DIR.exists():
+        try:
+            shutil.rmtree(BACKUP_DIR)
+            logger.info("Cleaned up backup directory")
+        except Exception as e:
+            logger.warning(f"Failed to clean up backup: {e}")
+
+
 def configure_git_safe_directory():
     """
     Configure git to trust the JAM repo directory.
@@ -138,17 +341,26 @@ def clone_repo(branch: str) -> bool:
     Clone the jam-player repo if it doesn't exist.
 
     This handles the migration from the old combined 'jam' repo to the
-    new dedicated 'jam-player' repo.
+    new dedicated 'jam-player' repo. Retries with exponential backoff
+    on failure (GitHub can be intermittently unavailable).
     """
     logger.info(f"Cloning jam-player repo to {JAM_REPO_DIR}...")
 
-    success, _, stderr = run_command(
-        ['git', 'clone', '--branch', branch, '--single-branch', GIT_REPO_URL, str(JAM_REPO_DIR)],
-        timeout=GIT_TIMEOUT
-    )
+    def attempt_clone():
+        success, _, stderr = run_command(
+            ['git', 'clone', '--branch', branch, '--single-branch', GIT_REPO_URL, str(JAM_REPO_DIR)],
+            timeout=GIT_TIMEOUT
+        )
+        if not success:
+            logger.warning(f"Clone attempt failed: {stderr}")
+            # Clean up partial clone if it exists
+            if JAM_REPO_DIR.exists():
+                shutil.rmtree(JAM_REPO_DIR)
+            return None
+        return True
 
-    if not success:
-        logger.error(f"Failed to clone repo: {stderr}")
+    result = retry_with_backoff(attempt_clone, "git clone")
+    if not result:
         return False
 
     # Set ownership to comitup user (UID 1000)
@@ -181,16 +393,27 @@ def get_current_version() -> Optional[str]:
 
 
 def get_latest_version(branch: str) -> Optional[str]:
-    """Fetch and get the latest version from remote."""
+    """
+    Fetch and get the latest version from remote.
+
+    Retries with exponential backoff on failure (GitHub can be
+    intermittently unavailable).
+    """
     logger.info(f"Fetching latest from {GIT_REMOTE}/{branch}...")
 
-    success, _, stderr = run_command(
-        ['git', 'fetch', GIT_REMOTE, branch],
-        cwd=JAM_REPO_DIR,
-        timeout=GIT_TIMEOUT
-    )
-    if not success:
-        logger.error(f"Git fetch failed: {stderr}")
+    def attempt_fetch():
+        success, _, stderr = run_command(
+            ['git', 'fetch', GIT_REMOTE, branch],
+            cwd=JAM_REPO_DIR,
+            timeout=GIT_TIMEOUT
+        )
+        if not success:
+            logger.warning(f"Fetch attempt failed: {stderr}")
+            return None
+        return True
+
+    result = retry_with_backoff(attempt_fetch, "git fetch")
+    if not result:
         return None
 
     success, stdout, stderr = run_command(
@@ -317,7 +540,6 @@ def show_updating_screen():
             )
             if result.returncode == 0:
                 break
-            import time
             time.sleep(1)
         else:
             logger.warning("X display not available, skipping update screen")
@@ -676,7 +898,6 @@ def restart_services():
             logger.warning(f"    Failed to trigger restart for {service}: {stderr[:100] if stderr else 'unknown'}")
 
     # Give services a moment to start
-    import time
     logger.info("  Waiting for services to initialize...")
     time.sleep(5)
 
@@ -799,41 +1020,54 @@ def main():
     # Show updating screen to user
     show_updating_screen()
 
-    # Pull latest code
-    if not pull_latest(branch):
+    # Helper function to handle update failure with rollback
+    def fail_update(error_msg: str, should_rollback: bool = True):
+        """Handle update failure: rollback if needed, report error, and exit."""
+        logger.error(f"Update failed: {error_msg}")
+        if should_rollback:
+            rollback_from_backup()
         hide_updating_screen()
-        report_error("Failed to pull latest code from git")
+        report_error(error_msg)
         sys.exit(1)
 
-    # Ensure venv exists
+    # Pull latest code (git repo, not the installed files)
+    if not pull_latest(branch):
+        fail_update("Failed to pull latest code from git", should_rollback=False)
+
+    # Ensure venv exists (before backup since we're not backing up venv)
     if not ensure_venv_exists():
-        hide_updating_screen()
-        report_error("Failed to create/verify virtual environment")
-        sys.exit(1)
+        fail_update("Failed to create/verify virtual environment", should_rollback=False)
+
+    # Create backup of current installation before making changes
+    # Skip backup for fresh installs (nothing to backup)
+    has_backup = False
+    if not force_install:
+        if not create_backup():
+            fail_update("Failed to create backup - aborting update for safety", should_rollback=False)
+        has_backup = True
+
+    # From here on, failures should trigger rollback (if we have a backup)
 
     # Install services
     if not install_services():
-        hide_updating_screen()
-        report_error("Failed to install services")
-        sys.exit(1)
+        fail_update("Failed to install services", should_rollback=has_backup)
 
     # Install dependencies
     if not install_dependencies():
-        hide_updating_screen()
-        report_error("Failed to install dependencies")
-        sys.exit(1)
+        fail_update("Failed to install dependencies", should_rollback=has_backup)
 
     # Install systemd units
     if not install_systemd_units():
-        hide_updating_screen()
-        report_error("Failed to install systemd units")
-        sys.exit(1)
+        fail_update("Failed to install systemd units", should_rollback=has_backup)
 
     # Update version file
     update_version_file(latest_version)
 
-    # Clean up legacy cruft
-    cleanup_legacy_cruft()
+    # Clean up legacy cruft (non-critical, don't fail update for this)
+    try:
+        cleanup_legacy_cruft()
+    except Exception as e:
+        logger.warning(f"Legacy cleanup had issues (non-fatal): {e}")
 
     # Install crontab with essential scheduled tasks (3am reboot, logrotate)
     install_crontab()
@@ -843,6 +1077,10 @@ def main():
 
     # Restart services to pick up changes
     restart_services()
+
+    # Update successful - clean up backup
+    if has_backup:
+        cleanup_backup()
 
     # Hide updating screen (jam-player-display.service will take over)
     hide_updating_screen()
