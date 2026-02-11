@@ -707,9 +707,37 @@ class JamPlayerDisplayManager:
         return DisplayMode.PLAYING_CONTENT
 
     def _has_content(self) -> bool:
-        """Check if we have content to display."""
+        """
+        Check if we have content to display.
+
+        Returns True only if:
+        1. scenes.json exists
+        2. At least one scene has a media file that exists
+        """
         scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
-        return scenes_file.exists()
+        if not scenes_file.exists():
+            return False
+
+        try:
+            with open(scenes_file, 'r') as f:
+                scenes = json.load(f)
+
+            if not scenes:
+                return False
+
+            # Check if at least one media file exists
+            media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
+            for scene in scenes:
+                media_file = scene.get('media_file')
+                if media_file and (media_dir / media_file).exists():
+                    return True
+
+            # No valid media files found
+            return False
+
+        except Exception as e:
+            logger.warning(f"Error checking content: {e}")
+            return False
 
     def _load_scenes(self) -> list:
         """Load scenes from the scenes.json file."""

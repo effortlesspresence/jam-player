@@ -23,7 +23,7 @@ from jam_player.utils import logging_utils as lu
 from jam_player.utils import scene_update_flag_utils as sufu
 
 from common.api import api_request
-from common.credentials import get_device_uuid
+from common.credentials import get_device_uuid, is_device_registered
 
 logger = lu.get_logger("scenes_manager_service")
 
@@ -148,7 +148,9 @@ def download_media(url: str, dest_path: Path) -> bool:
     if not url.startswith(('http:', 'https:')):
         url = 'https:' + url
 
-    logger.info(f"Downloading media from {url}")
+    # Log the full URL for debugging
+    logger.info(f"Downloading media: {url[:100]}{'...' if len(url) > 100 else ''}")
+    logger.info(f"  Destination: {dest_path}")
 
     # Retry logic for transient network issues
     max_retries = 5
@@ -298,7 +300,16 @@ def run():
     logger.info("JAM Player 2.0 - Scenes Manager Service Starting")
     logger.info("=" * 60)
 
-    # Initial content load
+    # Wait for device to be registered before trying to fetch content
+    # An unregistered device won't have content assigned anyway
+    logger.info("Waiting for device to be registered...")
+    while not is_device_registered():
+        time.sleep(10)
+    logger.info("Device is registered, proceeding with content management")
+
+    # Initial content load with exponential backoff
+    retry_delay = 10  # Start with 10 seconds
+    max_retry_delay = 300  # Cap at 5 minutes
     while True:
         try:
             logger.info("Loading initial content...")
@@ -306,11 +317,13 @@ def run():
                 logger.info("Initial content loaded successfully")
                 break
             else:
-                logger.error("Failed to load initial content, retrying in 60s")
-                time.sleep(60)
+                logger.warning(f"Failed to load initial content, retrying in {retry_delay}s")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
         except Exception as e:
             logger.error(f"Error during initial content load: {e}", exc_info=True)
-            time.sleep(60)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
 
     # Main polling loop
     while True:
