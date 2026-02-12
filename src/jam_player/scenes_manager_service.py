@@ -20,7 +20,6 @@ from pathlib import Path
 
 from jam_player import constants
 from jam_player.utils import logging_utils as lu
-from jam_player.utils import scene_update_flag_utils as sufu
 
 from common.api import api_request
 from common.credentials import get_device_uuid, is_device_registered
@@ -333,8 +332,7 @@ def run():
                 try:
                     if load_content():
                         logger.info("Content reloaded successfully")
-                        # Signal to jam_player_app that content has changed
-                        sufu.reset_update_flag_to_one()
+                        # Note: jam_player_display.py monitors scenes.json mtime directly
                     else:
                         logger.error("Failed to reload content")
                 except Exception as e:

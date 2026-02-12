@@ -84,11 +84,10 @@ class DisplayMode(Enum):
 # =============================================================================
 
 # Display configuration
-BACKGROUND_COLOR = (20, 20, 30)  # Dark blue-grey
-TEXT_COLOR = (255, 255, 255)
-ACCENT_COLOR = (0, 180, 255)  # JAM blue
-SECONDARY_COLOR = (180, 180, 180)
-WARNING_COLOR = (255, 180, 0)  # Amber for waiting states
+BACKGROUND_COLOR = (0, 0, 0)  # Black
+TEXT_COLOR = (255, 255, 255)  # White
+ACCENT_COLOR = (235, 68, 15)  # JAM orange #eb440f
+SECONDARY_COLOR = (180, 180, 180)  # Grey for less prominent text
 
 FONT_SIZE_TITLE = 72
 FONT_SIZE_SUBTITLE = 36
@@ -287,7 +286,7 @@ def create_registered_not_linked_screen(width: int, height: int, device_uuid: st
     title = "Registered!"
     bbox = draw.textbbox((0, 0), title, font=title_font)
     x = center_x - bbox[2] // 2
-    draw.text((x, y), title, font=title_font, fill=(0, 200, 100))  # Green for success
+    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
     y += bbox[3] + 40
 
     # Subtitle
@@ -357,7 +356,7 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
     bbox = draw.textbbox((0, 0), title, font=title_font)
     x = center_x - bbox[2] // 2
     y = center_y - bbox[3] - 20
-    draw.text((x, y), title, font=title_font, fill=WARNING_COLOR)
+    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
 
     # Subtitle
     subtitle = "Content is being downloaded. This may take a few minutes."
@@ -463,12 +462,13 @@ class MpvIpcClient:
             '--no-terminal',
             '--keep-open=yes',
             '--no-audio',  # Silent playback - no audio output
+            '--hwdec=auto',  # Use hardware decoding when available (critical for Pi)
             '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
             '--cache=yes',
             '--demuxer-max-bytes=150M',
             '--demuxer-readahead-secs=20',
-            '--video-sync=display-resample',  # Smooth video playback without audio sync
+            '--video-sync=audio',  # Sync to audio clock (even with --no-audio, this is more stable)
             f'--video-rotate={rotation_angle}',
             f'--input-ipc-server={self.socket_path}',
         ]
