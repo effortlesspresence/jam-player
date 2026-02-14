@@ -177,6 +177,9 @@ def is_scene_scheduled_now(scene: Dict[str, Any]) -> bool:
     # Find schedule entry for current day
     for schedule in days_scheduled:
         day_of_week = schedule.get('dayOfWeek')
+        # Handle both formats: string "FRIDAY" or object {"value": "FRIDAY", "label": "Friday"}
+        if isinstance(day_of_week, dict):
+            day_of_week = day_of_week.get('value')
         if day_of_week != current_weekday:
             continue
 
