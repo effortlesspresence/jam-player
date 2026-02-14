@@ -661,6 +661,7 @@ class MpvIpcClient:
             '--force-window=yes',
             '--no-terminal',
             '--keep-open=yes',
+            '--no-audio',  # Disable audio - avoids XDG_RUNTIME_DIR issues
             '--hwdec=auto',  # Use hardware decoding when available (critical for Pi)
             '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
