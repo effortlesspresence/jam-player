@@ -58,17 +58,40 @@ from jam_player import constants
 try:
     from PIL import Image, ImageDraw, ImageFont
     HAS_PIL = True
-except ImportError:
+except ImportError as e:
     HAS_PIL = False
+    print(f"WARNING: PIL not available: {e}")
 
 # Try to import qrcode for setup screens
 try:
     import qrcode
     HAS_QRCODE = True
-except ImportError:
+except ImportError as e:
     HAS_QRCODE = False
+    print(f"WARNING: qrcode not available: {e}")
 
 logger = setup_service_logging('jam-player-display')
+
+# Log dependency status at startup
+def _log_dependency_status():
+    """Log the availability of optional dependencies."""
+    logger.info(f"Dependency status: PIL={HAS_PIL}, qrcode={HAS_QRCODE}")
+
+    # Check for feh
+    try:
+        result = subprocess.run(['which', 'feh'], capture_output=True, text=True)
+        has_feh = result.returncode == 0
+        logger.info(f"feh available: {has_feh} ({result.stdout.strip() if has_feh else 'not found'})")
+    except Exception as e:
+        logger.warning(f"Could not check for feh: {e}")
+
+    # Check for ImageMagick (fallback)
+    try:
+        result = subprocess.run(['which', 'convert'], capture_output=True, text=True)
+        has_imagemagick = result.returncode == 0
+        logger.info(f"ImageMagick available: {has_imagemagick} ({result.stdout.strip() if has_imagemagick else 'not found'})")
+    except Exception as e:
+        logger.warning(f"Could not check for ImageMagick: {e}")
 sd_notifier = get_systemd_notifier()
 
 # =============================================================================
@@ -509,14 +532,56 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
     return img
 
 
-def display_image_with_feh(img: Image.Image, img_name: str = "jam_display") -> Optional[subprocess.Popen]:
-    """Display an image fullscreen using feh. Returns the process handle."""
-    if img is None:
+def create_fallback_image(width: int, height: int, message: str, img_name: str) -> Optional[str]:
+    """
+    Create a simple fallback image using ImageMagick when PIL fails.
+    Returns the path to the created image, or None if ImageMagick also fails.
+    """
+    img_path = f'/tmp/{img_name}.png'
+    try:
+        # Use ImageMagick to create a simple text image
+        result = subprocess.run([
+            'convert',
+            '-size', f'{width}x{height}',
+            'xc:black',
+            '-fill', 'white',
+            '-gravity', 'center',
+            '-pointsize', '48',
+            '-annotate', '0', message,
+            img_path
+        ], capture_output=True, timeout=10)
+
+        if result.returncode == 0 and os.path.exists(img_path):
+            os.chmod(img_path, 0o644)
+            logger.info(f"Created fallback image with ImageMagick: {img_path}")
+            return img_path
+        else:
+            logger.warning(f"ImageMagick failed: {result.stderr.decode()[:200]}")
+            return None
+    except Exception as e:
+        logger.warning(f"Fallback image creation failed: {e}")
         return None
 
+
+def display_image_with_feh(img: Image.Image, img_name: str = "jam_display", fallback_message: str = None) -> Optional[subprocess.Popen]:
+    """Display an image fullscreen using feh. Returns the process handle."""
     img_path = f'/tmp/{img_name}.png'
-    img.save(img_path, 'PNG')
-    os.chmod(img_path, 0o644)
+
+    if img is None:
+        if fallback_message:
+            # Try to create a fallback image with ImageMagick
+            logger.warning(f"PIL image is None, attempting ImageMagick fallback")
+            width, height = get_fb_size()
+            img_path = create_fallback_image(width, height, fallback_message, img_name)
+            if not img_path:
+                logger.error("Both PIL and ImageMagick fallback failed - no image to display")
+                return None
+        else:
+            logger.error("No image to display and no fallback message provided")
+            return None
+    else:
+        img.save(img_path, 'PNG')
+        os.chmod(img_path, 0o644)
 
     # Wait for X display to be available
     for _ in range(30):
@@ -934,7 +999,14 @@ class JamPlayerDisplayManager:
             img = create_unregistered_screen(
                 self.screen_width, self.screen_height, device_uuid
             )
-            self.feh_process = display_image_with_feh(img, "jam_display_unregistered")
+            self.feh_process = display_image_with_feh(
+                img, "jam_display_unregistered",
+                fallback_message="Welcome to JAM Player\n\nDownload JAM Setup app\nto configure this device"
+            )
+            if self.feh_process:
+                logger.info(f"feh process started: PID {self.feh_process.pid}")
+            else:
+                logger.error("Failed to start feh for UNREGISTERED screen")
             sd_notifier.notify("STATUS=Showing setup screen")
 
         elif new_mode == DisplayMode.REGISTERED_NOT_LINKED:
@@ -942,7 +1014,14 @@ class JamPlayerDisplayManager:
             img = create_registered_not_linked_screen(
                 self.screen_width, self.screen_height, device_uuid
             )
-            self.feh_process = display_image_with_feh(img, "jam_display_not_linked")
+            self.feh_process = display_image_with_feh(
+                img, "jam_display_not_linked",
+                fallback_message="Registered!\n\nOpen JAM Setup app\nto link this player to a screen"
+            )
+            if self.feh_process:
+                logger.info(f"feh process started: PID {self.feh_process.pid}")
+            else:
+                logger.error("Failed to start feh for REGISTERED_NOT_LINKED screen")
             sd_notifier.notify("STATUS=Registered - waiting for screen link")
 
         elif new_mode == DisplayMode.LINKED_WAITING_FOR_CONTENT:
@@ -951,7 +1030,14 @@ class JamPlayerDisplayManager:
             img = create_waiting_for_content_screen(
                 self.screen_width, self.screen_height, screen_id
             )
-            self.feh_process = display_image_with_feh(img, "jam_display_waiting")
+            self.feh_process = display_image_with_feh(
+                img, "jam_display_waiting",
+                fallback_message="Waiting for content...\n\nContent is being downloaded.\nThis may take a few minutes."
+            )
+            if self.feh_process:
+                logger.info(f"feh process started: PID {self.feh_process.pid}")
+            else:
+                logger.error("Failed to start feh for LINKED_WAITING_FOR_CONTENT screen")
             sd_notifier.notify("STATUS=Waiting for content download")
 
         elif new_mode == DisplayMode.PLAYING_CONTENT:
@@ -1285,6 +1371,44 @@ class JamPlayerDisplayManager:
 
             time.sleep(0.05)
 
+    def _show_no_scheduled_content_screen(self):
+        """Show a message when content exists but all scenes are scheduled off."""
+        logger.info("All scenes scheduled off - showing 'no content scheduled' message")
+
+        # Stop MPV if running
+        if self.mpv:
+            self.mpv.stop_mpv()
+            self.mpv = None
+
+        # Create and show a message
+        if HAS_PIL:
+            img = Image.new('RGB', (self.screen_width, self.screen_height), BACKGROUND_COLOR)
+            draw = ImageDraw.Draw(img)
+            title_font = get_font(FONT_SIZE_TITLE)
+            subtitle_font = get_font(FONT_SIZE_SUBTITLE)
+
+            center_x = self.screen_width // 2
+            center_y = self.screen_height // 2
+
+            title = "No Content Scheduled"
+            bbox = draw.textbbox((0, 0), title, font=title_font)
+            x = center_x - bbox[2] // 2
+            y = center_y - bbox[3] - 20
+            draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
+
+            subtitle = "Content will appear during scheduled hours."
+            bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
+            x = center_x - bbox[2] // 2
+            y = center_y + 20
+            draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
+        else:
+            img = None
+
+        self.feh_process = display_image_with_feh(
+            img, "jam_display_no_schedule",
+            fallback_message="No Content Scheduled\n\nContent will appear\nduring scheduled hours."
+        )
+
     def _run_scene_by_scene_sync(self):
         """
         Play scenes one by one with wall clock sync.
@@ -1295,9 +1419,29 @@ class JamPlayerDisplayManager:
 
         if not scenes:
             logger.warning("No scenes loaded (all may be scheduled off)")
-            # Wait and re-check - schedule might change
-            time.sleep(10)
-            return
+            # Show "no scheduled content" screen instead of black
+            self._show_no_scheduled_content_screen()
+            # Wait for schedule to potentially change
+            while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
+                time.sleep(10)
+                # Re-check if any scenes are now scheduled
+                scenes = self._load_scenes()
+                if scenes:
+                    logger.info(f"Scenes now scheduled - resuming playback with {len(scenes)} scenes")
+                    # Kill feh before restarting MPV
+                    kill_feh_processes()
+                    if self.feh_process:
+                        try:
+                            self.feh_process.terminate()
+                        except:
+                            pass
+                        self.feh_process = None
+                    # Restart MPV for playback
+                    self._start_video_playback()
+                    break
+            else:
+                # Mode changed or stopped, just return
+                return
 
         # Get actual video durations (use duration from API, backend provides exact values now)
         # No need to probe with ffprobe - backend ensures exact durations
@@ -1358,13 +1502,33 @@ class JamPlayerDisplayManager:
                         self._current_scene_index = -1
                         logger.info(f"Active scenes changed: {len(scenes)} scenes, cycle: {cycle_duration_ms}ms")
                 elif not new_scenes and scenes:
-                    # All scenes now scheduled off
-                    logger.info("All scenes now scheduled off - waiting for schedule window")
+                    # All scenes now scheduled off - show message screen
+                    logger.info("All scenes now scheduled off - showing waiting screen")
+                    self._show_no_scheduled_content_screen()
                     scenes = []
                     self._current_scene_index = -1
 
             if not scenes:
-                time.sleep(1)
+                # Wait and re-check for scheduled scenes
+                time.sleep(5)
+                new_scenes = self._load_scenes()
+                if new_scenes:
+                    logger.info(f"Scenes now scheduled - resuming playback with {len(new_scenes)} scenes")
+                    # Kill feh and restart MPV
+                    kill_feh_processes()
+                    if self.feh_process:
+                        try:
+                            self.feh_process.terminate()
+                        except:
+                            pass
+                        self.feh_process = None
+                    self._start_video_playback()
+                    scenes = new_scenes
+                    for scene in scenes:
+                        if 'actual_duration' not in scene:
+                            scene['actual_duration'] = scene.get('duration', 15)
+                    cycle_duration_ms = self._calculate_cycle_duration_ms(scenes)
+                    self._current_scene_index = -1
                 continue
 
             # Calculate where we should be based on wall clock
@@ -1507,6 +1671,7 @@ class JamPlayerDisplayManager:
         logger.info("=" * 60)
         logger.info("JAM PLAYER DISPLAY SERVICE - 4-MODE UNIFIED DISPLAY")
         logger.info(f"Screen: {self.screen_width}x{self.screen_height}")
+        _log_dependency_status()
         logger.info("=" * 60)
 
         # Send READY=1 immediately - we're initialized and entering main loop
@@ -1534,7 +1699,17 @@ class JamPlayerDisplayManager:
                     # After video loop exits, recheck state
                     continue
 
-                # For static display modes, just sleep and check state
+                # For static display modes, check feh is still running and sleep
+                if self.feh_process:
+                    poll_result = self.feh_process.poll()
+                    if poll_result is not None:
+                        # feh has exited - this shouldn't happen
+                        logger.warning(f"feh process exited with code {poll_result}, restarting display")
+                        # Force re-transition to current mode to restart feh
+                        old_mode = self.current_mode
+                        self.current_mode = None
+                        self.transition_to_mode(old_mode)
+
                 sd_notifier.notify("WATCHDOG=1")
                 time.sleep(1)
 
