@@ -329,6 +329,55 @@ def get_file_extension_from_url(url: str) -> str:
     return '.mp4' if 'video' in url.lower() else '.jpg'
 
 
+def cleanup_unused_media(referenced_files: set) -> int:
+    """
+    Remove media files that are no longer referenced by any scene.
+
+    Args:
+        referenced_files: Set of filenames (not full paths) that are currently in use.
+
+    Returns:
+        Number of files deleted.
+    """
+    if not LIVE_MEDIA_DIR.exists():
+        return 0
+
+    # Files to always keep (generated files, not downloaded)
+    always_keep = {'loop.mp4'}
+
+    deleted_count = 0
+    total_bytes_freed = 0
+
+    try:
+        for file_path in LIVE_MEDIA_DIR.iterdir():
+            if not file_path.is_file():
+                continue
+
+            filename = file_path.name
+
+            # Skip files that are referenced or should always be kept
+            if filename in referenced_files or filename in always_keep:
+                continue
+
+            # Delete unused file
+            try:
+                file_size = file_path.stat().st_size
+                file_path.unlink()
+                deleted_count += 1
+                total_bytes_freed += file_size
+                logger.info(f"Deleted unused media file: {filename} ({file_size / 1024 / 1024:.1f}MB)")
+            except Exception as e:
+                logger.warning(f"Failed to delete {filename}: {e}")
+
+        if deleted_count > 0:
+            logger.info(f"Cleanup complete: deleted {deleted_count} files, freed {total_bytes_freed / 1024 / 1024:.1f}MB")
+
+    except Exception as e:
+        logger.error(f"Error during media cleanup: {e}", exc_info=True)
+
+    return deleted_count
+
+
 def load_content() -> bool:
     """
     Fetch content from API and download all media files.
@@ -444,6 +493,10 @@ def load_content() -> bool:
     # Also copy loop.mp4 to live media dir for easy access
     if loop_path.exists():
         shutil.copy2(loop_path, LIVE_MEDIA_DIR / "loop.mp4")
+
+    # Clean up unused media files to free disk space
+    referenced_files = {s.get('media_file') for s in processed_scenes if s.get('media_file')}
+    cleanup_unused_media(referenced_files)
 
     logger.info("Content loaded successfully")
     return True
