@@ -650,7 +650,7 @@ class MpvIpcClient:
 
         self.stop_mpv()
 
-        args = [
+        mpv_args = [
             'mpv',
             '--idle=yes',
             '--fullscreen',
@@ -661,34 +661,33 @@ class MpvIpcClient:
             '--force-window=yes',
             '--no-terminal',
             '--keep-open=yes',
-            '--no-audio',  # Silent playback - no audio output
             '--hwdec=auto',  # Use hardware decoding when available (critical for Pi)
             '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
             '--cache=yes',
             '--demuxer-max-bytes=150M',
             '--demuxer-readahead-secs=20',
-            '--video-sync=audio',  # Sync to audio clock (even with --no-audio, this is more stable)
+            '--video-sync=display-resample',  # Sync to display refresh rate
             f'--video-rotate={rotation_angle}',
             f'--input-ipc-server={self.socket_path}',
         ]
 
         # Add loop option only for legacy single-video mode
         if loop:
-            args.insert(-1, '--loop-file=inf')
-            args.insert(-1, '--hr-seek-framedrop=no')
+            mpv_args.insert(-1, '--loop-file=inf')
+            mpv_args.insert(-1, '--hr-seek-framedrop=no')
+
+        # Run MPV as comitup user (same as feh) for X11 access
+        args = [
+            'sudo', '-u', 'comitup',
+            'env', 'DISPLAY=:0',
+        ] + mpv_args
 
         try:
             logger.info(f"Starting MPV with IPC socket at {self.socket_path}")
 
-            # Set DISPLAY environment for MPV
-            env = os.environ.copy()
-            env['DISPLAY'] = ':0'
-            env['XAUTHORITY'] = '/home/comitup/.Xauthority'
-
             self.process = subprocess.Popen(
                 args,
-                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
