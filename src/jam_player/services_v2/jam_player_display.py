@@ -33,8 +33,9 @@ import signal
 import threading
 from pathlib import Path
 from enum import Enum
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
 from dataclasses import dataclass
+from datetime import datetime, time as dt_time
 
 # Add the services directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,6 +71,33 @@ except ImportError:
 logger = setup_service_logging('jam-player-display')
 sd_notifier = get_systemd_notifier()
 
+# =============================================================================
+# Sync Configuration - for multi-display wall clock synchronization
+# =============================================================================
+
+# How often to check sync (ms)
+SYNC_CHECK_INTERVAL_MS = 200
+
+# Only seek if drift exceeds this (emergency correction)
+SEEK_THRESHOLD_MS = 500
+
+# Consider "in sync" if within this tolerance
+TARGET_SYNC_TOLERANCE_MS = 10
+
+# Proportional speed control - adjust playback speed based on drift magnitude
+# Offset ranges and corresponding speed adjustments:
+#   0-10ms:    normal speed (1.0x)
+#   10-30ms:   gentle correction (1.01x / 0.99x)
+#   30-100ms:  moderate correction (1.03x / 0.97x)
+#   100-500ms: aggressive correction (1.05x / 0.95x)
+SPEED_NORMAL = 1.0
+SPEED_GENTLE_FAST = 1.01
+SPEED_GENTLE_SLOW = 0.99
+SPEED_MODERATE_FAST = 1.03
+SPEED_MODERATE_SLOW = 0.97
+SPEED_AGGRESSIVE_FAST = 1.05
+SPEED_AGGRESSIVE_SLOW = 0.95
+
 
 class DisplayMode(Enum):
     """The 4 display modes from the design doc."""
@@ -77,6 +105,110 @@ class DisplayMode(Enum):
     REGISTERED_NOT_LINKED = "registered_not_linked"
     LINKED_WAITING_FOR_CONTENT = "linked_waiting_for_content"
     PLAYING_CONTENT = "playing_content"
+
+
+# =============================================================================
+# Scheduling Helpers - Filter scenes by day/time
+# =============================================================================
+
+# Map Python weekday (0=Monday) to API day names
+WEEKDAY_NAMES = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
+
+
+def parse_time_str(time_str: str) -> Optional[dt_time]:
+    """Parse 'HH:MM' string to datetime.time object."""
+    if not time_str:
+        return None
+    try:
+        parts = time_str.split(':')
+        return dt_time(int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+def is_scene_scheduled_now(scene: Dict[str, Any]) -> bool:
+    """
+    Check if a scene should be displayed right now based on its daysScheduled.
+
+    Rules from the design doc:
+    1. If current day is NOT in daysScheduled list → don't display
+    2. If current day IS in list but startTime/endTime are null → display all day
+    3. If current day IS in list with startTime + endTime → only display during that range
+
+    Args:
+        scene: Scene dict with optional 'days_scheduled' field
+
+    Returns:
+        True if scene should be displayed now, False otherwise
+    """
+    days_scheduled = scene.get('days_scheduled', [])
+
+    # If no scheduling info, always display (backwards compatibility)
+    if not days_scheduled:
+        return True
+
+    now = datetime.now()
+    current_weekday = WEEKDAY_NAMES[now.weekday()]
+    current_time = now.time()
+
+    # Find schedule entry for current day
+    for schedule in days_scheduled:
+        day_of_week = schedule.get('dayOfWeek')
+        if day_of_week != current_weekday:
+            continue
+
+        # Found entry for today
+        start_time_str = schedule.get('startTime')
+        end_time_str = schedule.get('endTime')
+
+        # If no time constraints, display all day
+        if not start_time_str and not end_time_str:
+            return True
+
+        # If we have time constraints, check them
+        start_time = parse_time_str(start_time_str)
+        end_time = parse_time_str(end_time_str)
+
+        if start_time and end_time:
+            # Handle overnight schedules (e.g., 22:00 to 02:00)
+            if start_time <= end_time:
+                # Normal range (e.g., 09:00 to 17:00)
+                if start_time <= current_time <= end_time:
+                    return True
+            else:
+                # Overnight range (e.g., 22:00 to 02:00)
+                if current_time >= start_time or current_time <= end_time:
+                    return True
+        elif start_time:
+            # Only start time - display from start time until midnight
+            if current_time >= start_time:
+                return True
+        elif end_time:
+            # Only end time - display from midnight until end time
+            if current_time <= end_time:
+                return True
+
+        # Time constraints not met
+        return False
+
+    # Current day not in schedule list - don't display
+    return False
+
+
+def filter_scenes_by_schedule(scenes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filter scenes to only those that should be displayed right now.
+
+    Args:
+        scenes: List of scene dicts
+
+    Returns:
+        Filtered list of scenes that are scheduled for now
+    """
+    filtered = [s for s in scenes if is_scene_scheduled_now(s)]
+    if len(filtered) != len(scenes):
+        logger.info(f"Schedule filter: {len(filtered)}/{len(scenes)} scenes active now")
+    return filtered
 
 
 # =============================================================================
@@ -739,8 +871,17 @@ class JamPlayerDisplayManager:
             logger.warning(f"Error checking content: {e}")
             return False
 
-    def _load_scenes(self) -> list:
-        """Load scenes from the scenes.json file."""
+    def _load_scenes(self, apply_schedule_filter: bool = True) -> list:
+        """
+        Load scenes from the scenes.json file.
+
+        Args:
+            apply_schedule_filter: If True, filter scenes by current day/time schedule.
+                                   Set to False to get all scenes regardless of schedule.
+
+        Returns:
+            List of scene dicts, sorted by order, optionally filtered by schedule.
+        """
         scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
         if not scenes_file.exists():
             return []
@@ -750,6 +891,11 @@ class JamPlayerDisplayManager:
                 scenes = json.load(f)
             # Sort by order
             scenes.sort(key=lambda s: s.get('order', 0))
+
+            # Filter by schedule if requested
+            if apply_schedule_filter:
+                scenes = filter_scenes_by_schedule(scenes)
+
             return scenes
         except Exception as e:
             logger.error(f"Error loading scenes: {e}")
@@ -832,76 +978,433 @@ class JamPlayerDisplayManager:
         logger.info("MPV started successfully")
         self.is_playing = False  # Will be set true once we load a file
 
+    # =========================================================================
+    # Wall Clock Sync Methods
+    # =========================================================================
+
+    def _get_wall_clock_ms(self) -> int:
+        """Get current wall clock time in milliseconds since epoch."""
+        return int(time.time() * 1000)
+
+    def _calculate_cycle_duration_ms(self, scenes: list) -> int:
+        """Calculate total cycle duration in milliseconds."""
+        total_ms = 0
+        for scene in scenes:
+            # All content is video now - backend provides exact duration
+            duration_sec = scene.get('actual_duration', scene.get('duration', 15))
+            total_ms += int(duration_sec * 1000)
+        return total_ms
+
+    def _get_scene_at_position(self, scenes: list, position_ms: int) -> tuple:
+        """
+        Given a position in the cycle, determine which scene and position within it.
+
+        Returns:
+            (scene_index, position_within_scene_ms, scene)
+        """
+        elapsed_ms = 0
+        for i, scene in enumerate(scenes):
+            duration_sec = scene.get('actual_duration', scene.get('duration', 15))
+            duration_ms = int(duration_sec * 1000)
+
+            if elapsed_ms + duration_ms > position_ms:
+                # This is the scene we should be on
+                position_within = position_ms - elapsed_ms
+                return (i, position_within, scene)
+
+            elapsed_ms += duration_ms
+
+        # Shouldn't happen if position_ms < cycle_duration, but fallback
+        return (0, 0, scenes[0])
+
+    def _calculate_expected_position(self, cycle_duration_ms: int) -> int:
+        """Calculate where in the cycle we should be based on wall clock."""
+        wall_clock_ms = self._get_wall_clock_ms()
+        return wall_clock_ms % cycle_duration_ms
+
+    def _get_sync_offset_ms(self, expected_ms: int, actual_ms: int, duration_ms: int) -> int:
+        """
+        Calculate offset between actual and expected position.
+
+        Returns:
+            Positive = actual is AHEAD (need to slow down)
+            Negative = actual is BEHIND (need to speed up)
+        """
+        offset_ms = actual_ms - expected_ms
+
+        # Handle wrap-around near loop boundary
+        if offset_ms > duration_ms / 2:
+            offset_ms = offset_ms - duration_ms
+        elif offset_ms < -duration_ms / 2:
+            offset_ms = offset_ms + duration_ms
+
+        return offset_ms
+
+    def _adjust_video_sync(self, scene_duration_ms: int, position_in_scene_ms: int) -> None:
+        """
+        Adjust video playback speed based on sync offset.
+        Uses proportional control - bigger offset = bigger correction.
+        """
+        actual_sec = self.mpv.get_playback_time()
+        if actual_sec is None:
+            return
+
+        actual_ms = int(actual_sec * 1000)
+        offset_ms = self._get_sync_offset_ms(position_in_scene_ms, actual_ms, scene_duration_ms)
+        abs_offset = abs(offset_ms)
+
+        if abs_offset > SEEK_THRESHOLD_MS:
+            # Emergency seek required
+            target_sec = position_in_scene_ms / 1000.0
+            logger.warning(f"SYNC EMERGENCY SEEK: offset={offset_ms}ms, seeking to {target_sec:.2f}s")
+            self.mpv.seek(target_sec)
+            self.mpv.set_speed(SPEED_NORMAL)
+            self._current_speed = SPEED_NORMAL
+
+        elif abs_offset > 100:
+            # Aggressive correction (100-500ms)
+            new_speed = SPEED_AGGRESSIVE_FAST if offset_ms < 0 else SPEED_AGGRESSIVE_SLOW
+            if new_speed != getattr(self, '_current_speed', SPEED_NORMAL):
+                self.mpv.set_speed(new_speed)
+                self._current_speed = new_speed
+
+        elif abs_offset > 30:
+            # Moderate correction (30-100ms)
+            new_speed = SPEED_MODERATE_FAST if offset_ms < 0 else SPEED_MODERATE_SLOW
+            if new_speed != getattr(self, '_current_speed', SPEED_NORMAL):
+                self.mpv.set_speed(new_speed)
+                self._current_speed = new_speed
+
+        elif abs_offset > TARGET_SYNC_TOLERANCE_MS:
+            # Gentle correction (10-30ms)
+            new_speed = SPEED_GENTLE_FAST if offset_ms < 0 else SPEED_GENTLE_SLOW
+            if new_speed != getattr(self, '_current_speed', SPEED_NORMAL):
+                self.mpv.set_speed(new_speed)
+                self._current_speed = new_speed
+
+        else:
+            # In sync - normal speed
+            if getattr(self, '_current_speed', SPEED_NORMAL) != SPEED_NORMAL:
+                self.mpv.set_speed(SPEED_NORMAL)
+                self._current_speed = SPEED_NORMAL
+
+    def _preload_video_durations(self, scenes: list, media_dir: Path) -> list:
+        """
+        Set actual_duration for all scenes.
+
+        The backend now provides exact video durations via the 'duration' field,
+        so we just copy that to 'actual_duration'. No ffprobe needed.
+
+        All content is now video (images are converted to video by backend).
+        """
+        for scene in scenes:
+            # Backend provides exact duration - no need to probe
+            scene['actual_duration'] = scene.get('duration', 15)
+
+        return scenes
+
+    # =========================================================================
+    # Main Content Loop with Wall Clock Sync
+    # =========================================================================
+
+    def _load_loop_metadata(self) -> Optional[dict]:
+        """Load loop_meta.json if available."""
+        meta_path = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "loop_meta.json"
+        if meta_path.exists():
+            try:
+                with open(meta_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load loop metadata: {e}")
+        return None
+
+    def _has_scheduled_scenes(self) -> bool:
+        """Check if any scene has scheduling constraints."""
+        scenes = self._load_scenes(apply_schedule_filter=False)
+        for scene in scenes:
+            days_scheduled = scene.get('days_scheduled', [])
+            if days_scheduled:
+                return True
+        return False
+
     def run_video_loop(self):
-        """Main content playback loop - plays scenes sequentially."""
+        """
+        Main content playback loop with wall clock synchronization.
+
+        If scenes have scheduling constraints (days_scheduled), uses scene-by-scene
+        playback so we can dynamically filter based on current day/time.
+
+        Otherwise uses the stitched loop.mp4 if available (preferred - gapless playback).
+
+        All JAM Players displaying the same Screen will show the same content
+        at the same time, synchronized via wall clock (chrony/NTP).
+        """
         if not self.mpv:
             return
 
-        logger.info("Starting scene-based content playback")
+        logger.info("=" * 60)
+        logger.info("Starting SYNCED content playback (wall clock mode)")
+        logger.info(f"Sync config: check={SYNC_CHECK_INTERVAL_MS}ms, tolerance={TARGET_SYNC_TOLERANCE_MS}ms")
+        logger.info("=" * 60)
 
+        media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
+
+        # Check if any scene has scheduling - if so, use scene-by-scene for dynamic filtering
+        if self._has_scheduled_scenes():
+            logger.info("Scenes have scheduling constraints - using scene-by-scene playback for dynamic filtering")
+            self._run_scene_by_scene_sync()
+            return
+
+        # Check for stitched loop.mp4 (preferred for gapless playback)
+        loop_path = media_dir / "loop.mp4"
+        loop_meta = self._load_loop_metadata()
+
+        if loop_path.exists() and loop_meta:
+            self._run_loop_video_sync(loop_path, loop_meta)
+        else:
+            logger.warning("No stitched loop.mp4 found - using scene-by-scene playback (may have transition glitches)")
+            self._run_scene_by_scene_sync()
+
+    def _run_loop_video_sync(self, loop_path: Path, loop_meta: dict):
+        """
+        Play the stitched loop.mp4 with wall clock synchronization.
+        This is the preferred mode - gapless playback with tight sync.
+        """
+        loop_duration_sec = loop_meta.get('total_duration', 60)
+        loop_duration_ms = int(loop_duration_sec * 1000)
+        scene_count = loop_meta.get('scene_count', 0)
+
+        logger.info(f"Playing stitched loop: {loop_path}")
+        logger.info(f"Loop duration: {loop_duration_sec:.1f}s ({scene_count} scenes)")
+
+        # Load the loop video
+        self.mpv.load_file(str(loop_path))
+        time.sleep(0.5)
+
+        # Initial sync - seek to correct position
+        expected_ms = self._calculate_expected_position(loop_duration_ms)
+        expected_sec = expected_ms / 1000.0
+        self.mpv.seek(expected_sec)
+        self.mpv.set_property('pause', False)
+        self.mpv.set_speed(SPEED_NORMAL)
+        self._current_speed = SPEED_NORMAL
+
+        logger.info(f"Initial sync: seeking to {expected_sec:.2f}s")
+
+        self._last_sync_check = 0
+        self._last_sync_log = 0
+        self._last_content_mtime = 0
+        sync_stats = {'adjustments': 0, 'seeks': 0, 'in_sync': 0}
+
+        while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
+            # Check for content updates (loop.mp4 rebuilt)
+            try:
+                current_mtime = loop_path.stat().st_mtime
+                if self._last_content_mtime == 0:
+                    self._last_content_mtime = current_mtime
+                elif current_mtime != self._last_content_mtime:
+                    logger.info("Loop video updated - reloading")
+                    self._last_content_mtime = current_mtime
+                    # Reload loop metadata
+                    new_meta = self._load_loop_metadata()
+                    if new_meta:
+                        loop_duration_sec = new_meta.get('total_duration', 60)
+                        loop_duration_ms = int(loop_duration_sec * 1000)
+                    # Reload and sync
+                    self.mpv.load_file(str(loop_path))
+                    time.sleep(0.3)
+                    expected_ms = self._calculate_expected_position(loop_duration_ms)
+                    self.mpv.seek(expected_ms / 1000.0)
+                    self.mpv.set_speed(SPEED_NORMAL)
+                    self._current_speed = SPEED_NORMAL
+                    continue
+            except Exception as e:
+                logger.warning(f"Error checking loop file: {e}")
+
+            # Sync adjustment
+            current_time_ms = self._get_wall_clock_ms()
+
+            if current_time_ms - self._last_sync_check >= SYNC_CHECK_INTERVAL_MS:
+                self._last_sync_check = current_time_ms
+
+                # Get actual playback position
+                actual_sec = self.mpv.get_playback_time()
+                if actual_sec is not None:
+                    actual_ms = int(actual_sec * 1000)
+                    expected_ms = self._calculate_expected_position(loop_duration_ms)
+                    offset_ms = self._get_sync_offset_ms(expected_ms, actual_ms, loop_duration_ms)
+                    abs_offset = abs(offset_ms)
+
+                    # Apply proportional speed control
+                    if abs_offset > SEEK_THRESHOLD_MS:
+                        # Emergency seek
+                        target_sec = expected_ms / 1000.0
+                        logger.warning(f"SYNC EMERGENCY SEEK: offset={offset_ms}ms -> {target_sec:.2f}s")
+                        self.mpv.seek(target_sec)
+                        self.mpv.set_speed(SPEED_NORMAL)
+                        self._current_speed = SPEED_NORMAL
+                        sync_stats['seeks'] += 1
+
+                    elif abs_offset > 100:
+                        new_speed = SPEED_AGGRESSIVE_FAST if offset_ms < 0 else SPEED_AGGRESSIVE_SLOW
+                        if new_speed != self._current_speed:
+                            self.mpv.set_speed(new_speed)
+                            self._current_speed = new_speed
+                            sync_stats['adjustments'] += 1
+
+                    elif abs_offset > 30:
+                        new_speed = SPEED_MODERATE_FAST if offset_ms < 0 else SPEED_MODERATE_SLOW
+                        if new_speed != self._current_speed:
+                            self.mpv.set_speed(new_speed)
+                            self._current_speed = new_speed
+                            sync_stats['adjustments'] += 1
+
+                    elif abs_offset > TARGET_SYNC_TOLERANCE_MS:
+                        new_speed = SPEED_GENTLE_FAST if offset_ms < 0 else SPEED_GENTLE_SLOW
+                        if new_speed != self._current_speed:
+                            self.mpv.set_speed(new_speed)
+                            self._current_speed = new_speed
+                            sync_stats['adjustments'] += 1
+
+                    else:
+                        if self._current_speed != SPEED_NORMAL:
+                            self.mpv.set_speed(SPEED_NORMAL)
+                            self._current_speed = SPEED_NORMAL
+                        sync_stats['in_sync'] += 1
+
+                    # Log sync status every 5 seconds
+                    if current_time_ms - self._last_sync_log >= 5000:
+                        self._last_sync_log = current_time_ms
+                        status = "IN_SYNC" if abs_offset <= TARGET_SYNC_TOLERANCE_MS else "ADJUSTING"
+                        speed_str = f"{self._current_speed:.2f}x"
+                        logger.info(
+                            f"SYNC [{status}]: offset={offset_ms:+d}ms speed={speed_str} "
+                            f"| pos={actual_sec:.1f}s/{loop_duration_sec:.1f}s "
+                            f"| stats={{seeks:{sync_stats['seeks']}, adj:{sync_stats['adjustments']}, sync:{sync_stats['in_sync']}}}"
+                        )
+
+            time.sleep(0.05)
+
+    def _run_scene_by_scene_sync(self):
+        """
+        Play scenes one by one with wall clock sync.
+        Supports dynamic scheduling - periodically re-filters scenes by day/time.
+        """
         media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
         scenes = self._load_scenes()
 
         if not scenes:
-            logger.warning("No scenes loaded")
+            logger.warning("No scenes loaded (all may be scheduled off)")
+            # Wait and re-check - schedule might change
+            time.sleep(10)
             return
 
-        logger.info(f"Loaded {len(scenes)} scenes")
-        for i, scene in enumerate(scenes):
-            logger.info(f"  Scene {i}: {scene.get('id')} - {scene.get('media_type')} - {scene.get('media_file')}")
+        # Get actual video durations (use duration from API, backend provides exact values now)
+        # No need to probe with ffprobe - backend ensures exact durations
+        for scene in scenes:
+            if 'actual_duration' not in scene:
+                scene['actual_duration'] = scene.get('duration', 15)
 
-        current_scene_index = 0
+        cycle_duration_ms = self._calculate_cycle_duration_ms(scenes)
+        logger.info(f"Loaded {len(scenes)} active scenes, cycle duration: {cycle_duration_ms}ms ({cycle_duration_ms/1000:.1f}s)")
+
+        self._current_speed = SPEED_NORMAL
+        self._current_scene_index = -1
+        self._last_sync_check = 0
+        self._last_sync_log = 0
+        self._last_schedule_check = 0
+
+        # How often to re-check schedule (every 60 seconds)
+        SCHEDULE_CHECK_INTERVAL_SEC = 60
 
         while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
-            # Reload scenes if content was updated
-            scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
-            scenes_mtime = scenes_file.stat().st_mtime if scenes_file.exists() else 0
+            current_time_sec = time.time()
 
-            if not hasattr(self, '_last_scenes_mtime') or scenes_mtime != self._last_scenes_mtime:
-                self._last_scenes_mtime = scenes_mtime
-                new_scenes = self._load_scenes()
+            # Check for content updates (file modified)
+            scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
+            try:
+                scenes_mtime = scenes_file.stat().st_mtime if scenes_file.exists() else 0
+            except:
+                scenes_mtime = 0
+
+            content_changed = not hasattr(self, '_last_scenes_mtime') or scenes_mtime != self._last_scenes_mtime
+
+            # Periodically re-check schedule even if content hasn't changed
+            schedule_check_needed = (current_time_sec - self._last_schedule_check) >= SCHEDULE_CHECK_INTERVAL_SEC
+
+            if content_changed or schedule_check_needed:
+                if content_changed:
+                    self._last_scenes_mtime = scenes_mtime
+                    logger.info("Content file updated, reloading scenes")
+                if schedule_check_needed:
+                    self._last_schedule_check = current_time_sec
+                    logger.debug("Periodic schedule re-check")
+
+                new_scenes = self._load_scenes()  # This applies schedule filter
+
                 if new_scenes:
-                    scenes = new_scenes
-                    current_scene_index = 0
-                    logger.info(f"Reloaded {len(scenes)} scenes")
+                    # Update durations
+                    for scene in new_scenes:
+                        if 'actual_duration' not in scene:
+                            scene['actual_duration'] = scene.get('duration', 15)
+
+                    # Check if active scene list changed
+                    old_scene_ids = [s.get('id') for s in scenes]
+                    new_scene_ids = [s.get('id') for s in new_scenes]
+
+                    if old_scene_ids != new_scene_ids:
+                        scenes = new_scenes
+                        cycle_duration_ms = self._calculate_cycle_duration_ms(scenes)
+                        self._current_scene_index = -1
+                        logger.info(f"Active scenes changed: {len(scenes)} scenes, cycle: {cycle_duration_ms}ms")
+                elif not new_scenes and scenes:
+                    # All scenes now scheduled off
+                    logger.info("All scenes now scheduled off - waiting for schedule window")
+                    scenes = []
+                    self._current_scene_index = -1
 
             if not scenes:
                 time.sleep(1)
                 continue
 
-            # Get current scene
-            if current_scene_index >= len(scenes):
-                current_scene_index = 0
-                logger.info("Completed scene cycle, starting over")
+            # Calculate where we should be based on wall clock
+            position_in_cycle_ms = self._calculate_expected_position(cycle_duration_ms)
+            scene_index, position_in_scene_ms, scene = self._get_scene_at_position(scenes, position_in_cycle_ms)
 
-            scene = scenes[current_scene_index]
             media_file = scene.get('media_file')
-            media_type = scene.get('media_type', 'IMAGE')
-            time_to_display = scene.get('time_to_display', 15)
-
+            media_type = scene.get('media_type', 'VIDEO')  # All content is video now
+            scene_duration_ms = int(scene.get('actual_duration', scene.get('duration', 15)) * 1000)
             media_path = media_dir / media_file
 
-            if not media_path.exists():
-                logger.error(f"Media file not found: {media_path}")
-                current_scene_index += 1
-                continue
+            # Check if we need to switch scenes
+            if scene_index != self._current_scene_index:
+                if not media_path.exists():
+                    logger.error(f"Media file not found: {media_path}")
+                    time.sleep(0.5)
+                    continue
 
-            logger.info(f"Displaying scene {current_scene_index}: {scene.get('id')} ({media_type})")
+                logger.info(f"Switching to scene {scene_index}: {scene.get('id')} ({media_type}) @ {position_in_scene_ms}ms")
+                self._current_scene_index = scene_index
 
-            # Load the file
-            self.mpv.load_file(str(media_path))
-            time.sleep(0.3)
+                self.mpv.load_file(str(media_path))
+                time.sleep(0.2)
 
-            if media_type == 'VIDEO':
-                # Wait for video to finish
-                if not self._wait_for_video_end():
-                    break  # State changed or interrupted
-            else:
-                # Wait for the configured duration (images)
-                if not self._wait_for_duration(time_to_display):
-                    break  # State changed or interrupted
+                if media_type == 'VIDEO':
+                    seek_sec = position_in_scene_ms / 1000.0
+                    self.mpv.seek(seek_sec)
+                    self.mpv.set_speed(SPEED_NORMAL)
+                    self._current_speed = SPEED_NORMAL
 
-            current_scene_index += 1
+            # Sync logic for videos
+            current_time_ms = self._get_wall_clock_ms()
+
+            if current_time_ms - self._last_sync_check >= SYNC_CHECK_INTERVAL_MS:
+                self._last_sync_check = current_time_ms
+
+                if media_type == 'VIDEO':
+                    self._adjust_video_sync(scene_duration_ms, position_in_scene_ms)
+
+            time.sleep(0.05)
 
     def _check_content_updated(self) -> bool:
         """Check if scenes.json has been updated since we last loaded it."""

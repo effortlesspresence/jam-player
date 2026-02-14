@@ -4,8 +4,15 @@ JAM Player 2.0 - Scenes Manager Service
 This service manages content for the JAM Player:
 1. Polls the JAM 2.0 API for content updates
 2. Fetches scene content when updates are available
-3. Downloads media files (images and videos)
-4. Writes scene data for jam_player_app to consume
+3. Downloads media files (all videos - images are converted to video by backend)
+4. Writes scene data for jam_player_display to consume
+
+The backend now handles:
+- Converting all image scenes to videos with exact timeToDisplay duration
+- Normalizing all videos to the same encoding (libx265, CRF 22, 30fps)
+- Adding silent audio tracks for sync
+
+This service just downloads the pre-processed videos and manages scheduling.
 
 TEMPORARY: This polling mechanism will be replaced with WebSocket push
 notifications in a future release.
@@ -15,8 +22,12 @@ import os
 import json
 import time
 import hashlib
+import shutil
+import subprocess
+import tempfile
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+from datetime import datetime
 
 from jam_player import constants
 from jam_player.utils import logging_utils as lu
@@ -91,7 +102,7 @@ def fetch_content() -> Optional[List[Dict[str, Any]]]:
     Calls GET /jam-players/{deviceUuid}/content with Ed25519 signing.
 
     Returns:
-        List of scene dicts with id, videoUrl, imageUrl, timeToDisplay, or None on error.
+        List of scene dicts with id, videoUrl, videoDuration, daysScheduled, or None on error.
     """
     device_uuid = get_device_uuid()
     if not device_uuid:
@@ -182,6 +193,120 @@ def download_media(url: str, dest_path: Path) -> bool:
     return False
 
 
+def stitch_scenes_to_loop(scenes: List[Dict[str, Any]], media_dir: Path, output_path: Path) -> bool:
+    """
+    Stitch all scenes into a single loop.mp4 video for gapless playback.
+
+    Uses stream copy (-c copy) for fast concatenation. All input videos
+    must be pre-normalized to the same format (done during download).
+
+    Args:
+        scenes: List of processed scene dicts with video_clip field
+        media_dir: Directory containing media files
+        output_path: Where to write the stitched loop.mp4
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    if not scenes:
+        logger.warning("No scenes to stitch")
+        return False
+
+    logger.info(f"Stitching {len(scenes)} scenes into loop video (stream copy)...")
+
+    try:
+        # Create concat file listing all video clips
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            concat_file = f.name
+
+            for scene in scenes:
+                video_clip = scene.get('video_clip')
+                if not video_clip:
+                    logger.warning(f"Scene {scene.get('id')} has no video_clip, skipping")
+                    continue
+
+                clip_path = media_dir / video_clip
+                if not clip_path.exists():
+                    logger.warning(f"Video clip not found: {clip_path}")
+                    continue
+
+                f.write(f"file '{clip_path}'\n")
+
+        # Concatenate with stream copy (very fast, no re-encoding)
+        stitch_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_file,
+            '-c', 'copy',  # Stream copy - no re-encoding!
+            '-movflags', '+faststart',
+            str(output_path)
+        ]
+
+        logger.info("Running ffmpeg concat with stream copy...")
+        start_time = time.time()
+
+        result = subprocess.run(stitch_cmd, capture_output=True, timeout=60)
+
+        elapsed = time.time() - start_time
+
+        if result.returncode != 0:
+            logger.error(f"Failed to stitch videos: {result.stderr.decode()[:500]}")
+            # Clean up concat file
+            try:
+                os.unlink(concat_file)
+            except:
+                pass
+            return False
+
+        # Clean up concat file
+        os.unlink(concat_file)
+
+        # Get final loop duration
+        loop_duration = get_video_duration(output_path)
+        file_size_mb = output_path.stat().st_size / (1024 * 1024)
+
+        logger.info(f"Stitched loop.mp4: {loop_duration:.1f}s, {file_size_mb:.1f}MB (took {elapsed:.1f}s)")
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.error("Stitch operation timed out")
+        return False
+    except Exception as e:
+        logger.error(f"Error stitching scenes: {e}", exc_info=True)
+        return False
+
+
+def get_video_duration(file_path: Path) -> Optional[float]:
+    """
+    Get the duration of a video file using ffprobe.
+
+    Returns:
+        Duration in seconds, or None if unable to determine.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(file_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception as e:
+        logger.warning(f"Could not get video duration for {file_path}: {e}")
+
+    return None
+
+
 def get_file_extension_from_url(url: str) -> str:
     """Extract file extension from URL, defaulting to appropriate type."""
     if not url:
@@ -208,7 +333,12 @@ def load_content() -> bool:
     """
     Fetch content from API and download all media files.
 
-    This stages content first, then atomically swaps to live.
+    The backend now handles:
+    - Converting all image scenes to videos with exact duration
+    - Normalizing all videos to the same encoding
+    - Adding silent audio tracks for sync
+
+    This service just downloads pre-processed videos and stores scheduling info.
 
     Returns:
         True if successful, False otherwise.
@@ -222,11 +352,9 @@ def load_content() -> bool:
     if not scenes:
         logger.warning("No scenes returned from API")
         # Still write empty scenes file so player knows there's nothing to show
-        pass
 
     # Clear staged directory
     if STAGED_SCENES_DIR.exists():
-        import shutil
         shutil.rmtree(STAGED_SCENES_DIR)
 
     # Ensure directories exist
@@ -238,36 +366,41 @@ def load_content() -> bool:
     for order_index, scene in enumerate(scenes):
         scene_id = scene.get('id')
         video_url = scene.get('videoUrl')
-        image_url = scene.get('imageUrl')
-        time_to_display = scene.get('timeToDisplay', 15)
+        video_duration = scene.get('videoDuration')
+        days_scheduled = scene.get('daysScheduled', [])
 
-        # Determine which URL to use (video takes priority)
-        media_url = video_url or image_url
-        is_video = video_url is not None
+        if not video_url:
+            logger.warning(f"Scene {scene_id} has no videoUrl, skipping")
+            continue
 
-        if not media_url:
-            logger.warning(f"Scene {scene_id} has no media URL, skipping")
+        if video_duration is None:
+            logger.warning(f"Scene {scene_id} has no videoDuration, skipping")
             continue
 
         # Generate filename from URL hash
-        url_hash = hash_string(media_url)
-        extension = get_file_extension_from_url(media_url)
+        url_hash = hash_string(video_url)
+        extension = get_file_extension_from_url(video_url)
         media_filename = f"{url_hash}{extension}"
         media_path = LIVE_MEDIA_DIR / media_filename
 
         # Download if not already present
         if not media_path.exists():
-            if not download_media(media_url, media_path):
-                logger.error(f"Failed to download media for scene {scene_id}, skipping")
+            if not download_media(video_url, media_path):
+                logger.error(f"Failed to download video for scene {scene_id}, skipping")
                 continue
 
+        logger.info(f"Scene {scene_id}: duration={video_duration}s, scheduled_days={len(days_scheduled)}")
+
         # Build processed scene data (order preserves API order)
+        # All content is now video - backend handles image-to-video conversion
         processed_scene = {
             'id': scene_id,
             'order': order_index,
             'media_file': media_filename,
-            'media_type': 'VIDEO' if is_video else 'IMAGE',
-            'time_to_display': time_to_display,
+            'media_type': 'VIDEO',
+            'duration': video_duration,
+            'video_clip': media_filename,  # Same file - already normalized by backend
+            'days_scheduled': days_scheduled,  # For display service to filter by day/time
         }
         processed_scenes.append(processed_scene)
 
@@ -283,11 +416,34 @@ def load_content() -> bool:
 
     logger.info(f"Staged {len(processed_scenes)} scenes")
 
+    # Stitch all scenes into a single loop.mp4 for gapless playback
+    # Note: All videos are now pre-normalized by backend, so stream copy should work
+    loop_path = STAGED_SCENES_DIR / "loop.mp4"
+    if processed_scenes:
+        if not stitch_scenes_to_loop(processed_scenes, LIVE_MEDIA_DIR, loop_path):
+            logger.warning("Failed to create stitched loop - will use scene-by-scene playback")
+        else:
+            # Calculate total duration and add to scenes.json metadata
+            total_duration = sum(s.get('duration', 0) for s in processed_scenes)
+            # Write a loop metadata file
+            loop_meta = {
+                'loop_file': 'loop.mp4',
+                'total_duration': total_duration,
+                'scene_count': len(processed_scenes),
+                'scenes': processed_scenes,
+            }
+            with open(STAGED_SCENES_DIR / "loop_meta.json", 'w') as f:
+                json.dump(loop_meta, f, indent=2)
+            logger.info(f"Loop metadata written: {total_duration:.1f}s total")
+
     # Atomically swap staged to live
-    import shutil
     if LIVE_SCENES_DIR.exists():
         shutil.rmtree(LIVE_SCENES_DIR)
     shutil.copytree(STAGED_SCENES_DIR, LIVE_SCENES_DIR)
+
+    # Also copy loop.mp4 to live media dir for easy access
+    if loop_path.exists():
+        shutil.copy2(loop_path, LIVE_MEDIA_DIR / "loop.mp4")
 
     logger.info("Content loaded successfully")
     return True
