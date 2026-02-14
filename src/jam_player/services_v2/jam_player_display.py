@@ -1372,6 +1372,8 @@ class JamPlayerDisplayManager:
                             f"| stats={{seeks:{sync_stats['seeks']}, adj:{sync_stats['adjustments']}, sync:{sync_stats['in_sync']}}}"
                         )
 
+            # Notify systemd watchdog
+            sd_notifier.notify("WATCHDOG=1")
             time.sleep(0.05)
 
     def _show_no_scheduled_content_screen(self):
@@ -1513,6 +1515,7 @@ class JamPlayerDisplayManager:
 
             if not scenes:
                 # Wait and re-check for scheduled scenes
+                sd_notifier.notify("WATCHDOG=1")
                 time.sleep(5)
                 new_scenes = self._load_scenes()
                 if new_scenes:
@@ -1571,6 +1574,8 @@ class JamPlayerDisplayManager:
                 if media_type == 'VIDEO':
                     self._adjust_video_sync(scene_duration_ms, position_in_scene_ms)
 
+            # Notify systemd watchdog
+            sd_notifier.notify("WATCHDOG=1")
             time.sleep(0.05)
 
     def _check_content_updated(self) -> bool:
