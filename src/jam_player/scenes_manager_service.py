@@ -30,12 +30,12 @@ from pathlib import Path
 from datetime import datetime
 
 from jam_player import constants
-from jam_player.utils import logging_utils as lu
 
 from common.api import api_request
 from common.credentials import get_device_uuid, is_device_registered
+from common.logging_config import setup_service_logging
 
-logger = lu.get_logger("scenes_manager_service")
+logger = setup_service_logging("jam-content-manager")
 
 # Directories for content storage
 LIVE_SCENES_DIR = Path(constants.APP_DATA_LIVE_SCENES_DIR)
