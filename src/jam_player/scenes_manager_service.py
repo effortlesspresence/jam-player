@@ -34,6 +34,7 @@ from jam_player import constants
 from common.api import api_request
 from common.credentials import get_device_uuid, is_device_registered
 from common.logging_config import setup_service_logging
+from common.paths import SCREEN_ID_FILE
 
 logger = setup_service_logging("jam-content-manager")
 
@@ -590,19 +591,52 @@ def run():
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, max_retry_delay)
 
+    # Track screen_id.txt to detect when device is linked to a screen
+    # This allows immediate content fetch when screen is linked via BLE
+    last_screen_id_mtime = None
+    try:
+        if SCREEN_ID_FILE.exists():
+            last_screen_id_mtime = SCREEN_ID_FILE.stat().st_mtime
+    except Exception:
+        pass
+
     # Main polling loop
     while True:
         try:
+            should_load_content = False
+
+            # Check for backend updates (hasUnpulledUpdates flag)
             if check_for_updates():
-                logger.info("Updates detected, reloading content...")
+                logger.info("Backend updates detected")
+                should_load_content = True
+
+            # Check if screen_id.txt changed (e.g., device linked via BLE or heartbeat)
+            try:
+                if SCREEN_ID_FILE.exists():
+                    current_mtime = SCREEN_ID_FILE.stat().st_mtime
+                    if last_screen_id_mtime is None or current_mtime != last_screen_id_mtime:
+                        logger.info("screen_id.txt changed - device linked to screen")
+                        last_screen_id_mtime = current_mtime
+                        should_load_content = True
+                else:
+                    # File was deleted (device unlinked)
+                    if last_screen_id_mtime is not None:
+                        logger.info("screen_id.txt removed - device unlinked from screen")
+                        last_screen_id_mtime = None
+            except Exception as e:
+                logger.warning(f"Error checking screen_id.txt: {e}")
+
+            # Load content if needed
+            if should_load_content:
+                logger.info("Reloading content...")
                 try:
                     if load_content():
                         logger.info("Content reloaded successfully")
-                        # Note: jam_player_display.py monitors scenes.json mtime directly
                     else:
                         logger.error("Failed to reload content")
                 except Exception as e:
                     logger.error(f"Error reloading content: {e}", exc_info=True)
+
         except Exception as e:
             logger.error(f"Error in update check loop: {e}", exc_info=True)
 

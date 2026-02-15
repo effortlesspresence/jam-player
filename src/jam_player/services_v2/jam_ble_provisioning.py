@@ -86,6 +86,7 @@ from common.credentials import (
     is_device_registered,
     set_device_registered,
     set_device_announced,
+    set_screen_id,
 )
 from common.api import api_request, get_api_base_url
 from common.network import (
@@ -161,6 +162,7 @@ WIFI_CREDENTIALS_UUID = '12345678-1234-5678-1234-56789abcdef2'  # Write SSID + p
 CONNECTION_STATUS_UUID = '12345678-1234-5678-1234-56789abcdef3' # Read/notify status
 DEVICE_INFO_UUID = '12345678-1234-5678-1234-56789abcdef4'       # Read device info
 PROVISION_CONFIRM_UUID = '12345678-1234-5678-1234-56789abcdef5' # Write provisioning confirmation
+SCREEN_ID_UUID = '12345678-1234-5678-1234-56789abcdef6'         # Write screen ID for linking
 
 # ============================================================================
 # systemd Watchdog Configuration
@@ -1010,6 +1012,55 @@ class ProvisioningConfirmCharacteristic(Characteristic):
             logger.error(f"Error processing provisioning confirmation: {e}")
 
 
+class ScreenIdCharacteristic(Characteristic):
+    """
+    Characteristic to receive screen ID from mobile app after linking.
+
+    When the user links a JAM Player to a screen via the mobile app,
+    the app can send the screen ID directly via BLE. This allows the
+    device to immediately know its screen assignment without waiting
+    for the heartbeat service to poll the backend.
+
+    Expected input format (JSON):
+    {
+        "screenId": "uuid-of-screen"
+    }
+
+    Response: "OK" on success, error message on failure
+    """
+
+    def __init__(self, bus, index: int, service):
+        # Support both write types for flexibility
+        super().__init__(bus, index, SCREEN_ID_UUID, ['write', 'write-without-response'], service)
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
+    def WriteValue(self, value, options):
+        """Receive and store screen ID."""
+        try:
+            data = bytes(value).decode('utf-8')
+            logger.info("Received screen ID via BLE")
+
+            parsed = json.loads(data)
+            screen_id = parsed.get('screenId')
+
+            if not screen_id:
+                logger.error("Screen ID data missing 'screenId' field")
+                return
+
+            # Write screen ID to file
+            success = set_screen_id(screen_id)
+
+            if success:
+                logger.info(f"Screen ID set via BLE: {screen_id}")
+            else:
+                logger.error("Failed to write screen ID file")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in screen ID data: {e}")
+        except Exception as e:
+            logger.error(f"Error processing screen ID: {e}")
+
+
 # ============================================================================
 # JAM Provisioning Service (combines all characteristics)
 # ============================================================================
@@ -1034,6 +1085,7 @@ class JAMProvisioningService(Service):
         self.add_characteristic(WiFiCredentialsCharacteristic(bus, 2, self, status_chrc))
         self.add_characteristic(DeviceInfoCharacteristic(bus, 3, self))
         self.add_characteristic(ProvisioningConfirmCharacteristic(bus, 4, self))
+        self.add_characteristic(ScreenIdCharacteristic(bus, 5, self))
 
 
 # ============================================================================
