@@ -8,8 +8,8 @@ After=jam-first-boot.service
 # Wait for boot check to complete (validates system state)
 After=jam-boot-check.service
 
-# Wait for clock sync (for video wall-clock sync)
-After=time-sync.target
+# Wait for clock sync (for video wall-clock sync) - but don't block startup
+# Time sync is only needed for multi-display sync, not for basic display
 Wants=time-sync.target
 
 # Restart limits
