@@ -686,8 +686,9 @@ class MpvIpcClient:
             mpv_args.insert(1, '--idle=yes')
 
         # Run MPV as comitup user for X11 access
-        # Note: Use DISPLAY=:0 directly, not via env command
-        args = ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0'] + mpv_args
+        # Wrap in bash to get proper shell environment (fixes display issues from systemd)
+        mpv_cmd = ' '.join(mpv_args)
+        args = ['sudo', '-u', 'comitup', 'bash', '-c', f'DISPLAY=:0 {mpv_cmd}']
 
         try:
             logger.info(f"Starting MPV with IPC socket at {self.socket_path}")
