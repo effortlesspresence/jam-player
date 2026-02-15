@@ -176,7 +176,36 @@ def download_media(url: str, dest_path: Path) -> bool:
             with open(dest_path, 'wb') as f:
                 f.write(response.content)
 
-            logger.info(f"Downloaded media to {dest_path}")
+            # Verify file was written and has content
+            if not dest_path.exists():
+                logger.error(f"File not found after write: {dest_path}")
+                return False
+
+            file_size = dest_path.stat().st_size
+            if file_size == 0:
+                logger.error(f"Downloaded file is empty: {dest_path}")
+                dest_path.unlink()  # Clean up empty file
+                return False
+
+            # For video files, validate with ffprobe
+            if dest_path.suffix.lower() in {'.mp4', '.mov', '.avi', '.webm'}:
+                try:
+                    probe_result = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                         '-show_entries', 'stream=duration', '-of', 'csv=p=0',
+                         str(dest_path)],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if probe_result.returncode != 0:
+                        logger.error(f"Downloaded video is invalid: {dest_path}")
+                        dest_path.unlink()  # Clean up invalid file
+                        return False
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"ffprobe timeout validating {dest_path}, assuming valid")
+                except Exception as e:
+                    logger.warning(f"Could not validate video {dest_path}: {e}")
+
+            logger.info(f"Downloaded media to {dest_path} ({file_size / 1024 / 1024:.1f}MB)")
             return True
 
         except (ReqConnectionError, ReadTimeout) as e:
@@ -432,11 +461,27 @@ def load_content() -> bool:
         media_filename = f"{url_hash}{extension}"
         media_path = LIVE_MEDIA_DIR / media_filename
 
-        # Download if not already present
+        # Download if not already present or if existing file is invalid
+        need_download = False
         if not media_path.exists():
+            need_download = True
+        else:
+            # Verify existing file is valid (non-empty)
+            file_size = media_path.stat().st_size
+            if file_size == 0:
+                logger.warning(f"Existing file is empty, re-downloading: {media_path}")
+                media_path.unlink()
+                need_download = True
+
+        if need_download:
             if not download_media(video_url, media_path):
                 logger.error(f"Failed to download video for scene {scene_id}, skipping")
                 continue
+
+        # Final verification before adding to scenes
+        if not media_path.exists():
+            logger.error(f"Media file missing after download for scene {scene_id}, skipping")
+            continue
 
         logger.info(f"Scene {scene_id}: duration={video_duration}s, scheduled_days={len(days_scheduled)}")
 
@@ -468,31 +513,43 @@ def load_content() -> bool:
     # Stitch all scenes into a single loop.mp4 for gapless playback
     # Note: All videos are now pre-normalized by backend, so stream copy should work
     loop_path = STAGED_SCENES_DIR / "loop.mp4"
-    if processed_scenes:
-        if not stitch_scenes_to_loop(processed_scenes, LIVE_MEDIA_DIR, loop_path):
-            logger.warning("Failed to create stitched loop - will use scene-by-scene playback")
-        else:
-            # Calculate total duration and add to scenes.json metadata
-            total_duration = sum(s.get('duration', 0) for s in processed_scenes)
-            # Write a loop metadata file
-            loop_meta = {
-                'loop_file': 'loop.mp4',
-                'total_duration': total_duration,
-                'scene_count': len(processed_scenes),
-                'scenes': processed_scenes,
-            }
-            with open(STAGED_SCENES_DIR / "loop_meta.json", 'w') as f:
-                json.dump(loop_meta, f, indent=2)
-            logger.info(f"Loop metadata written: {total_duration:.1f}s total")
+    if not processed_scenes:
+        logger.warning("No scenes to stitch - keeping existing content")
+        return False
 
-    # Atomically swap staged to live
+    if not stitch_scenes_to_loop(processed_scenes, LIVE_MEDIA_DIR, loop_path):
+        logger.error("Failed to create loop.mp4 - keeping existing content")
+        return False
+
+    # Verify loop.mp4 was created and is valid
+    if not loop_path.exists():
+        logger.error("loop.mp4 not found after stitching - keeping existing content")
+        return False
+
+    loop_size = loop_path.stat().st_size
+    if loop_size == 0:
+        logger.error("loop.mp4 is empty - keeping existing content")
+        return False
+
+    # Calculate total duration and write loop metadata
+    total_duration = sum(s.get('duration', 0) for s in processed_scenes)
+    loop_meta = {
+        'loop_file': 'loop.mp4',
+        'total_duration': total_duration,
+        'scene_count': len(processed_scenes),
+        'scenes': processed_scenes,
+    }
+    with open(STAGED_SCENES_DIR / "loop_meta.json", 'w') as f:
+        json.dump(loop_meta, f, indent=2)
+    logger.info(f"Loop metadata written: {total_duration:.1f}s total, {loop_size / 1024 / 1024:.1f}MB")
+
+    # Atomically swap staged to live - only happens if loop.mp4 is valid
     if LIVE_SCENES_DIR.exists():
         shutil.rmtree(LIVE_SCENES_DIR)
     shutil.copytree(STAGED_SCENES_DIR, LIVE_SCENES_DIR)
 
     # Also copy loop.mp4 to live media dir for easy access
-    if loop_path.exists():
-        shutil.copy2(loop_path, LIVE_MEDIA_DIR / "loop.mp4")
+    shutil.copy2(loop_path, LIVE_MEDIA_DIR / "loop.mp4")
 
     # Clean up unused media files to free disk space
     referenced_files = {s.get('media_file') for s in processed_scenes if s.get('media_file')}
