@@ -653,6 +653,7 @@ class MpvIpcClient:
 
         mpv_args = [
             'mpv',
+            '--vo=gpu',  # Explicitly use GPU output - required for display
             '--fullscreen',
             '--no-osc',
             '--no-osd-bar',
