@@ -660,6 +660,7 @@ class MpvIpcClient:
             '--vo=gpu',
             '--fullscreen',
             '--no-audio',
+            '--keep-open=yes',  # Don't exit when playback ends
             f'--input-ipc-server={self.socket_path}',
             initial_file,
         ]
