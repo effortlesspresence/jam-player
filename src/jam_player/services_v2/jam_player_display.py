@@ -659,29 +659,14 @@ class MpvIpcClient:
             'mpv',
             '--vo=gpu',
             '--fullscreen',
-            '--no-osc',
-            '--no-osd-bar',
-            '--no-input-default-bindings',
-            '--input-conf=/dev/null',
-            '--force-window=yes',
-            '--no-terminal',
-            '--keep-open=yes',
             '--no-audio',
-            '--hwdec=auto',
-            '--image-display-duration=inf',
-            '--hr-seek=yes',
-            '--cache=yes',
-            '--demuxer-max-bytes=150M',
-            '--demuxer-readahead-secs=20',
-            f'--video-rotate={rotation_angle}',
             f'--input-ipc-server={self.socket_path}',
             initial_file,
         ]
 
         # Add loop option only for legacy single-video mode
         if loop:
-            mpv_args.insert(-2, '--loop-file=inf')
-            mpv_args.insert(-2, '--hr-seek-framedrop=no')
+            mpv_args.insert(-1, '--loop-file=inf')
 
         # Build command: run as comitup user for X11 access (service runs as root)
         args = ['sudo', '-u', 'comitup', 'env', f'DISPLAY=:0'] + mpv_args
