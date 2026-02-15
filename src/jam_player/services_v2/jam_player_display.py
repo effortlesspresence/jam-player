@@ -685,16 +685,17 @@ class MpvIpcClient:
         else:
             mpv_args.insert(1, '--idle=yes')
 
-        # Run MPV as comitup user for X11 access
-        # Wrap in bash to get proper shell environment (fixes display issues from systemd)
-        mpv_cmd = ' '.join(mpv_args)
-        args = ['sudo', '-u', 'comitup', 'bash', '-c', f'DISPLAY=:0 {mpv_cmd}']
-
         try:
             logger.info(f"Starting MPV with IPC socket at {self.socket_path}")
 
+            # Set DISPLAY environment for MPV (same as old working code)
+            env = os.environ.copy()
+            env['DISPLAY'] = ':0'
+            env['XAUTHORITY'] = '/home/comitup/.Xauthority'
+
             self.process = subprocess.Popen(
-                args,
+                mpv_args,
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
