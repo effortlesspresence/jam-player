@@ -635,13 +635,12 @@ class MpvIpcClient:
         self.socket: Optional[socket.socket] = None
         self._request_id = 0
 
-    def start_mpv(self, rotation_angle: int = 0, loop: bool = True, initial_file: str = None) -> bool:
+    def start_mpv(self, rotation_angle: int = 0, loop: bool = True) -> bool:
         """Start MPV process with IPC socket enabled.
 
         Args:
             rotation_angle: Video rotation in degrees
             loop: If True, loop videos infinitely (legacy mode). If False, play once (scene mode).
-            initial_file: If provided, start playing this file immediately instead of idle mode.
         """
         if os.path.exists(self.socket_path):
             try:
@@ -651,9 +650,9 @@ class MpvIpcClient:
 
         self.stop_mpv()
 
-        mpv_args = [
+        args = [
             'mpv',
-            '--vo=gpu',  # Explicitly use GPU output - required for display
+            '--idle=yes',
             '--fullscreen',
             '--no-osc',
             '--no-osd-bar',
@@ -662,39 +661,33 @@ class MpvIpcClient:
             '--force-window=yes',
             '--no-terminal',
             '--keep-open=yes',
-            '--no-audio',  # Disable audio - avoids XDG_RUNTIME_DIR issues
+            '--no-audio',  # Silent playback - no audio output
             '--hwdec=auto',  # Use hardware decoding when available (critical for Pi)
             '--image-display-duration=inf',  # Don't auto-advance images
             '--hr-seek=yes',
             '--cache=yes',
             '--demuxer-max-bytes=150M',
             '--demuxer-readahead-secs=20',
-            '--video-sync=display-resample',  # Sync to display refresh rate
+            '--video-sync=audio',  # Sync to audio clock (even with --no-audio, this is more stable)
             f'--video-rotate={rotation_angle}',
             f'--input-ipc-server={self.socket_path}',
         ]
 
         # Add loop option only for legacy single-video mode
         if loop:
-            mpv_args.insert(-1, '--loop-file=inf')
-            mpv_args.insert(-1, '--hr-seek-framedrop=no')
-
-        # Add idle mode only if no initial file - idle mode causes display issues
-        if initial_file:
-            mpv_args.append(initial_file)
-        else:
-            mpv_args.insert(1, '--idle=yes')
+            args.insert(-1, '--loop-file=inf')
+            args.insert(-1, '--hr-seek-framedrop=no')
 
         try:
             logger.info(f"Starting MPV with IPC socket at {self.socket_path}")
 
-            # Set DISPLAY environment for MPV (same as old working code)
+            # Set DISPLAY environment for MPV
             env = os.environ.copy()
             env['DISPLAY'] = ':0'
             env['XAUTHORITY'] = '/home/comitup/.Xauthority'
 
             self.process = subprocess.Popen(
-                mpv_args,
+                args,
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
@@ -1066,24 +1059,12 @@ class JamPlayerDisplayManager:
         # TODO: Get rotation from device configuration
         rotation = 0
 
-        # Get first scene file to start MPV with (avoids idle mode display issues)
-        initial_file = None
-        scenes = self._load_scenes()
-        if scenes:
-            media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
-            first_scene = scenes[0]
-            media_file = first_scene.get('media_file')
-            if media_file:
-                media_path = media_dir / media_file
-                if media_path.exists():
-                    initial_file = str(media_path)
-
-        # Start MPV with initial file to avoid idle mode display issues
-        if not self.mpv.start_mpv(rotation_angle=rotation, loop=False, initial_file=initial_file):
+        # Start MPV without looping - we handle scene transitions manually
+        if not self.mpv.start_mpv(rotation_angle=rotation, loop=False):
             logger.error("Failed to start MPV")
             return
 
-        logger.info(f"MPV started successfully with initial file: {initial_file}")
+        logger.info("MPV started successfully")
         self.is_playing = False  # Will be set true once we load a file
 
     # =========================================================================
