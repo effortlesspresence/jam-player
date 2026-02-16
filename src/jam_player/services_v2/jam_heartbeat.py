@@ -40,6 +40,7 @@ from common.credentials import (
     is_device_announced,
     update_screen_id_if_changed,
     update_timezone_if_changed,
+    update_orientation_if_changed,
     get_location_timezone,
 )
 from common.api import api_request
@@ -71,14 +72,15 @@ def signal_handler(signum, frame):
     running = False
 
 
-def send_heartbeat() -> tuple[bool, str | None, str | None]:
+def send_heartbeat() -> tuple[bool, str | None, str | None, str | None]:
     """
     Send a heartbeat to the backend.
 
     Returns:
-        Tuple of (success, screen_id_from_response, location_timezone_from_response)
+        Tuple of (success, screen_id, location_timezone, display_orientation)
         screen_id may be None if device is not linked to a screen.
         location_timezone may be None if device is not assigned to a location.
+        display_orientation defaults to LANDSCAPE if not set.
     """
     response = api_request(
         method='POST',
@@ -88,20 +90,21 @@ def send_heartbeat() -> tuple[bool, str | None, str | None]:
     )
 
     if response is None:
-        return False, None, None
+        return False, None, None, None
 
     if response.status_code == 200:
         try:
             data = response.json()
             screen_id = data.get('screenId')
             location_timezone = data.get('locationTimezone')
-            return True, screen_id, location_timezone
+            display_orientation = data.get('displayOrientation')
+            return True, screen_id, location_timezone, display_orientation
         except Exception as e:
             logger.error(f"Error parsing heartbeat response: {e}")
-            return True, None, None  # Request succeeded, just couldn't parse response
+            return True, None, None, None  # Request succeeded, just couldn't parse response
     else:
         logger.warning(f"Heartbeat returned status {response.status_code}")
-        return False, None, None
+        return False, None, None, None
 
 
 def apply_system_timezone(timezone: str) -> bool:
@@ -168,7 +171,7 @@ def main():
 
     while running:
         # Send heartbeat
-        success, screen_id, location_timezone = send_heartbeat()
+        success, screen_id, location_timezone, display_orientation = send_heartbeat()
 
         if success:
             if consecutive_failures > 0:
@@ -184,6 +187,19 @@ def main():
                 # Timezone changed - apply it to the system
                 if location_timezone:
                     apply_system_timezone(location_timezone)
+
+            # Update orientation if changed
+            if update_orientation_if_changed(display_orientation):
+                # Orientation changed - restart display service to apply
+                logger.info("Restarting jam-player-display.service to apply new orientation")
+                try:
+                    subprocess.run(
+                        ['systemctl', 'restart', 'jam-player-display.service'],
+                        timeout=10,
+                        capture_output=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to restart display service: {e}")
 
             # Notify systemd watchdog
             notifier.notify("WATCHDOG=1")

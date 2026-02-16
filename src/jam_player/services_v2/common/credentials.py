@@ -22,6 +22,7 @@ from .paths import (
     REGISTERED_FLAG,
     SCREEN_ID_FILE,
     LOCATION_TIMEZONE_FILE,
+    DISPLAY_ORIENTATION_FILE,
 )
 
 logger = logging.getLogger(__name__)
@@ -456,4 +457,85 @@ def update_timezone_if_changed(new_timezone: Optional[str]) -> bool:
         return True
     else:
         logger.error("Failed to update location timezone file")
+        return False
+
+
+# =============================================================================
+# Display Orientation Functions
+# =============================================================================
+
+def get_display_orientation() -> Optional[str]:
+    """
+    Read the display orientation from file.
+
+    Returns:
+        The orientation string (LANDSCAPE, PORTRAIT_BOTTOM_ON_LEFT,
+        PORTRAIT_BOTTOM_ON_RIGHT), or None if not found/readable.
+    """
+    try:
+        if DISPLAY_ORIENTATION_FILE.exists():
+            orientation = DISPLAY_ORIENTATION_FILE.read_text().strip()
+            return orientation if orientation else None
+        return None
+    except Exception as e:
+        logger.error(f"Error reading display orientation: {e}")
+        return None
+
+
+def set_display_orientation(orientation: Optional[str]) -> bool:
+    """
+    Write the display orientation to file.
+
+    Called by jam-heartbeat.service when the displayOrientation in the heartbeat
+    response differs from the current value.
+
+    Args:
+        orientation: The orientation string to write, or None to use default
+
+    Returns:
+        True if successfully written.
+    """
+    try:
+        DISPLAY_ORIENTATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if orientation:
+            DISPLAY_ORIENTATION_FILE.write_text(orientation.strip())
+            logger.info(f"Display orientation set to: {orientation}")
+        else:
+            # Write default if orientation is None
+            DISPLAY_ORIENTATION_FILE.write_text('LANDSCAPE')
+            logger.info("Display orientation set to default: LANDSCAPE")
+        return True
+    except Exception as e:
+        logger.error(f"Error setting display orientation: {e}")
+        return False
+
+
+def update_orientation_if_changed(new_orientation: Optional[str]) -> bool:
+    """
+    Update the local display_orientation.txt if the value has changed.
+
+    Compares new_orientation against the current file contents and updates
+    only if different.
+
+    Args:
+        new_orientation: The orientation from the backend
+
+    Returns:
+        True if the orientation was changed, False if unchanged
+    """
+    current_orientation = get_display_orientation()
+
+    # Treat None from backend as LANDSCAPE (the default)
+    effective_new = new_orientation if new_orientation else 'LANDSCAPE'
+
+    if effective_new == current_orientation:
+        return False
+
+    logger.info(f"Display orientation changed: {current_orientation} -> {effective_new}")
+
+    if set_display_orientation(effective_new):
+        logger.info("Display orientation file updated successfully")
+        return True
+    else:
+        logger.error("Failed to update display orientation file")
         return False

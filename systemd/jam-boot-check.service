@@ -4,11 +4,10 @@ Documentation=https://github.com/effortlesspresence/jam-player-v2
 
 # Run after first-boot completes
 After=jam-first-boot.service
-After=network-online.target
-Wants=network-online.target
 
-# Run after update service completes (ensures we have latest code)
-After=jam-update.service
+# Note: We intentionally don't wait for jam-update.service here.
+# Updates should not block display startup - the existing code works fine.
+# The display can start with the old code while updates install in background.
 
 # Run before other JAM services that depend on system state
 Before=jam-announce.service

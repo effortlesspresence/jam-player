@@ -91,7 +91,9 @@ from common.credentials import (
 from common.api import api_request, get_api_base_url
 from common.network import (
     get_available_wifi_networks,
+    get_saved_wifi_networks,
     connect_to_wifi,
+    connect_to_saved_wifi,
     get_current_connection_info,
     trigger_wifi_scan,
 )
@@ -163,6 +165,7 @@ CONNECTION_STATUS_UUID = '12345678-1234-5678-1234-56789abcdef3' # Read/notify st
 DEVICE_INFO_UUID = '12345678-1234-5678-1234-56789abcdef4'       # Read device info
 PROVISION_CONFIRM_UUID = '12345678-1234-5678-1234-56789abcdef5' # Write provisioning confirmation
 SCREEN_ID_UUID = '12345678-1234-5678-1234-56789abcdef6'         # Write screen ID for linking
+SAVED_NETWORKS_UUID = '12345678-1234-5678-1234-56789abcdef7'    # Read saved/known networks
 
 # ============================================================================
 # systemd Watchdog Configuration
@@ -620,6 +623,111 @@ class WiFiNetworksCharacteristic(Characteristic):
 
 
 # ============================================================================
+# Saved WiFi Networks Characteristic (READ)
+# ============================================================================
+
+class SavedNetworksCharacteristic(Characteristic):
+    """
+    Characteristic to read saved/known WiFi networks.
+
+    Returns networks that have been previously connected to and saved in
+    NetworkManager. Users can reconnect to these without entering a password.
+
+    Uses the same chunked notification protocol as WiFiNetworksCharacteristic.
+
+    Response format (JSON array):
+    [{"ssid": "MyNetwork", "name": "MyNetwork"}, ...]
+    """
+
+    CHUNK_SIZE = 498  # Same as WiFiNetworksCharacteristic
+
+    def __init__(self, bus, index: int, service):
+        super().__init__(bus, index, SAVED_NETWORKS_UUID, ['read', 'notify'], service)
+        self._notifying = False
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        """
+        Reading this characteristic triggers sending saved networks via notifications.
+        Returns immediately with status; actual data comes via notifications.
+        """
+        logger.info("Saved networks read requested - sending via notifications")
+
+        if not self._notifying:
+            logger.warning("Client read saved networks but notifications not enabled")
+            error = json.dumps({"error": "Subscribe to notifications first"})
+            return dbus.Array([dbus.Byte(b) for b in error.encode('utf-8')], signature='y')
+
+        # Trigger async notification sending
+        GLib.idle_add(self._send_networks_chunked)
+
+        # Return acknowledgment
+        return dbus.Array([dbus.Byte(ord('O')), dbus.Byte(ord('K'))], signature='y')
+
+    def _send_networks_chunked(self):
+        """Send saved WiFi networks data in chunked notifications."""
+        try:
+            networks = get_saved_wifi_networks()
+            data = json.dumps(networks, separators=(',', ':')).encode('utf-8')
+            total_size = len(data)
+            logger.info(f"Sending {len(networks)} saved WiFi networks ({total_size} bytes) in chunks")
+
+            # Split into chunks and send as notifications
+            seq_num = 0
+            offset = 0
+
+            while offset < total_size:
+                chunk_end = min(offset + self.CHUNK_SIZE, total_size)
+                chunk_data = data[offset:chunk_end]
+                is_last = chunk_end >= total_size
+
+                # Build packet: [seq_num][flags][data]
+                flags = 0x01 if is_last else 0x00
+                packet = bytes([seq_num, flags]) + chunk_data
+
+                logger.debug(f"Sending saved networks chunk {seq_num}: {len(chunk_data)} bytes, is_last={is_last}")
+
+                # Send notification
+                self.PropertiesChanged(
+                    GATT_CHRC_IFACE,
+                    {'Value': dbus.Array([dbus.Byte(b) for b in packet], signature='y')},
+                    []
+                )
+
+                seq_num = (seq_num + 1) % 256
+                offset = chunk_end
+
+                # Small delay between chunks
+                if not is_last:
+                    time.sleep(0.05)
+
+            logger.info(f"Finished sending {seq_num} chunks for saved networks")
+
+        except Exception as e:
+            logger.error(f"Error sending saved networks: {e}")
+            error_packet = bytes([0, 0x01]) + json.dumps({"error": str(e)}).encode('utf-8')
+            self.PropertiesChanged(
+                GATT_CHRC_IFACE,
+                {'Value': dbus.Array([dbus.Byte(b) for b in error_packet], signature='y')},
+                []
+            )
+
+        return False  # Don't repeat GLib.idle_add
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StartNotify(self):
+        """Client wants to receive notifications."""
+        logger.info("Client subscribed to saved networks notifications")
+        self._notifying = True
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StopNotify(self):
+        """Client no longer wants notifications."""
+        logger.info("Client unsubscribed from saved networks notifications")
+        self._notifying = False
+
+
+# ============================================================================
 # Post-WiFi Connection Actions
 # ============================================================================
 
@@ -649,8 +757,8 @@ def try_announce_after_wifi():
 
     # Check if already announced
     if is_device_announced():
-        logger.info("Device already announced - triggering jam-tailscale")
-        _trigger_tailscale()
+        logger.info("Device already announced - triggering post-announce services")
+        _trigger_post_announce_services()
         return
 
     logger.info("Attempting to announce device...")
@@ -688,27 +796,36 @@ def try_announce_after_wifi():
     if response.status_code in (200, 409):
         logger.info("Announce successful (or already announced)!")
         set_device_announced()
-        # Now trigger Tailscale setup
-        _trigger_tailscale()
+        # Now trigger post-announce services (Tailscale, WebSocket commands, etc.)
+        _trigger_post_announce_services()
     else:
         logger.warning(f"Announce failed: {response.status_code}")
 
 
-def _trigger_tailscale():
+def _trigger_post_announce_services():
     """
-    Restart jam-tailscale.service to attempt Tailscale setup.
+    Restart services that depend on the device being announced.
+    Called after announce succeeds and .announced flag is created.
     """
     import subprocess
-    try:
-        logger.info("Triggering jam-tailscale.service restart...")
-        subprocess.run(
-            ['systemctl', 'restart', 'jam-tailscale.service'],
-            timeout=10,
-            capture_output=True
-        )
-        logger.info("jam-tailscale.service restart triggered")
-    except Exception as e:
-        logger.warning(f"Failed to restart jam-tailscale: {e}")
+
+    services_to_restart = [
+        'jam-tailscale.service',      # Remote access via Tailscale
+        'jam-ws-commands.service',    # WebSocket commands from backend
+        'jam-heartbeat.service',      # Device status reporting
+    ]
+
+    for service in services_to_restart:
+        try:
+            logger.info(f"Triggering {service} restart...")
+            subprocess.run(
+                ['systemctl', 'restart', service],
+                timeout=10,
+                capture_output=True
+            )
+            logger.info(f"{service} restart triggered")
+        except Exception as e:
+            logger.warning(f"Failed to restart {service}: {e}")
 
 
 # ============================================================================
@@ -750,31 +867,44 @@ class WiFiCredentialsCharacteristic(Characteristic):
             credentials = json.loads(data)
             ssid = credentials.get('ssid', '')
             password = credentials.get('password', '')
+            use_saved = credentials.get('useSaved', False)
+            connection_name = credentials.get('connectionName', '')
 
-            if not ssid:
-                logger.warning("No SSID provided in credentials")
-                self.status_characteristic.set_status('error', 'No SSID provided')
+            if not ssid and not connection_name:
+                logger.warning("No SSID or connection name provided")
+                self.status_characteristic.set_status('error', 'No network specified')
                 return
 
-            logger.info(f"Attempting to connect to WiFi: {ssid}")
-            logger.info(f"Password length: {len(password)} chars")
-            self.status_characteristic.set_status('connecting', f'Connecting to {ssid}...')
+            if use_saved and connection_name:
+                logger.info(f"Attempting to connect to saved network: {connection_name}")
+            else:
+                logger.info(f"Attempting to connect to WiFi: {ssid}")
+                logger.info(f"Password length: {len(password)} chars")
+
+            self.status_characteristic.set_status('connecting', f'Connecting to {ssid or connection_name}...')
 
             # Run connection in a background thread so we don't block the BLE write.
             # BLE operations should complete quickly; WiFi connection can take 10-30 seconds.
             def connect_async():
-                logger.info(f"[BLE->WiFi] Starting WiFi connection attempt for SSID: {ssid}")
-                success, error_msg = connect_to_wifi(ssid, password)
+                if use_saved and connection_name:
+                    # Connect to saved network without password
+                    logger.info(f"[BLE->WiFi] Connecting to saved network: {connection_name}")
+                    success, error_msg = connect_to_saved_wifi(connection_name)
+                else:
+                    # Connect with password (new network or updating saved network password)
+                    logger.info(f"[BLE->WiFi] Starting WiFi connection attempt for SSID: {ssid}")
+                    success, error_msg = connect_to_wifi(ssid, password)
+
                 if success:
-                    logger.info(f"[BLE->WiFi] SUCCESS - Connected to {ssid}")
-                    self.status_characteristic.set_status('connected', f'Connected to {ssid}')
+                    logger.info(f"[BLE->WiFi] SUCCESS - Connected to {ssid or connection_name}")
+                    self.status_characteristic.set_status('connected', f'Connected to {ssid or connection_name}')
 
                     # Trigger announce + Tailscale setup in another background thread
                     # This runs 20 seconds after WiFi connects to ensure connection is stable
                     announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
                     announce_thread.start()
                 else:
-                    logger.error(f"[BLE->WiFi] FAILED - Could not connect to {ssid}")
+                    logger.error(f"[BLE->WiFi] FAILED - Could not connect to {ssid or connection_name}")
                     logger.error(f"[BLE->WiFi] Raw error message: {error_msg}")
                     # Map error messages to iOS-compatible status values
                     if 'password' in error_msg.lower() or 'secrets' in error_msg.lower():
@@ -785,7 +915,7 @@ class WiFiCredentialsCharacteristic(Characteristic):
                         status_code = 'timeout'
                     else:
                         status_code = 'failed'
-                    logger.error(f"[BLE->WiFi] Sending status '{status_code}' to iOS app")
+                    logger.error(f"[BLE->WiFi] Sending status '{status_code}' to mobile app")
                     self.status_characteristic.set_status(status_code, error_msg)
 
             thread = threading.Thread(target=connect_async, daemon=True)
@@ -1086,6 +1216,7 @@ class JAMProvisioningService(Service):
         self.add_characteristic(DeviceInfoCharacteristic(bus, 3, self))
         self.add_characteristic(ProvisioningConfirmCharacteristic(bus, 4, self))
         self.add_characteristic(ScreenIdCharacteristic(bus, 5, self))
+        self.add_characteristic(SavedNetworksCharacteristic(bus, 6, self))
 
 
 # ============================================================================

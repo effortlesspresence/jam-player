@@ -46,6 +46,7 @@ from common.credentials import (
     get_device_uuid,
     get_screen_id,
     get_device_uuid_short,
+    get_display_orientation,
 )
 from common.system import get_systemd_notifier, setup_signal_handlers
 from common.paths import (
@@ -93,6 +94,28 @@ def _log_dependency_status():
     except Exception as e:
         logger.warning(f"Could not check for ImageMagick: {e}")
 sd_notifier = get_systemd_notifier()
+
+
+def get_rotation_angle() -> int:
+    """
+    Get the MPV rotation angle based on display orientation setting.
+
+    Returns:
+        Rotation angle in degrees (0, 90, or 270)
+    """
+    orientation = get_display_orientation()
+
+    # Map orientation to MPV rotation angle
+    orientation_to_rotation = {
+        'LANDSCAPE': 0,
+        'PORTRAIT_BOTTOM_ON_LEFT': 270,
+        'PORTRAIT_BOTTOM_ON_RIGHT': 90,
+    }
+
+    rotation = orientation_to_rotation.get(orientation, 0)
+    logger.debug(f"Display orientation: {orientation} -> rotation: {rotation}")
+    return rotation
+
 
 # =============================================================================
 # Sync Configuration - for multi-display wall clock synchronization
@@ -662,6 +685,7 @@ class MpvIpcClient:
             '--no-audio',
             '--keep-open=yes',  # Don't exit when playback ends
             f'--input-ipc-server={self.socket_path}',
+            f'--video-rotate={rotation_angle}',
             initial_file,
         ]
 
@@ -673,7 +697,7 @@ class MpvIpcClient:
         args = ['sudo', '-u', 'comitup', 'env', f'DISPLAY=:0'] + mpv_args
 
         try:
-            logger.info(f"Starting MPV as comitup with file: {initial_file}")
+            logger.info(f"Starting MPV as comitup with file: {initial_file}, rotation: {rotation_angle}")
 
             self.process = subprocess.Popen(
                 args,
@@ -1044,8 +1068,8 @@ class JamPlayerDisplayManager:
         # Initialize MPV
         self.mpv = MpvIpcClient()
 
-        # TODO: Get rotation from device configuration
-        rotation = 0
+        # Get rotation from device orientation setting
+        rotation = get_rotation_angle()
 
         # Get first scene file - MPV must start with a file (idle mode doesn't work)
         scenes = self._load_scenes()

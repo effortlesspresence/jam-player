@@ -11,10 +11,11 @@ Wants=network-online.target time-sync.target
 After=jam-first-boot.service
 
 # Run BEFORE other JAM services so they get the updated code
+# Note: Display is NOT included here - display should start immediately
+# without waiting for updates (existing code will work)
 Before=jam-boot-check.service
 Before=jam-ble-state-manager.service
 Before=jam-content-manager.service
-Before=jam-player-display.service
 Before=jam-heartbeat.service
 Before=jam-health-monitor.service
 

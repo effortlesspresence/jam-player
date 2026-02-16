@@ -509,6 +509,125 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
+def get_saved_wifi_networks() -> List[Dict[str, str]]:
+    """
+    Get list of WiFi networks saved in NetworkManager.
+
+    These are networks the device has previously connected to and remembers.
+    Users can reconnect to these without entering a password.
+
+    Returns:
+        List of dicts with keys: 'ssid', 'name' (connection profile name)
+    """
+    try:
+        # Get all saved connections
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to list connections: {result.stderr}")
+            return []
+
+        saved_networks = []
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split(':')
+            if len(parts) >= 2 and parts[1] == '802-11-wireless':
+                connection_name = parts[0]
+                # Get the SSID for this connection
+                ssid_result = subprocess.run(
+                    ['nmcli', '-t', '-f', '802-11-wireless.ssid',
+                     'connection', 'show', connection_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if ssid_result.returncode == 0:
+                    ssid_line = ssid_result.stdout.strip()
+                    # Format is "802-11-wireless.ssid:MyNetwork"
+                    if ':' in ssid_line:
+                        ssid = ssid_line.split(':', 1)[1]
+                        if ssid:
+                            saved_networks.append({
+                                'ssid': ssid,
+                                'name': connection_name
+                            })
+
+        logger.info(f"Found {len(saved_networks)} saved WiFi networks")
+        return saved_networks
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout getting saved networks")
+        return []
+    except Exception as e:
+        logger.error(f"Error getting saved networks: {e}")
+        return []
+
+
+def connect_to_saved_wifi(connection_name: str) -> Tuple[bool, str]:
+    """
+    Connect to a saved WiFi network by its NetworkManager profile name.
+
+    This is used when the user wants to reconnect to a previously saved
+    network without entering the password again.
+
+    If already connected to a working network and the new connection attempt fails,
+    we restore the previous connection to avoid leaving the device offline.
+
+    Args:
+        connection_name: The NetworkManager connection profile name
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    try:
+        # Save current connection state before attempting new connection
+        previous_connection = _get_active_wifi_connection()
+        if previous_connection:
+            logger.info(f"Currently connected to: {previous_connection['name']} (will restore if new connection fails)")
+
+        # Stop comitup hotspot if running
+        _stop_comitup_hotspot()
+
+        logger.info(f"Connecting to saved network: {connection_name}")
+
+        result = subprocess.run(
+            ['nmcli', 'connection', 'up', connection_name],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Connected to saved network: {connection_name}")
+            return True, ""
+        else:
+            error_msg = result.stderr.strip() or "Connection failed"
+            logger.error(f"Failed to connect to saved network: {error_msg}")
+
+            # If we had a previous working connection, try to restore it
+            if previous_connection and previous_connection['name'] != connection_name:
+                logger.info(f"Restoring previous connection to: {previous_connection['name']}")
+                _restore_wifi_connection(previous_connection['name'])
+
+            return False, error_msg
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout connecting to saved network")
+        # Try to restore previous connection on timeout
+        if previous_connection and previous_connection['name'] != connection_name:
+            _restore_wifi_connection(previous_connection['name'])
+        return False, "timeout"
+    except Exception as e:
+        logger.error(f"Error connecting to saved network: {e}")
+        return False, str(e)
+
+
 def _get_active_wifi_connection() -> Optional[Dict[str, str]]:
     """Get the currently active WiFi connection profile."""
     try:
