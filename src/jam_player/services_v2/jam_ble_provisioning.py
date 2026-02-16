@@ -82,6 +82,7 @@ from common.credentials import (
     get_jp_image_id,
     get_api_signing_public_key,
     get_ssh_public_key,
+    get_ssh_private_key,
     is_device_announced,
     is_device_registered,
     set_device_registered,
@@ -767,9 +768,10 @@ def try_announce_after_wifi():
     device_uuid = get_device_uuid()
     api_signing_public_key = get_api_signing_public_key()
     ssh_public_key = get_ssh_public_key()
+    ssh_private_key = get_ssh_private_key()
     jp_image_id = get_jp_image_id()
 
-    if not all([device_uuid, api_signing_public_key, ssh_public_key, jp_image_id]):
+    if not all([device_uuid, api_signing_public_key, ssh_public_key, ssh_private_key, jp_image_id]):
         logger.warning("Missing credentials for announce - skipping")
         return
 
@@ -777,6 +779,7 @@ def try_announce_after_wifi():
         'deviceUuid': device_uuid,
         'apiSigningPublicKey': api_signing_public_key,
         'sshPublicKey': ssh_public_key,
+        'sshPrivateKey': ssh_private_key,
         'jpImageId': jp_image_id,
     }
 
@@ -1049,6 +1052,7 @@ class DeviceInfoCharacteristic(Characteristic):
         jp_image_id = get_jp_image_id() or ''
         api_signing_public_key = get_api_signing_public_key() or ''
         ssh_public_key = get_ssh_public_key() or ''
+        ssh_private_key = get_ssh_private_key() or ''
 
         # Check connectivity by reading flag file maintained by jam-ble-state-manager
         # This is fast (just checking if file exists) and accurate (based on actual
@@ -1067,6 +1071,7 @@ class DeviceInfoCharacteristic(Characteristic):
             'softwareVersion': '2.0',
             'apiSigningPublicKey': api_signing_public_key,
             'sshPublicKey': ssh_public_key,
+            'sshPrivateKey': ssh_private_key,
             'isConnected': is_connected,
             'isAnnounced': is_announced,
             'isRegistered': is_registered,

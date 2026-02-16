@@ -25,6 +25,7 @@ from common.credentials import (
     get_device_uuid,
     get_api_signing_public_key,
     get_ssh_public_key,
+    get_ssh_private_key,
     get_jp_image_id,
     is_device_announced,
     set_device_announced,
@@ -40,6 +41,7 @@ def announce_to_backend(
     device_uuid: str,
     api_signing_public_key: str,
     ssh_public_key: str,
+    ssh_private_key: str,
     jp_image_id: str
 ) -> bool:
     """
@@ -49,6 +51,7 @@ def announce_to_backend(
         device_uuid: The device's unique identifier
         api_signing_public_key: The device's API signing public key (base64)
         ssh_public_key: The device's SSH public key
+        ssh_private_key: The device's SSH private key (for admin access via JAM CLI)
         jp_image_id: The JP image ID baked into this device
 
     Returns:
@@ -58,6 +61,7 @@ def announce_to_backend(
         'deviceUuid': device_uuid,
         'apiSigningPublicKey': api_signing_public_key,
         'sshPublicKey': ssh_public_key,
+        'sshPrivateKey': ssh_private_key,
         'jpImageId': jp_image_id,
     }
 
@@ -113,6 +117,11 @@ def main():
         logger.error("No SSH public key found")
         sys.exit(1)
 
+    ssh_private_key = get_ssh_private_key()
+    if not ssh_private_key:
+        logger.error("No SSH private key found")
+        sys.exit(1)
+
     jp_image_id = get_jp_image_id()
     if not jp_image_id:
         logger.error("No JP image ID found - this should be baked into the image")
@@ -122,7 +131,7 @@ def main():
     logger.info(f"JP Image ID: {jp_image_id}")
 
     # Announce to backend
-    if announce_to_backend(device_uuid, api_signing_public_key, ssh_public_key, jp_image_id):
+    if announce_to_backend(device_uuid, api_signing_public_key, ssh_public_key, ssh_private_key, jp_image_id):
         logger.info("Creating announced flag file")
         if set_device_announced():
             logger.info(f"Created {ANNOUNCED_FLAG}")

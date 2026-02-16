@@ -40,7 +40,7 @@ except ImportError:
     sys.exit(1)
 
 from common.logging_config import setup_service_logging, log_service_start
-from common.credentials import get_device_uuid, is_device_announced
+from common.credentials import get_device_uuid, is_device_announced, update_screen_id_if_changed
 from common.network import (
     connect_to_wifi,
     connect_to_saved_wifi,
@@ -207,6 +207,50 @@ def handle_set_orientation(payload: dict, command_id: str) -> bool:
         return False
 
 
+def handle_set_screen_id(payload: dict, command_id: str) -> bool:
+    """
+    Handle a set screen ID command.
+
+    Updates the local screen_id.txt and triggers content manager to pull new content.
+
+    Args:
+        payload: The command payload containing screenId
+        command_id: The unique command ID for logging
+
+    Returns:
+        True if the screen ID was set successfully, False otherwise
+    """
+    screen_id = payload.get('screenId')  # Can be None to unlink
+
+    logger.info(f"[{command_id}] Setting screen ID to: {screen_id}")
+
+    try:
+        # Update screen_id.txt if it changed
+        changed = update_screen_id_if_changed(screen_id)
+
+        if changed:
+            logger.info(f"[{command_id}] Screen ID updated, restarting content manager to pull new content")
+            import subprocess
+            try:
+                subprocess.run(
+                    ['systemctl', 'restart', 'jam-content-manager.service'],
+                    timeout=10,
+                    capture_output=True
+                )
+                logger.info(f"[{command_id}] Content manager restart triggered")
+            except Exception as e:
+                logger.warning(f"[{command_id}] Failed to restart content manager: {e}")
+                # Not a critical failure - content manager will pick up changes on next cycle
+        else:
+            logger.info(f"[{command_id}] Screen ID unchanged, no action needed")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"[{command_id}] Failed to set screen ID: {e}")
+        return False
+
+
 def handle_device_command(message: dict):
     """
     Handle an incoming device command message.
@@ -232,6 +276,12 @@ def handle_device_command(message: dict):
             logger.info(f"[{command_id}] Orientation set successfully")
         else:
             logger.warning(f"[{command_id}] Failed to set orientation")
+    elif command_type == 'SET_SCREEN_ID':
+        success = handle_set_screen_id(payload, command_id)
+        if success:
+            logger.info(f"[{command_id}] Screen ID set successfully")
+        else:
+            logger.warning(f"[{command_id}] Failed to set screen ID")
     else:
         logger.warning(f"Unknown command type: {command_type}")
 
