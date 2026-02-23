@@ -17,7 +17,9 @@ This service handles all display states for the JAM Player:
 
 4. PLAYING_CONTENT (screen_id.txt exists, content is available)
    - Display: Plays scenes sequentially from scenes.json
-   - Videos play fully, images display for their configured duration
+   - Supports both IMAGE and VIDEO media types
+   - Images display for their configured duration
+   - Videos play for their duration
    - Automatically reloads when content is updated
 
 This service monitors state changes and transitions between display modes automatically.
@@ -684,6 +686,7 @@ class MpvIpcClient:
             '--fullscreen',
             '--no-audio',
             '--keep-open=yes',  # Don't exit when playback ends
+            '--image-display-duration=inf',  # Keep images displayed until we load next file
             f'--input-ipc-server={self.socket_path}',
             f'--video-rotate={rotation_angle}',
             initial_file,
@@ -1572,7 +1575,7 @@ class JamPlayerDisplayManager:
             scene_index, position_in_scene_ms, scene = self._get_scene_at_position(scenes, position_in_cycle_ms)
 
             media_file = scene.get('media_file')
-            media_type = scene.get('media_type', 'VIDEO')  # All content is video now
+            media_type = scene.get('media_type', 'IMAGE')  # IMAGE or VIDEO
             scene_duration_ms = int(scene.get('actual_duration', scene.get('duration', 15)) * 1000)
             media_path = media_dir / media_file
 

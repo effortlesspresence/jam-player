@@ -4,15 +4,15 @@ JAM Player 2.0 - Scenes Manager Service
 This service manages content for the JAM Player:
 1. Polls the JAM 2.0 API for content updates
 2. Fetches scene content when updates are available
-3. Downloads media files (all videos - images are converted to video by backend)
+3. Downloads media files (images and videos)
 4. Writes scene data for jam_player_display to consume
 
-The backend now handles:
-- Converting all image scenes to videos with exact timeToDisplay duration
-- Normalizing all videos to the same encoding (libx265, CRF 22, 30fps)
-- Adding silent audio tracks for sync
-
-This service just downloads the pre-processed videos and manages scheduling.
+The API returns scenes with:
+- mediaType: {"value": "CANVAS_IMAGE"|"CANVAS_VIDEO"|..., "label": "..."}
+- imageUrl: URL to image file (for image-based scenes)
+- videoUrl: URL to video file (for video-based scenes)
+- duration: How long to display (seconds)
+- daysScheduled: Day/time scheduling info
 
 TEMPORARY: This polling mechanism will be replaced with WebSocket push
 notifications in a future release.
@@ -103,7 +103,8 @@ def fetch_content() -> Optional[List[Dict[str, Any]]]:
     Calls GET /jam-players/{deviceUuid}/content with Ed25519 signing.
 
     Returns:
-        List of scene dicts with id, videoUrl, videoDuration, daysScheduled, or None on error.
+        List of scene dicts with id, mediaType, imageUrl, videoUrl, duration, daysScheduled,
+        or None on error.
     """
     device_uuid = get_device_uuid()
     if not device_uuid:
@@ -372,8 +373,8 @@ def cleanup_unused_media(referenced_files: set) -> int:
     if not LIVE_MEDIA_DIR.exists():
         return 0
 
-    # Files to always keep (generated files, not downloaded)
-    always_keep = {'loop.mp4'}
+    # Files to always keep (if any)
+    always_keep = set()
 
     deleted_count = 0
     total_bytes_freed = 0
@@ -412,12 +413,8 @@ def load_content() -> bool:
     """
     Fetch content from API and download all media files.
 
-    The backend now handles:
-    - Converting all image scenes to videos with exact duration
-    - Normalizing all videos to the same encoding
-    - Adding silent audio tracks for sync
-
-    This service just downloads pre-processed videos and stores scheduling info.
+    Downloads both images and videos based on the scene's mediaType.
+    Writes scene configs for jam_player_display to consume.
 
     Returns:
         True if successful, False otherwise.
@@ -444,21 +441,44 @@ def load_content() -> bool:
     processed_scenes = []
     for order_index, scene in enumerate(scenes):
         scene_id = scene.get('id')
+
+        # mediaType is an object: {"value": "CANVAS_IMAGE", "label": "Canvas Image"}
+        media_type_obj = scene.get('mediaType', {})
+        media_type_value = media_type_obj.get('value', 'CANVAS_IMAGE') if isinstance(media_type_obj, dict) else 'CANVAS_IMAGE'
+
+        image_url = scene.get('imageUrl')
         video_url = scene.get('videoUrl')
-        video_duration = scene.get('videoDuration')
+        duration = scene.get('duration')
         days_scheduled = scene.get('daysScheduled', [])
 
-        if not video_url:
-            logger.warning(f"Scene {scene_id} has no videoUrl, skipping")
+        # Determine if this is an image or video scene based on mediaType
+        # IMAGE types: CANVAS_IMAGE, and CANVAS_BRAND_AD with image
+        # VIDEO types: CANVAS_VIDEO, BRAND_VIDEO_AD, MENU_PULSE_GROUP_BRAND_VIDEO_AD
+        is_video = media_type_value in ('CANVAS_VIDEO', 'BRAND_VIDEO_AD', 'MENU_PULSE_GROUP_BRAND_VIDEO_AD')
+
+        # For CANVAS_BRAND_AD and MENU_PULSE_GROUP_CANVAS_BRAND_AD, check which URL is present
+        if media_type_value in ('CANVAS_BRAND_AD', 'MENU_PULSE_GROUP_CANVAS_BRAND_AD'):
+            is_video = video_url is not None and image_url is None
+
+        # Get the appropriate media URL
+        if is_video:
+            media_url = video_url
+            local_media_type = 'VIDEO'
+        else:
+            media_url = image_url
+            local_media_type = 'IMAGE'
+
+        if not media_url:
+            logger.warning(f"Scene {scene_id} has no media URL (type={media_type_value}), skipping")
             continue
 
-        if video_duration is None:
-            logger.warning(f"Scene {scene_id} has no videoDuration, skipping")
+        if duration is None:
+            logger.warning(f"Scene {scene_id} has no duration, skipping")
             continue
 
         # Generate filename from URL hash
-        url_hash = hash_string(video_url)
-        extension = get_file_extension_from_url(video_url)
+        url_hash = hash_string(media_url)
+        extension = get_file_extension_from_url(media_url)
         media_filename = f"{url_hash}{extension}"
         media_path = LIVE_MEDIA_DIR / media_filename
 
@@ -475,8 +495,8 @@ def load_content() -> bool:
                 need_download = True
 
         if need_download:
-            if not download_media(video_url, media_path):
-                logger.error(f"Failed to download video for scene {scene_id}, skipping")
+            if not download_media(media_url, media_path):
+                logger.error(f"Failed to download media for scene {scene_id}, skipping")
                 continue
 
         # Final verification before adding to scenes
@@ -484,17 +504,15 @@ def load_content() -> bool:
             logger.error(f"Media file missing after download for scene {scene_id}, skipping")
             continue
 
-        logger.info(f"Scene {scene_id}: duration={video_duration}s, scheduled_days={len(days_scheduled)}")
+        logger.info(f"Scene {scene_id}: type={local_media_type}, duration={duration}s, scheduled_days={len(days_scheduled)}")
 
         # Build processed scene data (order preserves API order)
-        # All content is now video - backend handles image-to-video conversion
         processed_scene = {
             'id': scene_id,
             'order': order_index,
             'media_file': media_filename,
-            'media_type': 'VIDEO',
-            'duration': video_duration,
-            'video_clip': media_filename,  # Same file - already normalized by backend
+            'media_type': local_media_type,  # 'IMAGE' or 'VIDEO'
+            'duration': duration,
             'days_scheduled': days_scheduled,  # For display service to filter by day/time
         }
         processed_scenes.append(processed_scene)
@@ -511,46 +529,25 @@ def load_content() -> bool:
 
     logger.info(f"Staged {len(processed_scenes)} scenes")
 
-    # Stitch all scenes into a single loop.mp4 for gapless playback
-    # Note: All videos are now pre-normalized by backend, so stream copy should work
-    loop_path = STAGED_SCENES_DIR / "loop.mp4"
     if not processed_scenes:
-        logger.warning("No scenes to stitch - keeping existing content")
+        logger.warning("No scenes processed - keeping existing content")
         return False
 
-    if not stitch_scenes_to_loop(processed_scenes, LIVE_MEDIA_DIR, loop_path):
-        logger.error("Failed to create loop.mp4 - keeping existing content")
-        return False
-
-    # Verify loop.mp4 was created and is valid
-    if not loop_path.exists():
-        logger.error("loop.mp4 not found after stitching - keeping existing content")
-        return False
-
-    loop_size = loop_path.stat().st_size
-    if loop_size == 0:
-        logger.error("loop.mp4 is empty - keeping existing content")
-        return False
-
-    # Calculate total duration and write loop metadata
+    # Calculate total duration and write metadata
     total_duration = sum(s.get('duration', 0) for s in processed_scenes)
-    loop_meta = {
-        'loop_file': 'loop.mp4',
+    content_meta = {
         'total_duration': total_duration,
         'scene_count': len(processed_scenes),
         'scenes': processed_scenes,
     }
-    with open(STAGED_SCENES_DIR / "loop_meta.json", 'w') as f:
-        json.dump(loop_meta, f, indent=2)
-    logger.info(f"Loop metadata written: {total_duration:.1f}s total, {loop_size / 1024 / 1024:.1f}MB")
+    with open(STAGED_SCENES_DIR / "content_meta.json", 'w') as f:
+        json.dump(content_meta, f, indent=2)
+    logger.info(f"Content metadata written: {total_duration:.1f}s total, {len(processed_scenes)} scenes")
 
-    # Atomically swap staged to live - only happens if loop.mp4 is valid
+    # Atomically swap staged to live
     if LIVE_SCENES_DIR.exists():
         shutil.rmtree(LIVE_SCENES_DIR)
     shutil.copytree(STAGED_SCENES_DIR, LIVE_SCENES_DIR)
-
-    # Also copy loop.mp4 to live media dir for easy access
-    shutil.copy2(loop_path, LIVE_MEDIA_DIR / "loop.mp4")
 
     # Clean up unused media files to free disk space
     referenced_files = {s.get('media_file') for s in processed_scenes if s.get('media_file')}
