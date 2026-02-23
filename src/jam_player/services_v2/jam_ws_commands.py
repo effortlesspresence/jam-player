@@ -46,16 +46,18 @@ from common.network import (
     connect_to_saved_wifi,
     check_internet_connectivity,
 )
-from common.paths import DISPLAY_ORIENTATION_FILE
+from common.paths import DISPLAY_ORIENTATION_FILE, ENVIRONMENT_FILE
 
 logger = setup_service_logging('jam-ws-commands')
 
-# WebSocket URL template - will be configured from environment or hardcoded
-# Format: wss://{stage}.sockets.justamenu.com
-WEBSOCKET_URL_TEMPLATE = "wss://{stage}.sockets.justamenu.com"
-
-# Environment for determining the WebSocket URL
-ENVIRONMENT = os.environ.get('JAM_ENVIRONMENT', 'production')
+# WebSocket URLs by environment
+# Note: prod uses sockets.justamenu.com (no prefix), others use {env}.sockets.justamenu.com
+WEBSOCKET_URLS = {
+    'prod': 'wss://sockets.justamenu.com',
+    'staging': 'wss://staging.sockets.justamenu.com',
+    'testing': 'wss://testing.sockets.justamenu.com',
+}
+DEFAULT_ENVIRONMENT = 'prod'
 
 # Reconnection settings
 INITIAL_RECONNECT_DELAY = 5  # seconds
@@ -76,15 +78,29 @@ reconnect_delay = INITIAL_RECONNECT_DELAY
 
 
 def get_websocket_url() -> str:
-    """Get the WebSocket URL based on environment."""
-    if ENVIRONMENT == 'production':
-        stage = 'production'
-    elif ENVIRONMENT == 'staging':
-        stage = 'staging'
-    else:
-        stage = 'testing'
+    """
+    Get the WebSocket URL based on environment.
 
-    return WEBSOCKET_URL_TEMPLATE.format(stage=stage)
+    Defaults to production. To override, create /etc/jam/config/environment
+    with content: 'testing', 'staging', or 'prod'.
+    """
+    env = DEFAULT_ENVIRONMENT
+
+    if ENVIRONMENT_FILE.exists():
+        try:
+            file_content = ENVIRONMENT_FILE.read_text().strip().lower()
+            if file_content:  # Only use if non-empty
+                env = file_content
+        except Exception as e:
+            logger.warning(f"Error reading environment file: {e}")
+
+    # Fall back to default if env is not a known environment
+    url = WEBSOCKET_URLS.get(env, WEBSOCKET_URLS[DEFAULT_ENVIRONMENT])
+
+    if env != DEFAULT_ENVIRONMENT and env in WEBSOCKET_URLS:
+        logger.info(f"Using {env} WebSocket: {url}")
+
+    return url
 
 
 def signal_handler(signum, frame):
