@@ -1586,26 +1586,12 @@ class JamPlayerDisplayManager:
                     time.sleep(0.5)
                     continue
 
-                logger.info(f"Switching to scene {scene_index}: {scene.get('id')} ({media_type}) @ {position_in_scene_ms}ms")
+                logger.info(f"Switching to scene {scene_index}: {scene.get('id')} ({media_type})")
                 self._current_scene_index = scene_index
 
+                # Just load and play - no seeking or sync logic for now
                 self.mpv.load_file(str(media_path))
-                time.sleep(0.2)
-
-                if media_type == 'VIDEO':
-                    seek_sec = position_in_scene_ms / 1000.0
-                    self.mpv.seek(seek_sec)
-                    self.mpv.set_speed(SPEED_NORMAL)
-                    self._current_speed = SPEED_NORMAL
-
-            # Sync logic for videos
-            current_time_ms = self._get_wall_clock_ms()
-
-            if current_time_ms - self._last_sync_check >= SYNC_CHECK_INTERVAL_MS:
-                self._last_sync_check = current_time_ms
-
-                if media_type == 'VIDEO':
-                    self._adjust_video_sync(scene_duration_ms, position_in_scene_ms)
+                time.sleep(0.1)  # Brief delay for MPV to initialize
 
             # Notify systemd watchdog
             sd_notifier.notify("WATCHDOG=1")
