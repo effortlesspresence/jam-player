@@ -61,6 +61,7 @@ from common.system import (
     WatchdogPinger,
 )
 from common.network import check_internet_connectivity
+from common.api import api_request
 
 # ============================================================================
 # Logging Configuration
@@ -86,6 +87,7 @@ MONITORED_SERVICES = [
     'jam-player-display.service',
     'jam-heartbeat.service',
     'jam-announce.service',
+    'jam-ws-commands.service',
 ]
 
 # Services that should always be running and will be restarted if failed
@@ -264,31 +266,29 @@ class HealthMonitor:
             logger.debug("No internet connectivity, skipping backend report")
             return
 
-        # TODO: Implement actual API call once the jam-player service
-        # backend endpoint for error reporting is implemented
-        # For now, just log that we would report
-        logger.info(
-            f"Would report to backend: service={service}, "
-            f"severity={severity.value}, message={message}"
-        )
+        try:
+            response = api_request(
+                method='POST',
+                path='/jam-players/errors',
+                body={
+                    'affectedService': service,
+                    'severity': severity.value,
+                    'errorMessage': message,
+                },
+                timeout=10,
+            )
 
-        # Future implementation:
-        # try:
-        #     response = requests.post(
-        #         f"{API_BASE_URL}/jam-player/report-error",
-        #         json={
-        #             'deviceUuid': get_device_uuid(),
-        #             'serviceAffected': service,
-        #             'severity': severity.value,
-        #             'errorMessage': message,
-        #         },
-        #         headers=get_auth_headers(),
-        #         timeout=10
-        #     )
-        #     if response.status_code != 200:
-        #         logger.warning(f"Backend returned {response.status_code}")
-        # except Exception as e:
-        #     logger.warning(f"Failed to report to backend: {e}")
+            if response is None:
+                logger.warning("Failed to report error to backend (request failed)")
+            elif response.status_code == 200:
+                logger.info(f"Reported error to backend: {service} ({severity.value})")
+            else:
+                logger.warning(
+                    f"Backend returned {response.status_code} when reporting error: "
+                    f"{response.text[:200] if response.text else 'no response body'}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to report to backend: {e}")
 
     def _should_attempt_restart(self, service: str) -> bool:
         """

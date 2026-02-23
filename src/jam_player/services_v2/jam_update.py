@@ -698,11 +698,14 @@ def install_systemd_units() -> bool:
     logger.info("Installing systemd units...")
 
     try:
+        installed_services = []
+
         # Copy service files
         for service_file in SYSTEMD_SRC.glob('*.service'):
             dest = Path('/etc/systemd/system') / service_file.name
             shutil.copy2(service_file, dest)
             logger.info(f"  Installed {service_file.name}")
+            installed_services.append(service_file.name)
 
         # Copy timer files
         for timer_file in SYSTEMD_SRC.glob('*.timer'):
@@ -713,6 +716,11 @@ def install_systemd_units() -> bool:
         # Reload systemd
         logger.info("  Reloading systemd daemon...")
         run_command(['systemctl', 'daemon-reload'])
+
+        # Enable all installed services (idempotent, safe to run on already-enabled services)
+        logger.info("  Enabling services...")
+        for service in installed_services:
+            run_command(['systemctl', 'enable', service], timeout=10)
 
         return True
     except Exception as e:
@@ -880,6 +888,7 @@ def restart_services():
         'jam-player-display.service',     # Type=notify, sends READY=1 early
         'jam-health-monitor.service',     # Type=notify, sends READY=1 early
         'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
+        'jam-ws-commands.service',        # Type=notify, WebSocket commands (has ConditionPath)
         'jam-tailscale.service',          # Type=oneshot, runs once
     ]
 
