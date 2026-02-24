@@ -2,14 +2,15 @@
 Description=JAM Player Display - Unified display manager for all display states
 Documentation=https://github.com/anthropics/jam-player
 
-# Wait for first boot to complete (credentials must exist)
-After=jam-first-boot.service
+# Start after basic system targets but DON'T wait for network-dependent services.
+# The display should start ASAP to show setup/loading screen.
+# It handles all states gracefully (no credentials, no network, no content).
+After=graphical.target
 
-# Wait for boot check to complete (validates system state)
-After=jam-boot-check.service
+# Soft dependency on first boot - we'll handle missing credentials gracefully
+Wants=jam-first-boot.service
 
-# Wait for clock sync (for video wall-clock sync) - but don't block startup
-# Time sync is only needed for multi-display sync, not for basic display
+# Clock sync is only needed for multi-display sync, not for basic display
 Wants=time-sync.target
 
 # Restart limits

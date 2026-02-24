@@ -1025,6 +1025,9 @@ class DeviceInfoCharacteristic(Characteristic):
     Returns basic info about the JAM Player for the mobile app.
     Includes device UUID, public keys for provisioning, and status flags.
 
+    Uses chunked notification transfer because the response includes the
+    SSH private key which exceeds BLE MTU limits (~512 bytes).
+
     Response format (camelCase to match JAM API conventions):
     {
         "deviceUuid": "019beb00-486a-702b-9e48-6b40f233fb75",
@@ -1033,52 +1036,126 @@ class DeviceInfoCharacteristic(Characteristic):
         "softwareVersion": "2.0",
         "apiSigningPublicKey": "base64-encoded-key",
         "sshPublicKey": "ssh-ed25519 AAAA...",
+        "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----...",
         "isConnected": false,
         "isAnnounced": false,
         "isRegistered": false
     }
     """
 
+    CHUNK_SIZE = 498  # 512 MTU - 2 byte header - ~12 bytes BLE overhead
+
     def __init__(self, bus, index: int, service):
-        super().__init__(bus, index, DEVICE_INFO_UUID, ['read'], service)
+        super().__init__(bus, index, DEVICE_INFO_UUID, ['read', 'notify'], service)
+        self._notifying = False
 
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
     def ReadValue(self, options):
-        """Return device information."""
-        logger.debug("Client requested device info")
+        """
+        Reading this characteristic triggers sending device info via notifications.
+        Returns immediately with status; actual data comes via notifications.
+        """
+        logger.info("Device info read requested - sending via notifications")
 
-        device_uuid = get_device_uuid() or 'unknown'
-        ble_device_name = get_device_name()
-        jp_image_id = get_jp_image_id() or ''
-        api_signing_public_key = get_api_signing_public_key() or ''
-        ssh_public_key = get_ssh_public_key() or ''
-        ssh_private_key = get_ssh_private_key() or ''
+        if not self._notifying:
+            logger.warning("Client read device info but notifications not enabled")
+            error = json.dumps({"error": "Subscribe to notifications first"})
+            return dbus.Array([dbus.Byte(b) for b in error.encode('utf-8')], signature='y')
 
-        # Check connectivity by reading flag file maintained by jam-ble-state-manager
-        # This is fast (just checking if file exists) and accurate (based on actual
-        # internet verification, not just NetworkManager state).
-        # The flag is updated every ~30 seconds by jam-ble-state-manager.
-        is_connected = INTERNET_VERIFIED_FLAG.exists()
+        # Trigger async notification sending
+        GLib.idle_add(self._send_device_info_chunked)
 
-        # Check registration status flags
-        is_announced = is_device_announced()
-        is_registered = is_device_registered()
+        # Return acknowledgment
+        return dbus.Array([dbus.Byte(ord('O')), dbus.Byte(ord('K'))], signature='y')
 
-        info = {
-            'deviceUuid': device_uuid,
-            'bleDeviceName': ble_device_name,
-            'jpImageId': jp_image_id,
-            'softwareVersion': '2.0',
-            'apiSigningPublicKey': api_signing_public_key,
-            'sshPublicKey': ssh_public_key,
-            'sshPrivateKey': ssh_private_key,
-            'isConnected': is_connected,
-            'isAnnounced': is_announced,
-            'isRegistered': is_registered,
-        }
-        logger.debug(f"Returning device info: uuid={device_uuid}, connected={is_connected}, announced={is_announced}, registered={is_registered}")
-        data = json.dumps(info)
-        return dbus.Array([dbus.Byte(b) for b in data.encode('utf-8')])
+    def _send_device_info_chunked(self):
+        """Send device info in chunked notifications."""
+        try:
+            device_uuid = get_device_uuid() or 'unknown'
+            ble_device_name = get_device_name()
+            jp_image_id = get_jp_image_id() or ''
+            api_signing_public_key = get_api_signing_public_key() or ''
+            ssh_public_key = get_ssh_public_key() or ''
+            ssh_private_key = get_ssh_private_key() or ''
+
+            # Check connectivity by reading flag file maintained by jam-ble-state-manager
+            is_connected = INTERNET_VERIFIED_FLAG.exists()
+
+            # Check registration status flags
+            is_announced = is_device_announced()
+            is_registered = is_device_registered()
+
+            info = {
+                'deviceUuid': device_uuid,
+                'bleDeviceName': ble_device_name,
+                'jpImageId': jp_image_id,
+                'softwareVersion': '2.0',
+                'apiSigningPublicKey': api_signing_public_key,
+                'sshPublicKey': ssh_public_key,
+                'sshPrivateKey': ssh_private_key,
+                'isConnected': is_connected,
+                'isAnnounced': is_announced,
+                'isRegistered': is_registered,
+            }
+
+            data = json.dumps(info, separators=(',', ':')).encode('utf-8')
+            total_size = len(data)
+            logger.info(f"Sending device info ({total_size} bytes) in chunks")
+            logger.debug(f"Device info: uuid={device_uuid}, connected={is_connected}, announced={is_announced}, registered={is_registered}")
+
+            # Split into chunks and send as notifications
+            seq_num = 0
+            offset = 0
+
+            while offset < total_size:
+                chunk_end = min(offset + self.CHUNK_SIZE, total_size)
+                chunk_data = data[offset:chunk_end]
+                is_last = chunk_end >= total_size
+
+                # Build packet: [seq_num][flags][data]
+                flags = 0x01 if is_last else 0x00
+                packet = bytes([seq_num, flags]) + chunk_data
+
+                logger.debug(f"Sending device info chunk {seq_num}: {len(chunk_data)} bytes, is_last={is_last}")
+
+                # Send notification
+                self.PropertiesChanged(
+                    GATT_CHRC_IFACE,
+                    {'Value': dbus.Array([dbus.Byte(b) for b in packet], signature='y')},
+                    []
+                )
+
+                seq_num = (seq_num + 1) % 256
+                offset = chunk_end
+
+                # Small delay between chunks
+                if not is_last:
+                    time.sleep(0.05)
+
+            logger.info(f"Finished sending {seq_num} chunks for device info")
+
+        except Exception as e:
+            logger.error(f"Error sending device info: {e}")
+            error_packet = bytes([0, 0x01]) + json.dumps({"error": str(e)}).encode('utf-8')
+            self.PropertiesChanged(
+                GATT_CHRC_IFACE,
+                {'Value': dbus.Array([dbus.Byte(b) for b in error_packet], signature='y')},
+                []
+            )
+
+        return False  # Don't repeat GLib.idle_add
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StartNotify(self):
+        """Client wants to receive notifications."""
+        logger.info("Client subscribed to device info notifications")
+        self._notifying = True
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StopNotify(self):
+        """Client no longer wants notifications."""
+        logger.info("Client unsubscribed from device info notifications")
+        self._notifying = False
 
 
 # ============================================================================

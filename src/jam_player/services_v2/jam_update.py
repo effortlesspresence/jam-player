@@ -744,6 +744,63 @@ def update_version_file(version: str) -> bool:
 # Cleanup Functions
 # =============================================================================
 
+def ensure_jam_user_exists() -> bool:
+    """
+    Ensure the 'jam' user exists for SSH key-based authentication.
+
+    The jam user:
+    - Is used for remote support SSH access
+    - Can ONLY authenticate via SSH keys (no password)
+    - Has its authorized_keys populated by jam-first-boot.service
+
+    The comitup user remains as a backup with password auth.
+
+    This is called during updates to ensure old devices (that already
+    completed first-boot before the jam user was introduced) get the
+    user created.
+
+    Returns True if user exists or was created successfully.
+    """
+    import pwd
+
+    try:
+        pwd.getpwnam('jam')
+        logger.debug("jam user already exists")
+        return True
+    except KeyError:
+        pass  # User doesn't exist, create it
+
+    logger.info("Creating jam user for SSH key authentication...")
+
+    try:
+        # Create user with home directory, no password (SSH key only)
+        success, _, stderr = run_command([
+            'useradd',
+            '-m',              # Create home directory
+            '-s', '/bin/bash', # Shell
+            '-c', 'JAM Player SSH Access',  # Comment
+            'jam'
+        ])
+
+        if not success:
+            logger.error(f"Failed to create jam user: {stderr}")
+            return False
+
+        # Lock the password (prevents password auth, SSH keys only)
+        success, _, stderr = run_command(['passwd', '-l', 'jam'])
+
+        if not success:
+            logger.warning(f"Failed to lock jam password: {stderr}")
+            # Not fatal - user still created
+
+        logger.info("Created jam user successfully (SSH key auth only)")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to create jam user: {e}")
+        return False
+
+
 def disable_comitup():
     """
     Disable comitup - JAM 2.0 uses its own BLE provisioning instead.
@@ -982,6 +1039,11 @@ def main():
     # This is idempotent and safe to run repeatedly, ensuring comitup stays disabled
     # even if a previous attempt failed or the device was imaged with comitup enabled
     disable_comitup()
+
+    # Ensure jam user exists for SSH key authentication
+    # This creates the user on old devices that already completed first-boot
+    # before the jam user was introduced
+    ensure_jam_user_exists()
 
     # Check if repo exists
     if not JAM_REPO_DIR.exists():

@@ -48,6 +48,67 @@ JAM_USER_SSH_DIR = Path('/home/jam/.ssh')
 JAM_USER_AUTHORIZED_KEYS = JAM_USER_SSH_DIR / 'authorized_keys'
 
 
+def ensure_jam_user_exists() -> bool:
+    """
+    Ensure the 'jam' user exists for SSH key-based authentication.
+
+    The jam user:
+    - Is used for remote support SSH access
+    - Can ONLY authenticate via SSH keys (no password)
+    - Has its authorized_keys populated with the device's public key
+
+    The comitup user remains as a backup with password auth.
+
+    Returns True if user exists or was created successfully.
+    """
+    import pwd
+
+    try:
+        pwd.getpwnam('jam')
+        logger.info("jam user already exists")
+        return True
+    except KeyError:
+        pass  # User doesn't exist, create it
+
+    logger.info("Creating jam user for SSH key authentication...")
+
+    try:
+        # Create user with home directory, no password (SSH key only)
+        result = subprocess.run(
+            [
+                'useradd',
+                '-m',              # Create home directory
+                '-s', '/bin/bash', # Shell
+                '-c', 'JAM Player SSH Access',  # Comment
+                'jam'
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            logger.error(f"Failed to create jam user: {result.stderr}")
+            return False
+
+        # Lock the password (prevents password auth, SSH keys only)
+        result = subprocess.run(
+            ['passwd', '-l', 'jam'],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to lock jam password: {result.stderr}")
+            # Not fatal - user still created
+
+        logger.info("Created jam user successfully (SSH key auth only)")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to create jam user: {e}")
+        return False
+
+
 def generate_device_uuid() -> str:
     """
     Generate a UUID v7 for this device installation.
@@ -271,7 +332,12 @@ def run_first_boot() -> bool:
     else:
         logger.info("SSH host keys already exist")
 
-    # 4. Set up SSH authorized_keys (using device's own public key)
+    # 4. Ensure jam user exists (for SSH key auth)
+    if not ensure_jam_user_exists():
+        logger.error("Failed to ensure jam user exists")
+        all_success = False
+
+    # 5. Set up SSH authorized_keys (using device's own public key)
     if not JAM_USER_AUTHORIZED_KEYS.exists():
         logger.info("Setting up SSH authorized_keys...")
         if not setup_ssh_authorized_keys():
