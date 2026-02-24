@@ -2,16 +2,9 @@
 Description=JAM Player Display - Unified display manager for all display states
 Documentation=https://github.com/anthropics/jam-player
 
-# Start after basic system targets but DON'T wait for network-dependent services.
-# The display should start ASAP to show setup/loading screen.
-# It handles all states gracefully (no credentials, no network, no content).
-After=graphical.target
-
-# Soft dependency on first boot - we'll handle missing credentials gracefully
-Wants=jam-first-boot.service
-
-# Clock sync is only needed for multi-display sync, not for basic display
-Wants=time-sync.target
+# Start early - the service handles waiting for X11 internally via xdpyinfo polling.
+# No After= dependencies to avoid systemd ordering cycles.
+# The display must start ASAP to show setup/loading screen.
 
 # Restart limits
 StartLimitIntervalSec=300
@@ -52,4 +45,4 @@ StandardError=journal
 SyslogIdentifier=jam-player-display
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
