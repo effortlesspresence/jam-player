@@ -114,6 +114,9 @@ CHECK_INTERVAL_SECONDS = 30     # How often to check service status
 # Watchdog interval (seconds)
 WATCHDOG_INTERVAL = 30
 
+# Bluetooth health check interval (only check every N cycles to avoid spam)
+BT_CHECK_INTERVAL_CYCLES = 2    # Check BT every 2 cycles (60 seconds)
+
 
 # ============================================================================
 # Error Severity Enum (matches jam_player_error_severity in DB)
@@ -200,6 +203,7 @@ class HealthMonitor:
             svc: ServiceFailureTracker(service_name=svc)
             for svc in MONITORED_SERVICES
         }
+        self._check_cycle = 0  # Track cycles for periodic checks
 
     def _get_service_status(self, service: str) -> tuple[bool, str]:
         """
@@ -305,6 +309,133 @@ class HealthMonitor:
             True if we should attempt to restart this service
         """
         return service in ALWAYS_RUNNING_SERVICES
+
+    def _check_bluetooth_health(self):
+        """
+        Check Bluetooth adapter health when BLE provisioning is running.
+
+        If jam-ble-provisioning is active but the adapter is not discoverable,
+        fix it by running bluetoothctl commands and restarting the service.
+        """
+        # Only check if jam-ble-provisioning is running
+        is_running, status = self._get_service_status('jam-ble-provisioning.service')
+        if not is_running:
+            return
+
+        # Check if adapter is discoverable
+        try:
+            result = subprocess.run(
+                ['bluetoothctl', 'show'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                logger.warning("Failed to get Bluetooth adapter status")
+                return
+
+            output = result.stdout
+
+            # Check Powered status
+            powered = 'Powered: yes' in output
+            discoverable = 'Discoverable: yes' in output
+
+            if not powered:
+                logger.warning("Bluetooth adapter is not powered - attempting to fix")
+                self._fix_bluetooth_adapter()
+            elif not discoverable:
+                logger.warning("Bluetooth adapter is not discoverable - attempting to fix")
+                self._fix_bluetooth_discoverable()
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout checking Bluetooth adapter status")
+        except Exception as e:
+            logger.warning(f"Error checking Bluetooth adapter: {e}")
+
+    def _fix_bluetooth_adapter(self):
+        """Attempt to power on the Bluetooth adapter and restart BLE service."""
+        try:
+            # Power on the adapter
+            subprocess.run(
+                ['bluetoothctl', 'power', 'on'],
+                capture_output=True,
+                timeout=10
+            )
+            logger.info("Bluetooth adapter powered on")
+
+            # Set discoverable
+            subprocess.run(
+                ['bluetoothctl', 'discoverable', 'on'],
+                capture_output=True,
+                timeout=10
+            )
+            logger.info("Bluetooth adapter set to discoverable")
+
+            # Restart BLE provisioning to re-register advertisement
+            subprocess.run(
+                ['systemctl', 'restart', 'jam-ble-provisioning.service'],
+                capture_output=True,
+                timeout=30
+            )
+            logger.info("Restarted jam-ble-provisioning after Bluetooth fix")
+
+            self._report_to_backend(
+                'jam-ble-provisioning.service',
+                ErrorSeverity.MEDIUM,
+                'Bluetooth adapter was not powered - fixed automatically'
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to fix Bluetooth adapter: {e}")
+            self._report_to_backend(
+                'jam-ble-provisioning.service',
+                ErrorSeverity.HIGH,
+                f'Failed to fix Bluetooth adapter: {e}'
+            )
+
+    def _fix_bluetooth_discoverable(self):
+        """Attempt to make the Bluetooth adapter discoverable."""
+        try:
+            # Set discoverable
+            result = subprocess.run(
+                ['bluetoothctl', 'discoverable', 'on'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                logger.info("Bluetooth adapter set to discoverable")
+
+                # Restart BLE provisioning to ensure advertisement is registered
+                subprocess.run(
+                    ['systemctl', 'restart', 'jam-ble-provisioning.service'],
+                    capture_output=True,
+                    timeout=30
+                )
+                logger.info("Restarted jam-ble-provisioning after discoverable fix")
+
+                self._report_to_backend(
+                    'jam-ble-provisioning.service',
+                    ErrorSeverity.MEDIUM,
+                    'Bluetooth adapter was not discoverable - fixed automatically'
+                )
+            else:
+                logger.error(f"Failed to set discoverable: {result.stderr}")
+                self._report_to_backend(
+                    'jam-ble-provisioning.service',
+                    ErrorSeverity.HIGH,
+                    f'Failed to set Bluetooth discoverable: {result.stderr}'
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to fix Bluetooth discoverable: {e}")
+            self._report_to_backend(
+                'jam-ble-provisioning.service',
+                ErrorSeverity.HIGH,
+                f'Failed to fix Bluetooth discoverable: {e}'
+            )
 
     def check_services(self):
         """
@@ -426,6 +557,11 @@ class HealthMonitor:
             try:
                 # Check all services
                 self.check_services()
+
+                # Periodically check Bluetooth health
+                self._check_cycle += 1
+                if self._check_cycle % BT_CHECK_INTERVAL_CYCLES == 0:
+                    self._check_bluetooth_health()
 
                 # Update status
                 status_summary = self.get_status_summary()

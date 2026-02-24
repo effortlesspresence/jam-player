@@ -123,6 +123,15 @@ INTERNET_CHECK_INTERVAL_SECONDS = 30
 BLE_PROVISIONING_SERVICE = 'jam-ble-provisioning.service'
 HEARTBEAT_SERVICE = 'jam-heartbeat.service'
 
+# Services to restart when connectivity is restored
+# These services may have failed/exited during offline period
+POST_CONNECTIVITY_SERVICES = [
+    'jam-tailscale.service',
+    'jam-ws-commands.service',
+    'jam-heartbeat.service',
+    'jam-announce.service',
+]
+
 # Watchdog interval (seconds)
 WATCHDOG_INTERVAL = 30
 
@@ -275,6 +284,7 @@ class BLEStateManager:
         Apply online state - stop BLE provisioning only if device is registered.
 
         Uses _apply_ble_state() which in turn uses _should_ble_run().
+        Also restarts services that may have failed during offline period.
 
         Returns:
             False (to stop the GLib timeout from repeating)
@@ -289,6 +299,9 @@ class BLEStateManager:
         method = self._connectivity_monitor.last_success_method
 
         self._apply_ble_state(is_online=True, method=method)
+
+        # Restart services that may have failed/exited during offline period
+        self._restart_post_connectivity_services()
 
         # Update systemd status
         if self._should_ble_run(is_online=True):
@@ -458,6 +471,36 @@ class BLEStateManager:
             return True  # Online but not registered - BLE needed for registration
 
         return False  # Online and registered - BLE not needed
+
+    def _restart_post_connectivity_services(self):
+        """
+        Restart services that may have failed/exited during offline period.
+
+        Called when connectivity is restored. These services need network
+        access and may have exited or failed while the device was offline.
+        """
+        import subprocess
+
+        logger.info("Restarting post-connectivity services...")
+
+        for service in POST_CONNECTIVITY_SERVICES:
+            try:
+                result = subprocess.run(
+                    ['systemctl', 'restart', service],
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+                if result.returncode == 0:
+                    logger.info(f"Restarted {service}")
+                else:
+                    # Not an error - service might not be needed yet
+                    # (e.g., jam-announce if already announced)
+                    logger.debug(f"Could not restart {service}: {result.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Timeout restarting {service}")
+            except Exception as e:
+                logger.warning(f"Error restarting {service}: {e}")
 
     def _apply_ble_state(self, is_online: bool, method: str = "unknown"):
         """
