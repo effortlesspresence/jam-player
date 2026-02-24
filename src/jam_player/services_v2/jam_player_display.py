@@ -721,6 +721,12 @@ class MpvIpcClient:
             logger.error(f"Failed to start MPV: {e}")
             return False
 
+    def is_running(self) -> bool:
+        """Check if MPV process is still running."""
+        if self.process is None:
+            return False
+        return self.process.poll() is None
+
     def stop_mpv(self):
         """Stop the MPV process and clean up."""
         if self.socket:
@@ -1261,8 +1267,18 @@ class JamPlayerDisplayManager:
         All JAM Players displaying the same Screen will show the same content
         at the same time, synchronized via wall clock (chrony/NTP).
         """
-        if not self.mpv:
-            return
+        # Ensure MPV is running - restart if it died
+        if not self.mpv or not self.mpv.is_running():
+            logger.info("MPV not running, (re)starting video playback...")
+            if self.mpv:
+                try:
+                    self.mpv.stop_mpv()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up MPV: {e}")
+            self._start_video_playback()
+            if not self.mpv:
+                logger.error("Failed to start MPV")
+                return
 
         logger.info("=" * 60)
         logger.info("Starting SYNCED content playback (wall clock mode)")
@@ -1342,6 +1358,16 @@ class JamPlayerDisplayManager:
                     continue
             except Exception as e:
                 logger.warning(f"Error checking loop file: {e}")
+
+            # Check if MPV died and needs restart
+            if self.mpv and not self.mpv.is_running():
+                logger.warning("MPV process died in stitched loop playback, exiting to retry")
+                try:
+                    self.mpv.stop_mpv()
+                except Exception as e:
+                    logger.warning(f"Error stopping dead MPV: {e}")
+                self.mpv = None
+                return  # Exit to let caller retry
 
             # Sync adjustment
             current_time_ms = self._get_wall_clock_ms()
@@ -1570,7 +1596,22 @@ class JamPlayerDisplayManager:
                     self._current_scene_index = -1
                 continue
 
+            # Check if MPV died and needs restart
+            if self.mpv and not self.mpv.is_running():
+                logger.warning("MPV process died, restarting...")
+                # Clean up the dead MPV first
+                try:
+                    self.mpv.stop_mpv()
+                except Exception as e:
+                    logger.warning(f"Error stopping dead MPV: {e}")
+                self.mpv = None
+                # Restart video playback
+                self._start_video_playback()
+                self._current_scene_index = -1  # Force scene reload
+                continue
+
             # Calculate where we should be based on wall clock
+
             position_in_cycle_ms = self._calculate_expected_position(cycle_duration_ms)
             scene_index, position_in_scene_ms, scene = self._get_scene_at_position(scenes, position_in_cycle_ms)
 
