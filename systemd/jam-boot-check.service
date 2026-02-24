@@ -10,10 +10,11 @@ After=jam-first-boot.service
 # The display can start with the old code while updates install in background.
 
 # Run before other JAM services that depend on system state
+# NOTE: jam-player-display is NOT listed here - it should start ASAP
+# without waiting for boot check. It handles all states gracefully.
 Before=jam-announce.service
 Before=jam-ble-provisioning.service
 Before=jam-content-manager.service
-Before=jam-player-display.service
 
 [Service]
 Type=oneshot

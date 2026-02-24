@@ -52,4 +52,4 @@ StandardError=journal
 SyslogIdentifier=jam-player-display
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target

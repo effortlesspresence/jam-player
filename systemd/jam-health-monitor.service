@@ -41,4 +41,4 @@ StandardError=journal
 SyslogIdentifier=jam-health-monitor
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
