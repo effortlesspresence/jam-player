@@ -9,11 +9,10 @@ After=jam-first-boot.service
 # Updates should not block display startup - the existing code works fine.
 # The display can start with the old code while updates install in background.
 
-# Run before other JAM services that depend on system state
-# NOTE: jam-player-display is NOT listed here - it should start ASAP
-# without waiting for boot check. It handles all states gracefully.
+# Run before services that actually need system state validation.
+# NOTE: jam-player-display and jam-ble-provisioning are NOT listed here -
+# they must start ASAP on fresh devices for user setup experience.
 Before=jam-announce.service
-Before=jam-ble-provisioning.service
 Before=jam-content-manager.service
 
 [Service]

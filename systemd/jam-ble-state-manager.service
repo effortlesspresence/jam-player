@@ -6,8 +6,8 @@ Documentation=https://github.com/anthropics/jam-player
 After=NetworkManager.service
 Requires=NetworkManager.service
 
-# Wait for boot check to complete
-After=jam-boot-check.service
+# NOTE: We do NOT wait for jam-boot-check.service here!
+# BLE state manager must start early to enable BLE provisioning on fresh devices.
 
 # Restart limits
 StartLimitIntervalSec=300
