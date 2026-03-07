@@ -43,6 +43,71 @@ from common.paths import (
 
 logger = setup_service_logging('jam-first-boot')
 
+# Path to jam user's SSH directory
+JAM_USER_SSH_DIR = Path('/home/jam/.ssh')
+JAM_USER_AUTHORIZED_KEYS = JAM_USER_SSH_DIR / 'authorized_keys'
+
+
+def ensure_jam_user_exists() -> bool:
+    """
+    Ensure the 'jam' user exists for SSH key-based authentication.
+
+    The jam user:
+    - Is used for remote support SSH access
+    - Can ONLY authenticate via SSH keys (no password)
+    - Has its authorized_keys populated with the device's public key
+
+    The comitup user remains as a backup with password auth.
+
+    Returns True if user exists or was created successfully.
+    """
+    import pwd
+
+    try:
+        pwd.getpwnam('jam')
+        logger.info("jam user already exists")
+        return True
+    except KeyError:
+        pass  # User doesn't exist, create it
+
+    logger.info("Creating jam user for SSH key authentication...")
+
+    try:
+        # Create user with home directory, no password (SSH key only)
+        result = subprocess.run(
+            [
+                'useradd',
+                '-m',              # Create home directory
+                '-s', '/bin/bash', # Shell
+                '-c', 'JAM Player SSH Access',  # Comment
+                'jam'
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            logger.error(f"Failed to create jam user: {result.stderr}")
+            return False
+
+        # Lock the password (prevents password auth, SSH keys only)
+        result = subprocess.run(
+            ['passwd', '-l', 'jam'],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to lock jam password: {result.stderr}")
+            # Not fatal - user still created
+
+        logger.info("Created jam user successfully (SSH key auth only)")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to create jam user: {e}")
+        return False
+
 
 def generate_device_uuid() -> str:
     """
@@ -92,13 +157,59 @@ def generate_api_signing_keys() -> bool:
         return False
 
 
+def setup_ssh_authorized_keys() -> bool:
+    """
+    Set up SSH authorized_keys for the jam user using the device's own public key.
+
+    This enables passwordless SSH access: the device's private key (stored in
+    /etc/jam/credentials/) is uploaded to the backend during provisioning, and
+    the JAM CLI downloads it to authenticate when connecting.
+
+    Creates /home/jam/.ssh/authorized_keys with the device's own public key.
+    """
+    try:
+        # Read the device's SSH public key
+        if not SSH_PUBLIC_KEY_FILE.exists():
+            logger.error("SSH public key not found - generate SSH keys first")
+            return False
+
+        device_public_key = SSH_PUBLIC_KEY_FILE.read_text().strip()
+
+        # Get jam user's UID and GID
+        import pwd
+        try:
+            jam_user = pwd.getpwnam('jam')
+            jam_uid = jam_user.pw_uid
+            jam_gid = jam_user.pw_gid
+        except KeyError:
+            logger.error("jam user does not exist")
+            return False
+
+        # Create .ssh directory if it doesn't exist
+        JAM_USER_SSH_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(JAM_USER_SSH_DIR, 0o700)
+        os.chown(JAM_USER_SSH_DIR, jam_uid, jam_gid)
+
+        # Write authorized_keys file with the device's own public key
+        JAM_USER_AUTHORIZED_KEYS.write_text(device_public_key + '\n')
+        os.chmod(JAM_USER_AUTHORIZED_KEYS, 0o600)
+        os.chown(JAM_USER_AUTHORIZED_KEYS, jam_uid, jam_gid)
+
+        logger.info("Set up SSH authorized_keys with device's public key")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to set up SSH authorized_keys: {e}")
+        return False
+
+
 def generate_ssh_keys() -> bool:
     """
-    Generate Ed25519 SSH key pair for remote support access.
+    Generate Ed25519 SSH key pair for sshd host key verification.
 
     Uses ssh-keygen for compatibility with standard SSH tools.
-    The public key is sent to the backend during provisioning for
-    the JAM CLI's `jam jp ssh` command.
+    The public key is sent to the backend during provisioning so
+    the JAM CLI can verify the host identity.
     """
     try:
         # Remove existing keys if present (shouldn't happen, but be safe)
@@ -212,14 +323,39 @@ def run_first_boot() -> bool:
     else:
         logger.info("API signing keys already exist")
 
-    # 3. Generate SSH key pair
+    # 3. Generate SSH key pair (for host key verification)
+    ssh_keys_regenerated = False
     if not SSH_PRIVATE_KEY_FILE.exists() or not SSH_PUBLIC_KEY_FILE.exists():
-        logger.info("Generating SSH key pair...")
+        logger.info("Generating SSH host key pair...")
         if not generate_ssh_keys():
             logger.error("Failed to generate SSH keys")
             all_success = False
+        else:
+            ssh_keys_regenerated = True
     else:
-        logger.info("SSH keys already exist")
+        logger.info("SSH host keys already exist")
+
+    # 4. Ensure jam user exists (for SSH key auth)
+    if not ensure_jam_user_exists():
+        logger.error("Failed to ensure jam user exists")
+        all_success = False
+
+    # 5. Set up SSH authorized_keys (using device's own public key)
+    # IMPORTANT: If keys were regenerated, we MUST update authorized_keys to match!
+    if ssh_keys_regenerated and JAM_USER_AUTHORIZED_KEYS.exists():
+        logger.info("SSH keys were regenerated - removing old authorized_keys to force update")
+        try:
+            JAM_USER_AUTHORIZED_KEYS.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to remove old authorized_keys: {e}")
+
+    if not JAM_USER_AUTHORIZED_KEYS.exists():
+        logger.info("Setting up SSH authorized_keys...")
+        if not setup_ssh_authorized_keys():
+            logger.error("Failed to set up SSH authorized_keys")
+            all_success = False
+    else:
+        logger.info("SSH authorized_keys already configured")
 
     # Mark complete only if all tasks succeeded
     if all_success:

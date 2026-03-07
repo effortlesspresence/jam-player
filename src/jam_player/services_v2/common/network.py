@@ -284,6 +284,278 @@ def trigger_wifi_scan():
         logger.error(f"Initial WiFi scan failed: {e}")
 
 
+def _log_network_diagnostic_info():
+    """
+    Log detailed network diagnostic information for debugging WiFi connection issues.
+    This helps diagnose issues like "Connection activation failed: New connection activation was enqueued"
+    """
+    logger.info("=== NETWORK DIAGNOSTIC INFO ===")
+
+    # 1. Log wlan0 interface state
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"Device status:\n{result.stdout.strip()}")
+        else:
+            logger.warning(f"Failed to get device status: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting device status: {e}")
+
+    # 2. Log active connections
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE', 'connection', 'show', '--active'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"Active connections:\n{result.stdout.strip() or '(none)'}")
+        else:
+            logger.warning(f"Failed to get active connections: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting active connections: {e}")
+
+    # 3. Log NetworkManager state
+    try:
+        result = subprocess.run(
+            ['nmcli', 'general', 'status'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"NetworkManager status:\n{result.stdout.strip()}")
+        else:
+            logger.warning(f"Failed to get NM status: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting NM status: {e}")
+
+    # 4. Check if comitup service is running
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', 'comitup'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        comitup_state = result.stdout.strip()
+        logger.info(f"comitup.service state: {comitup_state}")
+    except Exception as e:
+        logger.warning(f"Error checking comitup state: {e}")
+
+    # 5. Check rfkill status (is WiFi blocked?)
+    try:
+        result = subprocess.run(
+            ['rfkill', 'list', 'wifi'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info(f"rfkill wifi status:\n{result.stdout.strip()}")
+        else:
+            logger.warning(f"Failed to get rfkill status: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"Error getting rfkill status: {e}")
+
+    logger.info("=== END DIAGNOSTIC INFO ===")
+
+
+def _connect_wifi_secure(ssid: str, password: str) -> subprocess.CompletedProcess:
+    """
+    Connect to a WiFi network securely without exposing the password in process list.
+
+    Uses a temporary NetworkManager connection file to pass credentials securely.
+    The file is created with restricted permissions (0600) and deleted immediately
+    after use.
+
+    Args:
+        ssid: The WiFi network SSID
+        password: The WiFi password
+
+    Returns:
+        subprocess.CompletedProcess with the result of the connection attempt
+    """
+    import os
+    import tempfile
+    import uuid
+
+    # Generate a unique connection name
+    conn_name = f"jam-wifi-{uuid.uuid4().hex[:8]}"
+
+    # First, delete any existing connection with the same SSID to avoid conflicts
+    try:
+        # Find existing connections for this SSID
+        list_result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if list_result.returncode == 0:
+            for line in list_result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[1] == '802-11-wireless':
+                    existing_name = parts[0]
+                    # Check if this connection is for our SSID
+                    ssid_result = subprocess.run(
+                        ['nmcli', '-t', '-f', '802-11-wireless.ssid',
+                         'connection', 'show', existing_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if ssid_result.returncode == 0 and ssid in ssid_result.stdout:
+                        logger.info(f"Removing existing connection profile: {existing_name}")
+                        subprocess.run(
+                            ['nmcli', 'connection', 'delete', existing_name],
+                            capture_output=True,
+                            timeout=5
+                        )
+    except Exception as e:
+        logger.warning(f"Error cleaning up existing connections: {e}")
+
+    # Create a NetworkManager keyfile (connection profile) with the credentials
+    # This avoids passing the password as a command-line argument
+    keyfile_content = f"""[connection]
+id={conn_name}
+type=wifi
+autoconnect=true
+
+[wifi]
+ssid={ssid}
+mode=infrastructure
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk={password}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+"""
+
+    temp_keyfile = None
+    try:
+        # Create temp file with restricted permissions
+        fd, temp_keyfile = tempfile.mkstemp(suffix='.nmconnection', prefix='jam-wifi-')
+        try:
+            # Set restrictive permissions BEFORE writing content
+            os.fchmod(fd, 0o600)
+            os.write(fd, keyfile_content.encode('utf-8'))
+        finally:
+            os.close(fd)
+
+        logger.info(f"Created secure connection profile for SSID: {ssid}")
+
+        # Import the connection profile
+        import_result = subprocess.run(
+            ['nmcli', 'connection', 'load', temp_keyfile],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if import_result.returncode != 0:
+            logger.error(f"Failed to load connection profile: {import_result.stderr}")
+            return import_result
+
+        # Activate the connection
+        logger.info(f"Activating connection: {conn_name}")
+        result = subprocess.run(
+            ['nmcli', 'connection', 'up', conn_name],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        logger.info(f"Connection result: returncode={result.returncode}")
+        if result.stdout.strip():
+            logger.info(f"stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            # Sanitize stderr to remove any password-related info
+            stderr_sanitized = result.stderr.strip()
+            if 'psk' in stderr_sanitized.lower() or 'password' in stderr_sanitized.lower():
+                logger.info("stderr: [contains sensitive info - redacted]")
+            else:
+                logger.info(f"stderr: {stderr_sanitized}")
+
+        return result
+
+    finally:
+        # Always clean up the temp file
+        if temp_keyfile and os.path.exists(temp_keyfile):
+            try:
+                # Securely overwrite before deletion
+                with open(temp_keyfile, 'wb') as f:
+                    f.write(b'\x00' * 1024)
+                os.unlink(temp_keyfile)
+            except Exception as e:
+                logger.warning(f"Error cleaning up temp keyfile: {e}")
+
+
+def _stop_comitup_hotspot() -> bool:
+    """
+    Stop the comitup hotspot to free up the wlan0 interface for client mode.
+
+    Returns:
+        True if hotspot was stopped or wasn't running, False on error
+    """
+    try:
+        # Check if comitup hotspot is active (connection name starts with JAM-SETUP)
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show', '--active'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        hotspot_name = None
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[0].startswith('JAM-SETUP'):
+                    hotspot_name = parts[0]
+                    break
+
+        if not hotspot_name:
+            logger.info("No comitup hotspot active, proceeding with WiFi connection")
+            return True
+
+        logger.info(f"Stopping comitup hotspot: {hotspot_name}")
+
+        # Bring down the hotspot connection
+        result = subprocess.run(
+            ['nmcli', 'connection', 'down', hotspot_name],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Successfully stopped hotspot: {hotspot_name}")
+            # Give NetworkManager a moment to release the interface
+            time.sleep(1)
+            return True
+        else:
+            logger.warning(f"Failed to stop hotspot: {result.stderr}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error stopping comitup hotspot: {e}")
+        return False
+
+
 def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
     """
     Connect to a WiFi network, preserving existing connection if new attempt fails.
@@ -315,20 +587,28 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
                 return True, ""
             logger.info(f"Connected to {ssid} but no internet - will attempt reconnect")
 
-        # Try to connect using nmcli
-        result = subprocess.run(
-            ['nmcli', 'device', 'wifi', 'connect', ssid, 'password', password],
-            capture_output=True,
-            text=True,
-            timeout=30  # WiFi connection can take a while
-        )
+        # Log diagnostic info before attempting connection (helps debug failures)
+        _log_network_diagnostic_info()
+
+        # Stop comitup hotspot if running - can't use wlan0 for both AP and client mode
+        hotspot_stopped = _stop_comitup_hotspot()
+        logger.info(f"Hotspot stop result: {hotspot_stopped}")
+
+        # Try to connect using nmcli with secure password handling
+        # We use a connection file to avoid exposing password in process list
+        logger.info(f"Connecting to WiFi network: {ssid}")
+        result = _connect_wifi_secure(ssid, password)
 
         if result.returncode == 0:
             logger.info(f"Successfully connected to {ssid}")
             return True, ""
 
         error_msg = result.stderr.strip() or result.stdout.strip()
-        logger.warning(f"Failed to connect to {ssid}: {error_msg}")
+        logger.error(f"WiFi connection FAILED for {ssid}: {error_msg}")
+
+        # Log diagnostic info again after failure to see what changed
+        logger.info("Post-failure diagnostic info:")
+        _log_network_diagnostic_info()
 
         # If we had a previous working connection, try to restore it
         if previous_connection:
@@ -344,13 +624,136 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
             return False, error_msg or "Connection failed"
 
     except subprocess.TimeoutExpired:
-        logger.error(f"Connection to {ssid} timed out")
+        logger.error(f"Connection to {ssid} timed out after 30 seconds")
+        logger.info("Post-timeout diagnostic info:")
+        _log_network_diagnostic_info()
         # Try to restore previous connection on timeout too
         if previous_connection:
             _restore_wifi_connection(previous_connection['name'])
         return False, "Connection timed out"
     except Exception as e:
-        logger.error(f"Error connecting to WiFi: {e}")
+        logger.error(f"Exception during WiFi connection: {type(e).__name__}: {e}")
+        logger.info("Post-exception diagnostic info:")
+        _log_network_diagnostic_info()
+        return False, str(e)
+
+
+def get_saved_wifi_networks() -> List[Dict[str, str]]:
+    """
+    Get list of WiFi networks saved in NetworkManager.
+
+    These are networks the device has previously connected to and remembers.
+    Users can reconnect to these without entering a password.
+
+    Returns:
+        List of dicts with keys: 'ssid', 'name' (connection profile name)
+    """
+    try:
+        # Get all saved connections
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to list connections: {result.stderr}")
+            return []
+
+        saved_networks = []
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split(':')
+            if len(parts) >= 2 and parts[1] == '802-11-wireless':
+                connection_name = parts[0]
+                # Get the SSID for this connection
+                ssid_result = subprocess.run(
+                    ['nmcli', '-t', '-f', '802-11-wireless.ssid',
+                     'connection', 'show', connection_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if ssid_result.returncode == 0:
+                    ssid_line = ssid_result.stdout.strip()
+                    # Format is "802-11-wireless.ssid:MyNetwork"
+                    if ':' in ssid_line:
+                        ssid = ssid_line.split(':', 1)[1]
+                        if ssid:
+                            saved_networks.append({
+                                'ssid': ssid,
+                                'name': connection_name
+                            })
+
+        logger.info(f"Found {len(saved_networks)} saved WiFi networks")
+        return saved_networks
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout getting saved networks")
+        return []
+    except Exception as e:
+        logger.error(f"Error getting saved networks: {e}")
+        return []
+
+
+def connect_to_saved_wifi(connection_name: str) -> Tuple[bool, str]:
+    """
+    Connect to a saved WiFi network by its NetworkManager profile name.
+
+    This is used when the user wants to reconnect to a previously saved
+    network without entering the password again.
+
+    If already connected to a working network and the new connection attempt fails,
+    we restore the previous connection to avoid leaving the device offline.
+
+    Args:
+        connection_name: The NetworkManager connection profile name
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    try:
+        # Save current connection state before attempting new connection
+        previous_connection = _get_active_wifi_connection()
+        if previous_connection:
+            logger.info(f"Currently connected to: {previous_connection['name']} (will restore if new connection fails)")
+
+        # Stop comitup hotspot if running
+        _stop_comitup_hotspot()
+
+        logger.info(f"Connecting to saved network: {connection_name}")
+
+        result = subprocess.run(
+            ['nmcli', 'connection', 'up', connection_name],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Connected to saved network: {connection_name}")
+            return True, ""
+        else:
+            error_msg = result.stderr.strip() or "Connection failed"
+            logger.error(f"Failed to connect to saved network: {error_msg}")
+
+            # If we had a previous working connection, try to restore it
+            if previous_connection and previous_connection['name'] != connection_name:
+                logger.info(f"Restoring previous connection to: {previous_connection['name']}")
+                _restore_wifi_connection(previous_connection['name'])
+
+            return False, error_msg
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout connecting to saved network")
+        # Try to restore previous connection on timeout
+        if previous_connection and previous_connection['name'] != connection_name:
+            _restore_wifi_connection(previous_connection['name'])
+        return False, "timeout"
+    except Exception as e:
+        logger.error(f"Error connecting to saved network: {e}")
         return False, str(e)
 
 

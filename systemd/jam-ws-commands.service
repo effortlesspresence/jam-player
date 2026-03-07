@@ -1,19 +1,13 @@
 [Unit]
-Description=JAM Player Announce - Announces device presence to JAM backend
+Description=JAM Player WebSocket Commands - Receives real-time commands from backend
 Documentation=https://github.com/anthropics/jam-player
 
-# Only run if not yet announced
-ConditionPathExists=!/etc/jam/device_data/.announced
+# Only run when device has announced itself to the backend (has a DB record)
+ConditionPathExists=/etc/jam/device_data/.announced
 
 # Requires first boot to have completed (credentials must exist)
 Requires=jam-first-boot.service
 After=jam-first-boot.service
-
-# Wait for update service to complete (ensures we have latest code)
-After=jam-update.service
-
-# Wait for boot check to complete (network readiness, system validation)
-After=jam-boot-check.service
 
 # Requires network and synced clock (for SSL certificate validation)
 After=network-online.target time-sync.target
@@ -24,29 +18,33 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=oneshot
+Type=notify
 
-# Run as root
+# Run as root (needed for network configuration changes)
 User=root
 Group=root
 
 # Working directory
 WorkingDirectory=/opt/jam/services
 
-# Main script - calls announce-jp API, creates .announced flag on success
-ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_announce.py
+# Main script - maintains WebSocket connection and handles commands
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_ws_commands.py
 
-# Retry on failure (network might not be ready)
-Restart=on-failure
+# Always restart - commands are important for remote management
+Restart=always
 RestartSec=30
+
+# Watchdog - must ping within 120 seconds (we ping every 30s)
+WatchdogSec=120
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
+Environment=JAM_ENVIRONMENT=production
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=jam-announce
+SyslogIdentifier=jam-ws-commands
 
 [Install]
 WantedBy=multi-user.target

@@ -82,15 +82,19 @@ from common.credentials import (
     get_jp_image_id,
     get_api_signing_public_key,
     get_ssh_public_key,
+    get_ssh_private_key,
     is_device_announced,
     is_device_registered,
     set_device_registered,
     set_device_announced,
+    set_screen_id,
 )
 from common.api import api_request, get_api_base_url
 from common.network import (
     get_available_wifi_networks,
+    get_saved_wifi_networks,
     connect_to_wifi,
+    connect_to_saved_wifi,
     get_current_connection_info,
     trigger_wifi_scan,
 )
@@ -109,7 +113,7 @@ logger = setup_service_logging('jam-ble-provisioning')
 # systemd Integration
 # ============================================================================
 
-from common.system import get_systemd_notifier, setup_signal_handlers, setup_glib_watchdog
+from common.system import get_systemd_notifier, setup_signal_handlers, setup_glib_watchdog, manage_service, restart_service
 
 # SystemdNotifier lets us tell systemd:
 # - READY=1: Service has started successfully
@@ -161,6 +165,8 @@ WIFI_CREDENTIALS_UUID = '12345678-1234-5678-1234-56789abcdef2'  # Write SSID + p
 CONNECTION_STATUS_UUID = '12345678-1234-5678-1234-56789abcdef3' # Read/notify status
 DEVICE_INFO_UUID = '12345678-1234-5678-1234-56789abcdef4'       # Read device info
 PROVISION_CONFIRM_UUID = '12345678-1234-5678-1234-56789abcdef5' # Write provisioning confirmation
+SCREEN_ID_UUID = '12345678-1234-5678-1234-56789abcdef6'         # Write screen ID for linking
+SAVED_NETWORKS_UUID = '12345678-1234-5678-1234-56789abcdef7'    # Read saved/known networks
 
 # ============================================================================
 # systemd Watchdog Configuration
@@ -618,6 +624,111 @@ class WiFiNetworksCharacteristic(Characteristic):
 
 
 # ============================================================================
+# Saved WiFi Networks Characteristic (READ)
+# ============================================================================
+
+class SavedNetworksCharacteristic(Characteristic):
+    """
+    Characteristic to read saved/known WiFi networks.
+
+    Returns networks that have been previously connected to and saved in
+    NetworkManager. Users can reconnect to these without entering a password.
+
+    Uses the same chunked notification protocol as WiFiNetworksCharacteristic.
+
+    Response format (JSON array):
+    [{"ssid": "MyNetwork", "name": "MyNetwork"}, ...]
+    """
+
+    CHUNK_SIZE = 498  # Same as WiFiNetworksCharacteristic
+
+    def __init__(self, bus, index: int, service):
+        super().__init__(bus, index, SAVED_NETWORKS_UUID, ['read', 'notify'], service)
+        self._notifying = False
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        """
+        Reading this characteristic triggers sending saved networks via notifications.
+        Returns immediately with status; actual data comes via notifications.
+        """
+        logger.info("Saved networks read requested - sending via notifications")
+
+        if not self._notifying:
+            logger.warning("Client read saved networks but notifications not enabled")
+            error = json.dumps({"error": "Subscribe to notifications first"})
+            return dbus.Array([dbus.Byte(b) for b in error.encode('utf-8')], signature='y')
+
+        # Trigger async notification sending
+        GLib.idle_add(self._send_networks_chunked)
+
+        # Return acknowledgment
+        return dbus.Array([dbus.Byte(ord('O')), dbus.Byte(ord('K'))], signature='y')
+
+    def _send_networks_chunked(self):
+        """Send saved WiFi networks data in chunked notifications."""
+        try:
+            networks = get_saved_wifi_networks()
+            data = json.dumps(networks, separators=(',', ':')).encode('utf-8')
+            total_size = len(data)
+            logger.info(f"Sending {len(networks)} saved WiFi networks ({total_size} bytes) in chunks")
+
+            # Split into chunks and send as notifications
+            seq_num = 0
+            offset = 0
+
+            while offset < total_size:
+                chunk_end = min(offset + self.CHUNK_SIZE, total_size)
+                chunk_data = data[offset:chunk_end]
+                is_last = chunk_end >= total_size
+
+                # Build packet: [seq_num][flags][data]
+                flags = 0x01 if is_last else 0x00
+                packet = bytes([seq_num, flags]) + chunk_data
+
+                logger.debug(f"Sending saved networks chunk {seq_num}: {len(chunk_data)} bytes, is_last={is_last}")
+
+                # Send notification
+                self.PropertiesChanged(
+                    GATT_CHRC_IFACE,
+                    {'Value': dbus.Array([dbus.Byte(b) for b in packet], signature='y')},
+                    []
+                )
+
+                seq_num = (seq_num + 1) % 256
+                offset = chunk_end
+
+                # Small delay between chunks
+                if not is_last:
+                    time.sleep(0.05)
+
+            logger.info(f"Finished sending {seq_num} chunks for saved networks")
+
+        except Exception as e:
+            logger.error(f"Error sending saved networks: {e}")
+            error_packet = bytes([0, 0x01]) + json.dumps({"error": str(e)}).encode('utf-8')
+            self.PropertiesChanged(
+                GATT_CHRC_IFACE,
+                {'Value': dbus.Array([dbus.Byte(b) for b in error_packet], signature='y')},
+                []
+            )
+
+        return False  # Don't repeat GLib.idle_add
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StartNotify(self):
+        """Client wants to receive notifications."""
+        logger.info("Client subscribed to saved networks notifications")
+        self._notifying = True
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StopNotify(self):
+        """Client no longer wants notifications."""
+        logger.info("Client unsubscribed from saved networks notifications")
+        self._notifying = False
+
+
+# ============================================================================
 # Post-WiFi Connection Actions
 # ============================================================================
 
@@ -647,8 +758,8 @@ def try_announce_after_wifi():
 
     # Check if already announced
     if is_device_announced():
-        logger.info("Device already announced - triggering jam-tailscale")
-        _trigger_tailscale()
+        logger.info("Device already announced - triggering post-announce services")
+        _trigger_post_announce_services()
         return
 
     logger.info("Attempting to announce device...")
@@ -657,9 +768,10 @@ def try_announce_after_wifi():
     device_uuid = get_device_uuid()
     api_signing_public_key = get_api_signing_public_key()
     ssh_public_key = get_ssh_public_key()
+    ssh_private_key = get_ssh_private_key()
     jp_image_id = get_jp_image_id()
 
-    if not all([device_uuid, api_signing_public_key, ssh_public_key, jp_image_id]):
+    if not all([device_uuid, api_signing_public_key, ssh_public_key, ssh_private_key, jp_image_id]):
         logger.warning("Missing credentials for announce - skipping")
         return
 
@@ -667,6 +779,7 @@ def try_announce_after_wifi():
         'deviceUuid': device_uuid,
         'apiSigningPublicKey': api_signing_public_key,
         'sshPublicKey': ssh_public_key,
+        'sshPrivateKey': ssh_private_key,
         'jpImageId': jp_image_id,
     }
 
@@ -686,27 +799,36 @@ def try_announce_after_wifi():
     if response.status_code in (200, 409):
         logger.info("Announce successful (or already announced)!")
         set_device_announced()
-        # Now trigger Tailscale setup
-        _trigger_tailscale()
+        # Now trigger post-announce services (Tailscale, WebSocket commands, etc.)
+        _trigger_post_announce_services()
     else:
         logger.warning(f"Announce failed: {response.status_code}")
 
 
-def _trigger_tailscale():
+def _trigger_post_announce_services():
     """
-    Restart jam-tailscale.service to attempt Tailscale setup.
+    Restart services that depend on the device being announced.
+    Called after announce succeeds and .announced flag is created.
     """
     import subprocess
-    try:
-        logger.info("Triggering jam-tailscale.service restart...")
-        subprocess.run(
-            ['systemctl', 'restart', 'jam-tailscale.service'],
-            timeout=10,
-            capture_output=True
-        )
-        logger.info("jam-tailscale.service restart triggered")
-    except Exception as e:
-        logger.warning(f"Failed to restart jam-tailscale: {e}")
+
+    services_to_restart = [
+        'jam-tailscale.service',      # Remote access via Tailscale
+        'jam-ws-commands.service',    # WebSocket commands from backend
+        'jam-heartbeat.service',      # Device status reporting
+    ]
+
+    for service in services_to_restart:
+        try:
+            logger.info(f"Triggering {service} restart...")
+            subprocess.run(
+                ['systemctl', 'restart', service],
+                timeout=10,
+                capture_output=True
+            )
+            logger.info(f"{service} restart triggered")
+        except Exception as e:
+            logger.warning(f"Failed to restart {service}: {e}")
 
 
 # ============================================================================
@@ -748,38 +870,56 @@ class WiFiCredentialsCharacteristic(Characteristic):
             credentials = json.loads(data)
             ssid = credentials.get('ssid', '')
             password = credentials.get('password', '')
+            use_saved = credentials.get('useSaved', False)
+            connection_name = credentials.get('connectionName', '')
 
-            if not ssid:
-                logger.warning("No SSID provided in credentials")
-                self.status_characteristic.set_status('error', 'No SSID provided')
+            if not ssid and not connection_name:
+                logger.warning("No SSID or connection name provided")
+                self.status_characteristic.set_status('error', 'No network specified')
                 return
 
-            logger.info(f"Attempting to connect to WiFi: {ssid}")
-            self.status_characteristic.set_status('connecting', f'Connecting to {ssid}...')
+            if use_saved and connection_name:
+                logger.info(f"Attempting to connect to saved network: {connection_name}")
+            else:
+                logger.info(f"Attempting to connect to WiFi: {ssid}")
+                logger.info(f"Password length: {len(password)} chars")
+
+            self.status_characteristic.set_status('connecting', f'Connecting to {ssid or connection_name}...')
 
             # Run connection in a background thread so we don't block the BLE write.
             # BLE operations should complete quickly; WiFi connection can take 10-30 seconds.
             def connect_async():
-                success, error_msg = connect_to_wifi(ssid, password)
+                if use_saved and connection_name:
+                    # Connect to saved network without password
+                    logger.info(f"[BLE->WiFi] Connecting to saved network: {connection_name}")
+                    success, error_msg = connect_to_saved_wifi(connection_name)
+                else:
+                    # Connect with password (new network or updating saved network password)
+                    logger.info(f"[BLE->WiFi] Starting WiFi connection attempt for SSID: {ssid}")
+                    success, error_msg = connect_to_wifi(ssid, password)
+
                 if success:
-                    logger.info(f"Successfully connected to {ssid}")
-                    self.status_characteristic.set_status('connected', f'Connected to {ssid}')
+                    logger.info(f"[BLE->WiFi] SUCCESS - Connected to {ssid or connection_name}")
+                    self.status_characteristic.set_status('connected', f'Connected to {ssid or connection_name}')
 
                     # Trigger announce + Tailscale setup in another background thread
                     # This runs 20 seconds after WiFi connects to ensure connection is stable
                     announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
                     announce_thread.start()
                 else:
-                    logger.warning(f"Failed to connect to {ssid}: {error_msg}")
+                    logger.error(f"[BLE->WiFi] FAILED - Could not connect to {ssid or connection_name}")
+                    logger.error(f"[BLE->WiFi] Raw error message: {error_msg}")
                     # Map error messages to iOS-compatible status values
                     if 'password' in error_msg.lower() or 'secrets' in error_msg.lower():
-                        self.status_characteristic.set_status('invalid_password', error_msg)
+                        status_code = 'invalid_password'
                     elif 'not found' in error_msg.lower() or 'no network' in error_msg.lower():
-                        self.status_characteristic.set_status('network_not_found', error_msg)
+                        status_code = 'network_not_found'
                     elif 'timeout' in error_msg.lower():
-                        self.status_characteristic.set_status('timeout', error_msg)
+                        status_code = 'timeout'
                     else:
-                        self.status_characteristic.set_status('failed', error_msg)
+                        status_code = 'failed'
+                    logger.error(f"[BLE->WiFi] Sending status '{status_code}' to mobile app")
+                    self.status_characteristic.set_status(status_code, error_msg)
 
             thread = threading.Thread(target=connect_async, daemon=True)
             thread.start()
@@ -885,6 +1025,9 @@ class DeviceInfoCharacteristic(Characteristic):
     Returns basic info about the JAM Player for the mobile app.
     Includes device UUID, public keys for provisioning, and status flags.
 
+    Uses chunked notification transfer because the response includes the
+    SSH private key which exceeds BLE MTU limits (~512 bytes).
+
     Response format (camelCase to match JAM API conventions):
     {
         "deviceUuid": "019beb00-486a-702b-9e48-6b40f233fb75",
@@ -893,50 +1036,126 @@ class DeviceInfoCharacteristic(Characteristic):
         "softwareVersion": "2.0",
         "apiSigningPublicKey": "base64-encoded-key",
         "sshPublicKey": "ssh-ed25519 AAAA...",
+        "sshPrivateKey": "-----BEGIN OPENSSH PRIVATE KEY-----...",
         "isConnected": false,
         "isAnnounced": false,
         "isRegistered": false
     }
     """
 
+    CHUNK_SIZE = 498  # 512 MTU - 2 byte header - ~12 bytes BLE overhead
+
     def __init__(self, bus, index: int, service):
-        super().__init__(bus, index, DEVICE_INFO_UUID, ['read'], service)
+        super().__init__(bus, index, DEVICE_INFO_UUID, ['read', 'notify'], service)
+        self._notifying = False
 
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
     def ReadValue(self, options):
-        """Return device information."""
-        logger.debug("Client requested device info")
+        """
+        Reading this characteristic triggers sending device info via notifications.
+        Returns immediately with status; actual data comes via notifications.
+        """
+        logger.info("Device info read requested - sending via notifications")
 
-        device_uuid = get_device_uuid() or 'unknown'
-        ble_device_name = get_device_name()
-        jp_image_id = get_jp_image_id() or ''
-        api_signing_public_key = get_api_signing_public_key() or ''
-        ssh_public_key = get_ssh_public_key() or ''
+        if not self._notifying:
+            logger.warning("Client read device info but notifications not enabled")
+            error = json.dumps({"error": "Subscribe to notifications first"})
+            return dbus.Array([dbus.Byte(b) for b in error.encode('utf-8')], signature='y')
 
-        # Check connectivity by reading flag file maintained by jam-ble-state-manager
-        # This is fast (just checking if file exists) and accurate (based on actual
-        # internet verification, not just NetworkManager state).
-        # The flag is updated every ~30 seconds by jam-ble-state-manager.
-        is_connected = INTERNET_VERIFIED_FLAG.exists()
+        # Trigger async notification sending
+        GLib.idle_add(self._send_device_info_chunked)
 
-        # Check registration status flags
-        is_announced = is_device_announced()
-        is_registered = is_device_registered()
+        # Return acknowledgment
+        return dbus.Array([dbus.Byte(ord('O')), dbus.Byte(ord('K'))], signature='y')
 
-        info = {
-            'deviceUuid': device_uuid,
-            'bleDeviceName': ble_device_name,
-            'jpImageId': jp_image_id,
-            'softwareVersion': '2.0',
-            'apiSigningPublicKey': api_signing_public_key,
-            'sshPublicKey': ssh_public_key,
-            'isConnected': is_connected,
-            'isAnnounced': is_announced,
-            'isRegistered': is_registered,
-        }
-        logger.debug(f"Returning device info: uuid={device_uuid}, connected={is_connected}, announced={is_announced}, registered={is_registered}")
-        data = json.dumps(info)
-        return dbus.Array([dbus.Byte(b) for b in data.encode('utf-8')])
+    def _send_device_info_chunked(self):
+        """Send device info in chunked notifications."""
+        try:
+            device_uuid = get_device_uuid() or 'unknown'
+            ble_device_name = get_device_name()
+            jp_image_id = get_jp_image_id() or ''
+            api_signing_public_key = get_api_signing_public_key() or ''
+            ssh_public_key = get_ssh_public_key() or ''
+            ssh_private_key = get_ssh_private_key() or ''
+
+            # Check connectivity by reading flag file maintained by jam-ble-state-manager
+            is_connected = INTERNET_VERIFIED_FLAG.exists()
+
+            # Check registration status flags
+            is_announced = is_device_announced()
+            is_registered = is_device_registered()
+
+            info = {
+                'deviceUuid': device_uuid,
+                'bleDeviceName': ble_device_name,
+                'jpImageId': jp_image_id,
+                'softwareVersion': '2.0',
+                'apiSigningPublicKey': api_signing_public_key,
+                'sshPublicKey': ssh_public_key,
+                'sshPrivateKey': ssh_private_key,
+                'isConnected': is_connected,
+                'isAnnounced': is_announced,
+                'isRegistered': is_registered,
+            }
+
+            data = json.dumps(info, separators=(',', ':')).encode('utf-8')
+            total_size = len(data)
+            logger.info(f"Sending device info ({total_size} bytes) in chunks")
+            logger.debug(f"Device info: uuid={device_uuid}, connected={is_connected}, announced={is_announced}, registered={is_registered}")
+
+            # Split into chunks and send as notifications
+            seq_num = 0
+            offset = 0
+
+            while offset < total_size:
+                chunk_end = min(offset + self.CHUNK_SIZE, total_size)
+                chunk_data = data[offset:chunk_end]
+                is_last = chunk_end >= total_size
+
+                # Build packet: [seq_num][flags][data]
+                flags = 0x01 if is_last else 0x00
+                packet = bytes([seq_num, flags]) + chunk_data
+
+                logger.debug(f"Sending device info chunk {seq_num}: {len(chunk_data)} bytes, is_last={is_last}")
+
+                # Send notification
+                self.PropertiesChanged(
+                    GATT_CHRC_IFACE,
+                    {'Value': dbus.Array([dbus.Byte(b) for b in packet], signature='y')},
+                    []
+                )
+
+                seq_num = (seq_num + 1) % 256
+                offset = chunk_end
+
+                # Small delay between chunks
+                if not is_last:
+                    time.sleep(0.05)
+
+            logger.info(f"Finished sending {seq_num} chunks for device info")
+
+        except Exception as e:
+            logger.error(f"Error sending device info: {e}")
+            error_packet = bytes([0, 0x01]) + json.dumps({"error": str(e)}).encode('utf-8')
+            self.PropertiesChanged(
+                GATT_CHRC_IFACE,
+                {'Value': dbus.Array([dbus.Byte(b) for b in error_packet], signature='y')},
+                []
+            )
+
+        return False  # Don't repeat GLib.idle_add
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StartNotify(self):
+        """Client wants to receive notifications."""
+        logger.info("Client subscribed to device info notifications")
+        self._notifying = True
+
+    @dbus.service.method(GATT_CHRC_IFACE)
+    def StopNotify(self):
+        """Client no longer wants notifications."""
+        logger.info("Client unsubscribed from device info notifications")
+        self._notifying = False
 
 
 # ============================================================================
@@ -986,6 +1205,16 @@ class ProvisioningConfirmCharacteristic(Characteristic):
 
             if success:
                 logger.info(f"Device registration confirmed: {jam_player_id}")
+
+                # Start jam-heartbeat.service now that registration is complete.
+                # Without this, heartbeat won't start until next reboot because
+                # its ConditionPathExists was evaluated at boot when .registered
+                # didn't exist yet.
+                manage_service('jam-heartbeat.service', should_run=True)
+
+                # Restart jam-player-display.service so it stops showing
+                # "Registered! Open JAM Setup..." and starts playing content
+                restart_service('jam-player-display.service')
             else:
                 logger.error("Failed to store provisioning confirmation")
 
@@ -993,6 +1222,55 @@ class ProvisioningConfirmCharacteristic(Characteristic):
             logger.error(f"Invalid JSON in provisioning confirmation: {e}")
         except Exception as e:
             logger.error(f"Error processing provisioning confirmation: {e}")
+
+
+class ScreenIdCharacteristic(Characteristic):
+    """
+    Characteristic to receive screen ID from mobile app after linking.
+
+    When the user links a JAM Player to a screen via the mobile app,
+    the app can send the screen ID directly via BLE. This allows the
+    device to immediately know its screen assignment without waiting
+    for the heartbeat service to poll the backend.
+
+    Expected input format (JSON):
+    {
+        "screenId": "uuid-of-screen"
+    }
+
+    Response: "OK" on success, error message on failure
+    """
+
+    def __init__(self, bus, index: int, service):
+        # Support both write types for flexibility
+        super().__init__(bus, index, SCREEN_ID_UUID, ['write', 'write-without-response'], service)
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
+    def WriteValue(self, value, options):
+        """Receive and store screen ID."""
+        try:
+            data = bytes(value).decode('utf-8')
+            logger.info("Received screen ID via BLE")
+
+            parsed = json.loads(data)
+            screen_id = parsed.get('screenId')
+
+            if not screen_id:
+                logger.error("Screen ID data missing 'screenId' field")
+                return
+
+            # Write screen ID to file
+            success = set_screen_id(screen_id)
+
+            if success:
+                logger.info(f"Screen ID set via BLE: {screen_id}")
+            else:
+                logger.error("Failed to write screen ID file")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in screen ID data: {e}")
+        except Exception as e:
+            logger.error(f"Error processing screen ID: {e}")
 
 
 # ============================================================================
@@ -1019,6 +1297,8 @@ class JAMProvisioningService(Service):
         self.add_characteristic(WiFiCredentialsCharacteristic(bus, 2, self, status_chrc))
         self.add_characteristic(DeviceInfoCharacteristic(bus, 3, self))
         self.add_characteristic(ProvisioningConfirmCharacteristic(bus, 4, self))
+        self.add_characteristic(ScreenIdCharacteristic(bus, 5, self))
+        self.add_characteristic(SavedNetworksCharacteristic(bus, 6, self))
 
 
 # ============================================================================

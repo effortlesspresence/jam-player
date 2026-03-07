@@ -20,7 +20,8 @@ Key behaviors:
 - Notifies systemd watchdog to prove liveness
 - Designed to be extremely stable - never crashes, always recovers
 
-This service only runs when /etc/jam/device_data/.registered exists (enforced by systemd).
+This service runs when /etc/jam/device_data/.announced exists (enforced by systemd).
+This means heartbeats start as soon as the device announces itself, not waiting for registration.
 """
 
 import sys
@@ -36,9 +37,10 @@ import sdnotify
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
-    is_device_registered,
+    is_device_announced,
     update_screen_id_if_changed,
     update_timezone_if_changed,
+    update_orientation_if_changed,
     get_location_timezone,
 )
 from common.api import api_request
@@ -46,8 +48,8 @@ from common.api import api_request
 logger = setup_service_logging('jam-heartbeat')
 
 # How often to send heartbeats
-HEARTBEAT_INTERVAL_MINUTES = 5
-HEARTBEAT_INTERVAL_SECONDS = 5 * 60
+HEARTBEAT_INTERVAL_MINUTES = 3
+HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MINUTES * 60
 
 # After this many consecutive failures, reduce logging verbosity
 FAILURE_LOG_THRESHOLD = 3
@@ -70,14 +72,15 @@ def signal_handler(signum, frame):
     running = False
 
 
-def send_heartbeat() -> tuple[bool, str | None, str | None]:
+def send_heartbeat() -> tuple[bool, str | None, str | None, str | None]:
     """
     Send a heartbeat to the backend.
 
     Returns:
-        Tuple of (success, screen_id_from_response, location_timezone_from_response)
+        Tuple of (success, screen_id, location_timezone, display_orientation)
         screen_id may be None if device is not linked to a screen.
         location_timezone may be None if device is not assigned to a location.
+        display_orientation defaults to LANDSCAPE if not set.
     """
     response = api_request(
         method='POST',
@@ -87,20 +90,21 @@ def send_heartbeat() -> tuple[bool, str | None, str | None]:
     )
 
     if response is None:
-        return False, None, None
+        return False, None, None, None
 
     if response.status_code == 200:
         try:
             data = response.json()
             screen_id = data.get('screenId')
             location_timezone = data.get('locationTimezone')
-            return True, screen_id, location_timezone
+            display_orientation = data.get('displayOrientation')
+            return True, screen_id, location_timezone, display_orientation
         except Exception as e:
             logger.error(f"Error parsing heartbeat response: {e}")
-            return True, None, None  # Request succeeded, just couldn't parse response
+            return True, None, None, None  # Request succeeded, just couldn't parse response
     else:
         logger.warning(f"Heartbeat returned status {response.status_code}")
-        return False, None, None
+        return False, None, None, None
 
 
 def apply_system_timezone(timezone: str) -> bool:
@@ -146,27 +150,28 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Verify device is registered (shouldn't happen due to ConditionPathExists, but be safe)
-    if not is_device_registered():
-        logger.error("Device is not registered - heartbeat service should not be running")
+    # Verify device is announced (shouldn't happen due to ConditionPathExists, but be safe)
+    if not is_device_announced():
+        logger.error("Device is not announced - heartbeat service should not be running")
         sys.exit(1)
 
+    # Tell systemd we're ready IMMEDIATELY - don't block on timezone application
+    notifier.notify("READY=1")
+    logger.info(f"Service started, sending heartbeats every {HEARTBEAT_INTERVAL_MINUTES} minutes")
+
     # Apply stored timezone on startup (in case device rebooted)
+    # This happens AFTER READY=1 to avoid blocking service startup
     stored_timezone = get_location_timezone()
     if stored_timezone:
         logger.info(f"Applying stored timezone on startup: {stored_timezone}")
         apply_system_timezone(stored_timezone)
-
-    # Tell systemd we're ready
-    notifier.notify("READY=1")
-    logger.info("Service started, sending heartbeats every 5 minutes")
 
     consecutive_failures = 0
     current_retry_delay = INITIAL_RETRY_DELAY
 
     while running:
         # Send heartbeat
-        success, screen_id, location_timezone = send_heartbeat()
+        success, screen_id, location_timezone, display_orientation = send_heartbeat()
 
         if success:
             if consecutive_failures > 0:
@@ -182,6 +187,19 @@ def main():
                 # Timezone changed - apply it to the system
                 if location_timezone:
                     apply_system_timezone(location_timezone)
+
+            # Update orientation if changed
+            if update_orientation_if_changed(display_orientation):
+                # Orientation changed - restart display service to apply
+                logger.info("Restarting jam-player-display.service to apply new orientation")
+                try:
+                    subprocess.run(
+                        ['systemctl', 'restart', 'jam-player-display.service'],
+                        timeout=10,
+                        capture_output=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to restart display service: {e}")
 
             # Notify systemd watchdog
             notifier.notify("WATCHDOG=1")

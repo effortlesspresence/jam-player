@@ -25,8 +25,11 @@ import sys
 import os
 import subprocess
 import shutil
+import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Callable, TypeVar
+
+T = TypeVar('T')
 
 # Add the services directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +37,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import is_device_registered
 from common.api import api_request
+from common.paths import ENVIRONMENT_FILE
+
+# Try to import PIL for update screen display
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 logger = setup_service_logging('jam-update')
 
@@ -59,14 +70,17 @@ SYSTEMD_SRC = JAM_REPO_DIR / 'systemd'
 CRON_SRC = JAM_REPO_DIR / 'cron'
 LOGROTATE_SRC = JAM_REPO_DIR / 'logrotate_config'
 
+# Backup paths (for rollback on failed updates)
+BACKUP_DIR = OPT_JAM_DIR / 'backup'
+SERVICES_BACKUP = BACKUP_DIR / 'services'
+SYSTEMD_BACKUP = BACKUP_DIR / 'systemd'
+VERSION_BACKUP = BACKUP_DIR / 'version.txt'
+
 # Legacy paths (for cleanup)
 LEGACY_JAM_DIR = Path('/home/comitup/.jam')
 LEGACY_APP_VENV = LEGACY_JAM_DIR / 'jam_player_virtual_env'
 LEGACY_SCRIPTS_VENV = LEGACY_JAM_DIR / 'scripts' / 'jam_scripts_venv'
 LEGACY_JAM_REPO = Path('/home/comitup/jam')  # Old combined repo
-
-# Demo mode file - if exists and not "false", use its contents as git branch
-DEMO_MODE_FILE = Path('/home/comitup/.DEMO_MODE')
 
 # Git settings
 GIT_REMOTE = 'origin'
@@ -79,13 +93,15 @@ def get_git_branch() -> str:
     """
     Get the git branch to use for updates.
 
-    If ~/.DEMO_MODE exists and contains a value other than "false",
-    use that value as the branch name. Otherwise use 'main'.
+    If /etc/jam/config/environment exists and contains a value other than
+    "false" or "prod", use that value as the branch name. Otherwise use 'main'.
+
+    The environment file is set during device provisioning or migration from 1.0.
     """
-    if DEMO_MODE_FILE.exists():
+    if ENVIRONMENT_FILE.exists():
         try:
-            content = DEMO_MODE_FILE.read_text().strip()
-            if content and content.lower() != 'false':
+            content = ENVIRONMENT_FILE.read_text().strip()
+            if content and content.lower() not in ('false', 'prod'):
                 return content
         except Exception:
             pass
@@ -113,6 +129,200 @@ def run_command(cmd: list, cwd: Path = None, timeout: int = 120) -> tuple[bool, 
         return False, "", str(e)
 
 
+# Retry configuration for git network operations
+GIT_RETRY_MAX_ATTEMPTS = 5
+GIT_RETRY_INITIAL_DELAY = 5  # seconds
+GIT_RETRY_MAX_DELAY = 60  # seconds
+
+
+def retry_with_backoff(
+    operation: Callable[[], T],
+    operation_name: str,
+    max_attempts: int = GIT_RETRY_MAX_ATTEMPTS,
+    initial_delay: int = GIT_RETRY_INITIAL_DELAY,
+    max_delay: int = GIT_RETRY_MAX_DELAY,
+) -> T:
+    """
+    Retry an operation with exponential backoff.
+
+    Args:
+        operation: A callable that returns a value. Should return None on failure.
+        operation_name: Human-readable name for logging.
+        max_attempts: Maximum number of attempts.
+        initial_delay: Initial delay between retries in seconds.
+        max_delay: Maximum delay between retries in seconds.
+
+    Returns:
+        The result of the operation, or None if all attempts failed.
+    """
+    delay = initial_delay
+
+    for attempt in range(1, max_attempts + 1):
+        result = operation()
+
+        if result is not None and result is not False:
+            if attempt > 1:
+                logger.info(f"{operation_name} succeeded on attempt {attempt}")
+            return result
+
+        if attempt < max_attempts:
+            logger.warning(
+                f"{operation_name} failed (attempt {attempt}/{max_attempts}), "
+                f"retrying in {delay}s..."
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay)
+        else:
+            logger.error(f"{operation_name} failed after {max_attempts} attempts")
+
+    return None
+
+
+# =============================================================================
+# Backup and Rollback Functions
+# =============================================================================
+
+def create_backup() -> bool:
+    """
+    Create a backup of current installation before updating.
+
+    Backs up:
+    - /opt/jam/services/ -> /opt/jam/backup/services/
+    - /etc/systemd/system/jam-*.service -> /opt/jam/backup/systemd/
+    - /etc/jam/version.txt -> /opt/jam/backup/version.txt
+
+    Returns:
+        True if backup was created successfully, False otherwise.
+    """
+    logger.info("Creating backup of current installation...")
+
+    try:
+        # Clean up any existing backup
+        if BACKUP_DIR.exists():
+            shutil.rmtree(BACKUP_DIR)
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Backup services directory
+        if SERVICES_DEST.exists():
+            shutil.copytree(SERVICES_DEST, SERVICES_BACKUP)
+            logger.info(f"  Backed up {SERVICES_DEST}")
+        else:
+            logger.info("  No existing services directory to backup")
+
+        # Backup systemd units
+        SYSTEMD_BACKUP.mkdir(parents=True, exist_ok=True)
+        systemd_dir = Path('/etc/systemd/system')
+        backed_up_units = 0
+        for pattern in ['jam-*.service', 'jam-*.timer']:
+            for unit_file in systemd_dir.glob(pattern):
+                shutil.copy2(unit_file, SYSTEMD_BACKUP / unit_file.name)
+                backed_up_units += 1
+        logger.info(f"  Backed up {backed_up_units} systemd units")
+
+        # Backup version file
+        if VERSION_FILE.exists():
+            shutil.copy2(VERSION_FILE, VERSION_BACKUP)
+            logger.info(f"  Backed up {VERSION_FILE}")
+        else:
+            logger.info("  No existing version file to backup")
+
+        logger.info("Backup created successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to create backup: {e}")
+        # Clean up partial backup
+        if BACKUP_DIR.exists():
+            try:
+                shutil.rmtree(BACKUP_DIR)
+            except:
+                pass
+        return False
+
+
+def rollback_from_backup() -> bool:
+    """
+    Restore the previous installation from backup.
+
+    This is called when an update fails partway through. It restores:
+    - Services directory
+    - Systemd unit files
+    - Version file
+
+    Returns:
+        True if rollback succeeded, False otherwise.
+    """
+    logger.warning("Rolling back to previous installation...")
+
+    if not BACKUP_DIR.exists():
+        logger.error("No backup directory found - cannot rollback")
+        return False
+
+    success = True
+
+    try:
+        # Restore services directory
+        if SERVICES_BACKUP.exists():
+            if SERVICES_DEST.exists():
+                shutil.rmtree(SERVICES_DEST)
+            shutil.copytree(SERVICES_BACKUP, SERVICES_DEST)
+            logger.info(f"  Restored {SERVICES_DEST}")
+        else:
+            logger.warning("  No services backup to restore")
+
+    except Exception as e:
+        logger.error(f"  Failed to restore services: {e}")
+        success = False
+
+    try:
+        # Restore systemd units
+        if SYSTEMD_BACKUP.exists():
+            systemd_dir = Path('/etc/systemd/system')
+            restored_units = 0
+            for unit_file in SYSTEMD_BACKUP.glob('*'):
+                shutil.copy2(unit_file, systemd_dir / unit_file.name)
+                restored_units += 1
+            logger.info(f"  Restored {restored_units} systemd units")
+            # Reload systemd to pick up restored units
+            run_command(['systemctl', 'daemon-reload'])
+        else:
+            logger.warning("  No systemd backup to restore")
+
+    except Exception as e:
+        logger.error(f"  Failed to restore systemd units: {e}")
+        success = False
+
+    try:
+        # Restore version file
+        if VERSION_BACKUP.exists():
+            shutil.copy2(VERSION_BACKUP, VERSION_FILE)
+            logger.info(f"  Restored {VERSION_FILE}")
+        else:
+            logger.warning("  No version backup to restore")
+
+    except Exception as e:
+        logger.error(f"  Failed to restore version file: {e}")
+        success = False
+
+    if success:
+        logger.info("Rollback completed successfully")
+    else:
+        logger.error("Rollback completed with errors - system may be in inconsistent state")
+
+    return success
+
+
+def cleanup_backup():
+    """Remove the backup directory after a successful update."""
+    if BACKUP_DIR.exists():
+        try:
+            shutil.rmtree(BACKUP_DIR)
+            logger.info("Cleaned up backup directory")
+        except Exception as e:
+            logger.warning(f"Failed to clean up backup: {e}")
+
+
 def configure_git_safe_directory():
     """
     Configure git to trust the JAM repo directory.
@@ -131,17 +341,26 @@ def clone_repo(branch: str) -> bool:
     Clone the jam-player repo if it doesn't exist.
 
     This handles the migration from the old combined 'jam' repo to the
-    new dedicated 'jam-player' repo.
+    new dedicated 'jam-player' repo. Retries with exponential backoff
+    on failure (GitHub can be intermittently unavailable).
     """
     logger.info(f"Cloning jam-player repo to {JAM_REPO_DIR}...")
 
-    success, _, stderr = run_command(
-        ['git', 'clone', '--branch', branch, '--single-branch', GIT_REPO_URL, str(JAM_REPO_DIR)],
-        timeout=GIT_TIMEOUT
-    )
+    def attempt_clone():
+        success, _, stderr = run_command(
+            ['git', 'clone', '--branch', branch, '--single-branch', GIT_REPO_URL, str(JAM_REPO_DIR)],
+            timeout=GIT_TIMEOUT
+        )
+        if not success:
+            logger.warning(f"Clone attempt failed: {stderr}")
+            # Clean up partial clone if it exists
+            if JAM_REPO_DIR.exists():
+                shutil.rmtree(JAM_REPO_DIR)
+            return None
+        return True
 
-    if not success:
-        logger.error(f"Failed to clone repo: {stderr}")
+    result = retry_with_backoff(attempt_clone, "git clone")
+    if not result:
         return False
 
     # Set ownership to comitup user (UID 1000)
@@ -174,16 +393,27 @@ def get_current_version() -> Optional[str]:
 
 
 def get_latest_version(branch: str) -> Optional[str]:
-    """Fetch and get the latest version from remote."""
+    """
+    Fetch and get the latest version from remote.
+
+    Retries with exponential backoff on failure (GitHub can be
+    intermittently unavailable).
+    """
     logger.info(f"Fetching latest from {GIT_REMOTE}/{branch}...")
 
-    success, _, stderr = run_command(
-        ['git', 'fetch', GIT_REMOTE, branch],
-        cwd=JAM_REPO_DIR,
-        timeout=GIT_TIMEOUT
-    )
-    if not success:
-        logger.error(f"Git fetch failed: {stderr}")
+    def attempt_fetch():
+        success, _, stderr = run_command(
+            ['git', 'fetch', GIT_REMOTE, branch],
+            cwd=JAM_REPO_DIR,
+            timeout=GIT_TIMEOUT
+        )
+        if not success:
+            logger.warning(f"Fetch attempt failed: {stderr}")
+            return None
+        return True
+
+    result = retry_with_backoff(attempt_fetch, "git fetch")
+    if not result:
         return None
 
     success, stdout, stderr = run_command(
@@ -195,6 +425,156 @@ def get_latest_version(branch: str) -> Optional[str]:
 
     logger.error(f"Failed to get remote HEAD: {stderr}")
     return None
+
+
+# =============================================================================
+# Update Display Functions
+# =============================================================================
+
+# Display configuration
+BACKGROUND_COLOR = (20, 20, 30)  # Dark blue-grey
+TEXT_COLOR = (255, 255, 255)
+ACCENT_COLOR = (0, 180, 255)  # JAM blue
+
+# Global to track if we're showing the update screen
+_update_display_process = None
+
+
+def get_fb_size() -> tuple:
+    """Get framebuffer dimensions."""
+    try:
+        with open('/sys/class/graphics/fb0/virtual_size', 'r') as f:
+            w, h = f.read().strip().split(',')
+            return int(w), int(h)
+    except:
+        return 1920, 1080
+
+
+def get_font(size: int):
+    """Get a font, falling back to default if needed."""
+    if not HAS_PIL:
+        return None
+
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
+
+def create_updating_screen(width: int, height: int) -> Optional[Image.Image]:
+    """Create the 'Updating...' screen image."""
+    if not HAS_PIL:
+        logger.warning("PIL not available for creating update screen")
+        return None
+
+    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(72)
+    subtitle_font = get_font(36)
+
+    center_x = width // 2
+    center_y = height // 2
+
+    # Title
+    title = "Updating JAM Player..."
+    bbox = draw.textbbox((0, 0), title, font=title_font)
+    x = center_x - bbox[2] // 2
+    y = center_y - bbox[3] - 30
+    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
+
+    # Subtitle
+    subtitle = "Please wait. This may take a few minutes."
+    bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
+    x = center_x - bbox[2] // 2
+    y = center_y + 30
+    draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
+
+    # Warning
+    warning = "Do not disconnect power."
+    warning_font = get_font(28)
+    bbox = draw.textbbox((0, 0), warning, font=warning_font)
+    x = center_x - bbox[2] // 2
+    y = center_y + 100
+    draw.text((x, y), warning, font=warning_font, fill=(255, 100, 100))  # Red warning
+
+    return img
+
+
+def show_updating_screen():
+    """Display the updating screen using feh."""
+    global _update_display_process
+
+    if not HAS_PIL:
+        logger.warning("PIL not available, skipping update screen display")
+        return
+
+    logger.info("Displaying update screen...")
+
+    try:
+        # Get screen size and create image
+        width, height = get_fb_size()
+        img = create_updating_screen(width, height)
+        if img is None:
+            return
+
+        # Save to temp file
+        img_path = '/tmp/jam_updating.png'
+        img.save(img_path, 'PNG')
+        os.chmod(img_path, 0o644)
+
+        # Kill any existing feh processes first
+        subprocess.run(['pkill', '-f', 'feh'], capture_output=True, timeout=5)
+
+        # Wait for X display to be available (might not be ready yet on boot)
+        for _ in range(30):
+            result = subprocess.run(
+                ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'xdpyinfo'],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            logger.warning("X display not available, skipping update screen")
+            return
+
+        # Display with feh
+        _update_display_process = subprocess.Popen(
+            ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'feh', '-F', '--hide-pointer', img_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        logger.info("Update screen displayed")
+
+    except Exception as e:
+        logger.warning(f"Failed to display update screen: {e}")
+
+
+def hide_updating_screen():
+    """Kill the updating screen display."""
+    global _update_display_process
+
+    if _update_display_process:
+        try:
+            _update_display_process.terminate()
+            _update_display_process.wait(timeout=5)
+        except:
+            pass
+        _update_display_process = None
+
+    # Also kill any feh showing our image
+    try:
+        subprocess.run(['pkill', '-f', 'feh.*jam_updating'], capture_output=True, timeout=5)
+    except:
+        pass
 
 
 # =============================================================================
@@ -318,11 +698,14 @@ def install_systemd_units() -> bool:
     logger.info("Installing systemd units...")
 
     try:
+        installed_services = []
+
         # Copy service files
         for service_file in SYSTEMD_SRC.glob('*.service'):
             dest = Path('/etc/systemd/system') / service_file.name
             shutil.copy2(service_file, dest)
             logger.info(f"  Installed {service_file.name}")
+            installed_services.append(service_file.name)
 
         # Copy timer files
         for timer_file in SYSTEMD_SRC.glob('*.timer'):
@@ -333,6 +716,11 @@ def install_systemd_units() -> bool:
         # Reload systemd
         logger.info("  Reloading systemd daemon...")
         run_command(['systemctl', 'daemon-reload'])
+
+        # Enable all installed services (idempotent, safe to run on already-enabled services)
+        logger.info("  Enabling services...")
+        for service in installed_services:
+            run_command(['systemctl', 'enable', service], timeout=10)
 
         return True
     except Exception as e:
@@ -356,9 +744,109 @@ def update_version_file(version: str) -> bool:
 # Cleanup Functions
 # =============================================================================
 
+def ensure_jam_user_exists() -> bool:
+    """
+    Ensure the 'jam' user exists for SSH key-based authentication.
+
+    The jam user:
+    - Is used for remote support SSH access
+    - Can ONLY authenticate via SSH keys (no password)
+    - Has its authorized_keys populated by jam-first-boot.service
+
+    The comitup user remains as a backup with password auth.
+
+    This is called during updates to ensure old devices (that already
+    completed first-boot before the jam user was introduced) get the
+    user created.
+
+    Returns True if user exists or was created successfully.
+    """
+    import pwd
+
+    try:
+        pwd.getpwnam('jam')
+        logger.debug("jam user already exists")
+        return True
+    except KeyError:
+        pass  # User doesn't exist, create it
+
+    logger.info("Creating jam user for SSH key authentication...")
+
+    try:
+        # Create user with home directory, no password (SSH key only)
+        success, _, stderr = run_command([
+            'useradd',
+            '-m',              # Create home directory
+            '-s', '/bin/bash', # Shell
+            '-c', 'JAM Player SSH Access',  # Comment
+            'jam'
+        ])
+
+        if not success:
+            logger.error(f"Failed to create jam user: {stderr}")
+            return False
+
+        # Lock the password (prevents password auth, SSH keys only)
+        success, _, stderr = run_command(['passwd', '-l', 'jam'])
+
+        if not success:
+            logger.warning(f"Failed to lock jam password: {stderr}")
+            # Not fatal - user still created
+
+        logger.info("Created jam user successfully (SSH key auth only)")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to create jam user: {e}")
+        return False
+
+
+def disable_comitup():
+    """
+    Disable comitup - JAM 2.0 uses its own BLE provisioning instead.
+
+    Comitup creates a WiFi hotspot for provisioning, but JAM 2.0 uses BLE
+    for WiFi provisioning. The comitup hotspot interferes with WiFi connections
+    because it uses the same wlan0 interface.
+    """
+    logger.info("Disabling comitup (JAM 2.0 uses BLE provisioning)...")
+
+    # Stop and disable comitup service
+    run_command(['systemctl', 'stop', 'comitup'], timeout=30)
+    run_command(['systemctl', 'disable', 'comitup'], timeout=30)
+    logger.info("  Stopped and disabled comitup service")
+
+    # Remove the JAM-SETUP hotspot connection profiles
+    result = run_command(
+        ['nmcli', '-t', '-f', 'NAME', 'connection', 'show'],
+        timeout=10
+    )
+    if result[0]:  # success
+        stdout = result[1]
+        for line in stdout.strip().split('\n'):
+            conn_name = line.strip()
+            if conn_name.startswith('JAM-SETUP'):
+                run_command(['nmcli', 'connection', 'delete', conn_name], timeout=10)
+                logger.info(f"  Removed hotspot connection: {conn_name}")
+
+    # Clear comitup state
+    comitup_state = Path('/var/lib/comitup')
+    if comitup_state.exists():
+        try:
+            shutil.rmtree(comitup_state)
+            logger.info("  Cleared comitup state directory")
+        except Exception as e:
+            logger.warning(f"  Failed to clear comitup state: {e}")
+
+    logger.info("  Comitup disabled successfully")
+
+
 def cleanup_legacy_cruft():
     """Remove legacy files/directories that are no longer needed."""
     logger.info("Cleaning up legacy cruft...")
+
+    # Disable comitup first - it interferes with JAM 2.0 BLE provisioning
+    disable_comitup()
 
     # Items to remove (files and directories)
     items_to_remove: List[Path] = [
@@ -439,25 +927,72 @@ def install_logrotate_config():
 
 
 def restart_services():
-    """Restart JAM services to pick up new code."""
+    """
+    Restart JAM services to pick up new code.
+
+    Uses --no-block to avoid waiting for each service to fully start.
+    Type=notify services can take time to initialize, and we don't want
+    the update process to hang waiting for them.
+
+    After triggering all restarts, we verify services are starting correctly.
+    """
     logger.info("Restarting JAM services...")
 
+    # Services to restart - ordered by dependency (independent ones first)
     services_to_restart = [
-        'jam-content-manager.service',
-        'jam-player-display.service',
-        'jam-ble-state-manager.service',
-        'jam-health-monitor.service',
-        'jam-heartbeat.service',
-        'jam-tailscale.service',
+        'jam-content-manager.service',    # Type=simple, starts fast
+        'jam-ble-state-manager.service',  # Type=notify, but sends READY=1 early
+        'jam-player-display.service',     # Type=notify, sends READY=1 early
+        'jam-health-monitor.service',     # Type=notify, sends READY=1 early
+        'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
+        'jam-ws-commands.service',        # Type=notify, WebSocket commands (has ConditionPath)
+        'jam-tailscale.service',          # Type=oneshot, runs once
     ]
 
+    # Trigger all restarts with --no-block to avoid waiting
+    # This is more reliable than waiting for Type=notify services
+    logger.info("  Triggering service restarts (non-blocking)...")
     for service in services_to_restart:
-        # Use shorter timeout - if restart takes >30s something is wrong
-        success, _, stderr = run_command(['systemctl', 'restart', service], timeout=30)
+        success, _, stderr = run_command(
+            ['systemctl', 'restart', '--no-block', service],
+            timeout=10
+        )
         if success:
-            logger.info(f"  Restarted {service}")
+            logger.info(f"    Triggered restart: {service}")
         else:
-            logger.warning(f"  Failed to restart {service}: {stderr[:100] if stderr else 'timeout'}")
+            # Log warning but continue - the service might just not be enabled
+            logger.warning(f"    Failed to trigger restart for {service}: {stderr[:100] if stderr else 'unknown'}")
+
+    # Give services a moment to start
+    logger.info("  Waiting for services to initialize...")
+    time.sleep(5)
+
+    # Verify critical services are running or starting
+    # We check for 'active' or 'activating' status
+    logger.info("  Verifying service status...")
+    critical_services = [
+        'jam-player-display.service',
+        'jam-ble-state-manager.service',
+        'jam-content-manager.service',
+    ]
+
+    all_ok = True
+    for service in critical_services:
+        success, stdout, _ = run_command(
+            ['systemctl', 'is-active', service],
+            timeout=5
+        )
+        status = stdout.strip() if stdout else 'unknown'
+        if status in ('active', 'activating'):
+            logger.info(f"    {service}: {status}")
+        else:
+            logger.warning(f"    {service}: {status} (may need attention)")
+            all_ok = False
+
+    if all_ok:
+        logger.info("  All critical services running")
+    else:
+        logger.warning("  Some services may not have started correctly - health monitor will handle recovery")
 
 
 # =============================================================================
@@ -500,6 +1035,16 @@ def report_error(error_message: str):
 def main():
     log_service_start(logger, 'JAM Update Service')
 
+    # Always disable comitup on every run - it interferes with JAM 2.0 BLE provisioning
+    # This is idempotent and safe to run repeatedly, ensuring comitup stays disabled
+    # even if a previous attempt failed or the device was imaged with comitup enabled
+    disable_comitup()
+
+    # Ensure jam user exists for SSH key authentication
+    # This creates the user on old devices that already completed first-boot
+    # before the jam user was introduced
+    ensure_jam_user_exists()
+
     # Check if repo exists
     if not JAM_REPO_DIR.exists():
         logger.error(f"JAM repo not found at {JAM_REPO_DIR}")
@@ -508,10 +1053,10 @@ def main():
     # Configure git to trust the repo (runs as root, repo owned by comitup)
     configure_git_safe_directory()
 
-    # Determine which branch to use (supports DEMO_MODE)
+    # Determine which branch to use (supports non-prod environments)
     branch = get_git_branch()
     if branch != GIT_BRANCH_DEFAULT:
-        logger.info(f"DEMO_MODE active: using branch '{branch}'")
+        logger.info(f"Environment override: using branch '{branch}'")
 
     # Get current version
     current_version = get_current_version()
@@ -543,36 +1088,57 @@ def main():
     else:
         logger.info(f"Update available: {current_version[:12]}... -> {latest_version[:12]}...")
 
-    # Pull latest code
-    if not pull_latest(branch):
-        report_error("Failed to pull latest code from git")
+    # Show updating screen to user
+    show_updating_screen()
+
+    # Helper function to handle update failure with rollback
+    def fail_update(error_msg: str, should_rollback: bool = True):
+        """Handle update failure: rollback if needed, report error, and exit."""
+        logger.error(f"Update failed: {error_msg}")
+        if should_rollback:
+            rollback_from_backup()
+        hide_updating_screen()
+        report_error(error_msg)
         sys.exit(1)
 
-    # Ensure venv exists
+    # Pull latest code (git repo, not the installed files)
+    if not pull_latest(branch):
+        fail_update("Failed to pull latest code from git", should_rollback=False)
+
+    # Ensure venv exists (before backup since we're not backing up venv)
     if not ensure_venv_exists():
-        report_error("Failed to create/verify virtual environment")
-        sys.exit(1)
+        fail_update("Failed to create/verify virtual environment", should_rollback=False)
+
+    # Create backup of current installation before making changes
+    # Skip backup for fresh installs (nothing to backup)
+    has_backup = False
+    if not force_install:
+        if not create_backup():
+            fail_update("Failed to create backup - aborting update for safety", should_rollback=False)
+        has_backup = True
+
+    # From here on, failures should trigger rollback (if we have a backup)
 
     # Install services
     if not install_services():
-        report_error("Failed to install services")
-        sys.exit(1)
+        fail_update("Failed to install services", should_rollback=has_backup)
 
     # Install dependencies
     if not install_dependencies():
-        report_error("Failed to install dependencies")
-        sys.exit(1)
+        fail_update("Failed to install dependencies", should_rollback=has_backup)
 
     # Install systemd units
     if not install_systemd_units():
-        report_error("Failed to install systemd units")
-        sys.exit(1)
+        fail_update("Failed to install systemd units", should_rollback=has_backup)
 
     # Update version file
     update_version_file(latest_version)
 
-    # Clean up legacy cruft
-    cleanup_legacy_cruft()
+    # Clean up legacy cruft (non-critical, don't fail update for this)
+    try:
+        cleanup_legacy_cruft()
+    except Exception as e:
+        logger.warning(f"Legacy cleanup had issues (non-fatal): {e}")
 
     # Install crontab with essential scheduled tasks (3am reboot, logrotate)
     install_crontab()
@@ -582,6 +1148,13 @@ def main():
 
     # Restart services to pick up changes
     restart_services()
+
+    # Update successful - clean up backup
+    if has_backup:
+        cleanup_backup()
+
+    # Hide updating screen (jam-player-display.service will take over)
+    hide_updating_screen()
 
     logger.info("Update completed successfully!")
     sys.exit(0)

@@ -104,11 +104,15 @@ def sign_request(method: str, path: str, body: str = "") -> Optional[Dict[str, s
     """
     Generate signature headers for an API request.
 
-    Creates the X-Device-ID, X-Timestamp, and X-Signature headers
+    Creates the X-Device-ID, X-Timestamp, X-Body-Hash, and X-Signature headers
     required by the jam-player API authorizer.
 
     Signature format: "{method}:{path}:{timestamp}:{body_hash}"
     signed with Ed25519 private key.
+
+    Note: X-Body-Hash is sent as a header because API Gateway REQUEST authorizers
+    don't have access to the request body. The authorizer uses this header to
+    reconstruct the signed payload.
 
     Args:
         method: HTTP method (GET, POST, etc.)
@@ -149,6 +153,7 @@ def sign_request(method: str, path: str, body: str = "") -> Optional[Dict[str, s
         return {
             'X-Device-ID': device_uuid,
             'X-Timestamp': timestamp,
+            'X-Body-Hash': body_hash,
             'X-Signature': signature,
         }
 
@@ -186,14 +191,16 @@ def api_request(
     body_str = json.dumps(body) if body else ""
 
     if signed:
+        logger.info(f"Signing request: {method} {path}")
         sign_headers = sign_request(method, path, body_str)
         if not sign_headers:
-            logger.error("Failed to sign request")
+            logger.error("Failed to sign request - check device UUID and API signing private key")
             return None
         headers.update(sign_headers)
+        logger.info(f"Request signed with device ID: {sign_headers.get('X-Device-ID', 'unknown')}")
 
     try:
-        logger.debug(f"API request: {method} {url}")
+        logger.info(f"Making API request: {method} {url}")
 
         if method.upper() == 'GET':
             response = requests.get(url, headers=headers, timeout=timeout)
@@ -207,14 +214,15 @@ def api_request(
             logger.error(f"Unsupported HTTP method: {method}")
             return None
 
+        logger.info(f"API response: {response.status_code}")
         return response
 
     except requests.exceptions.Timeout:
-        logger.warning(f"API request timed out: {method} {path}")
+        logger.error(f"API request timed out after {timeout}s: {method} {url}")
         return None
-    except requests.exceptions.ConnectionError:
-        logger.warning(f"Could not connect to API: {method} {path}")
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Could not connect to API: {method} {url} - {e}")
         return None
     except Exception as e:
-        logger.error(f"API request error: {e}")
+        logger.error(f"API request error: {method} {url} - {type(e).__name__}: {e}")
         return None

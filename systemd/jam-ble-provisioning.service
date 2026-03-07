@@ -9,8 +9,9 @@ Requires=bluetooth.target
 # Wait for first boot to complete (credentials generated)
 After=jam-first-boot.service
 
-# Wait for boot check to complete (system validation)
-After=jam-boot-check.service
+# NOTE: We do NOT wait for jam-boot-check.service here!
+# BLE provisioning must start ASAP on fresh devices so users can configure WiFi.
+# Boot check waits for network, but BLE is how users SET UP the network.
 
 # Restart limits (in Unit section for older systemd versions)
 StartLimitIntervalSec=300

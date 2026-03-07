@@ -1,2 +1,6 @@
 requests>=2.31.0,<2.32.0
 pillow>=10.2.0,<11.0.0
+websocket-client>=1.6.0,<2.0.0
+sdnotify>=0.3.0,<1.0.0
+pynacl>=1.5.0,<2.0.0
+uuid6>=2024.1.0

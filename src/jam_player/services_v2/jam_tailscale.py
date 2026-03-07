@@ -50,7 +50,7 @@ TAILSCALE_OAUTH_URL = f"{TAILSCALE_API}/oauth/token"
 TAILSCALE_TAILNET = "effortlesspresence.com"
 
 # Connection check settings
-MAX_CONNECTION_WAIT = 120  # seconds to wait for existing connection
+MAX_CONNECTION_WAIT = 60  # seconds to wait for existing connection
 
 
 def run_command(cmd: list, timeout: int = 30) -> Tuple[bool, str, str]:
@@ -225,25 +225,58 @@ def fetch_tailscale_credentials() -> Optional[Tuple[str, str]]:
     Returns:
         Tuple of (client_id, client_secret) or None on failure.
     """
-    logger.info("Fetching Tailscale credentials from backend...")
+    from common.api import get_api_base_url, sign_request
+    from common.credentials import get_api_signing_private_key
+    import requests
 
-    response = api_request(
-        method='POST',
-        path='/jam-players/tailscale-credentials',
-        signed=True,
-        timeout=30
-    )
+    # Debug: Check credentials before making request
+    device_uuid = get_device_uuid()
+    private_key = get_api_signing_private_key()
+    logger.info(f"Device UUID: {device_uuid}")
+    logger.info(f"Private key exists: {private_key is not None}")
+    if private_key:
+        logger.info(f"Private key length: {len(private_key)}")
+
+    base_url = get_api_base_url()
+    endpoint = '/jam-players/tailscale-conn-info'
+    url = f"{base_url}{endpoint}"
+    logger.info(f"Fetching Tailscale credentials from {url}")
+
+    # Debug: Try signing manually to see what happens
+    sign_headers = sign_request('GET', endpoint, '')
+    if not sign_headers:
+        logger.error("Failed to sign request - sign_request returned None")
+        return None
+    logger.info(f"Signed request with headers: X-Device-ID={sign_headers.get('X-Device-ID')}, X-Timestamp={sign_headers.get('X-Timestamp')}")
+
+    # Make request manually with full error details
+    headers = {'Content-Type': 'application/json'}
+    headers.update(sign_headers)
+
+    try:
+        logger.info(f"Making GET request to {url}")
+        response = requests.get(url, headers=headers, timeout=30)
+        logger.info(f"Response status: {response.status_code}")
+    except requests.exceptions.Timeout:
+        logger.error(f"Request timed out after 30s: {url}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error: {url} - {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Request failed: {url} - {type(e).__name__}: {e}")
+        return None
 
     if not response:
-        logger.error("No response from backend")
+        logger.error(f"No response from backend - request to {url} failed")
         return None
 
     if response.status_code == 401:
-        logger.error("Authentication failed - device may not be announced yet")
+        logger.error(f"Authentication failed (401) - device may not be announced or signature invalid. Response: {response.text}")
         return None
 
     if response.status_code != 200:
-        logger.error(f"Backend returned status {response.status_code}")
+        logger.error(f"Backend returned status {response.status_code}: {response.text}")
         return None
 
     try:
@@ -252,13 +285,13 @@ def fetch_tailscale_credentials() -> Optional[Tuple[str, str]]:
         client_secret = data.get('clientSecret')
 
         if client_id and client_secret:
-            logger.info("Received Tailscale credentials")
+            logger.info("Received Tailscale credentials successfully")
             return client_id, client_secret
         else:
-            logger.error("Invalid credentials response from backend")
+            logger.error(f"Invalid credentials response - missing clientId or clientSecret. Response: {data}")
             return None
     except Exception as e:
-        logger.error(f"Error parsing credentials response: {e}")
+        logger.error(f"Error parsing credentials response: {e}. Raw response: {response.text}")
         return None
 
 
@@ -401,6 +434,128 @@ def setup_tailscale(auth_key: str) -> bool:
         return False
 
 
+def report_tailscale_ip_to_backend(ip: str) -> bool:
+    """
+    Report the Tailscale IP address to the JAM backend.
+
+    This is called every time jam-tailscale.service runs and has a Tailscale IP,
+    even if the IP hasn't changed. This ensures the backend always has the
+    current IP for remote support access.
+
+    Args:
+        ip: The Tailscale IP address (e.g., "100.64.1.123")
+
+    Returns:
+        True if successfully reported, False otherwise.
+    """
+    device_uuid = get_device_uuid()
+    if not device_uuid:
+        logger.warning("No device UUID - cannot report Tailscale IP")
+        return False
+
+    logger.info(f"Reporting Tailscale IP {ip} to backend...")
+
+    response = api_request(
+        method='PUT',
+        path=f'/jam-players/{device_uuid}/set-ip',
+        body={'tailscaleIpAddress': ip},
+        signed=True,
+        timeout=30
+    )
+
+    if not response:
+        logger.warning("No response from backend when reporting Tailscale IP")
+        return False
+
+    if response.status_code == 200:
+        logger.info("Tailscale IP reported to backend successfully")
+        return True
+    else:
+        logger.warning(f"Failed to report Tailscale IP: {response.status_code} {response.text}")
+        return False
+
+
+def check_and_clear_cloned_tailscale_state() -> bool:
+    """
+    TEMPORARY: Check if this device was cloned from another device's image.
+
+    If the device UUID doesn't match the UUID stored when Tailscale was last
+    configured, clear the Tailscale state so this device gets its own identity.
+
+    TODO: Remove this once we have a proper image creation process that clears
+    Tailscale state before creating the image.
+
+    Returns:
+        True if state was cleared (Tailscale needs reconfiguration)
+        False if no action needed
+    """
+    device_uuid = get_device_uuid()
+    if not device_uuid:
+        logger.warning("[CLONE-CHECK] No device UUID found, skipping clone detection")
+        return False
+
+    tailscale_state_dir = Path('/var/lib/tailscale')
+    device_marker_file = tailscale_state_dir / '.jam-device-uuid'
+    state_file = tailscale_state_dir / 'tailscaled.state'
+
+    # If no Tailscale state exists, nothing to clear
+    if not state_file.exists():
+        logger.info("[CLONE-CHECK] No Tailscale state file, nothing to clear")
+        # Store marker for future clone detection
+        try:
+            tailscale_state_dir.mkdir(parents=True, exist_ok=True)
+            device_marker_file.write_text(device_uuid)
+            logger.info(f"[CLONE-CHECK] Stored device UUID marker: {device_uuid}")
+        except Exception as e:
+            logger.warning(f"[CLONE-CHECK] Could not store device marker: {e}")
+        return False
+
+    # Check if marker exists and matches
+    if device_marker_file.exists():
+        stored_uuid = device_marker_file.read_text().strip()
+        if stored_uuid == device_uuid:
+            logger.info(f"[CLONE-CHECK] Device UUID matches ({device_uuid}), no clone detected")
+            return False
+        else:
+            logger.warning(f"[CLONE-CHECK] CLONE DETECTED! Stored UUID: {stored_uuid}, Current UUID: {device_uuid}")
+    else:
+        # State exists but no marker - this is a clone from an image without the marker
+        logger.warning(f"[CLONE-CHECK] CLONE DETECTED! Tailscale state exists but no device marker")
+
+    # Clear Tailscale state
+    logger.info("[CLONE-CHECK] Clearing Tailscale state so this device gets its own identity...")
+
+    try:
+        # Stop tailscaled first
+        run_command(['systemctl', 'stop', 'tailscaled'])
+        time.sleep(1)
+
+        # Remove state files
+        if state_file.exists():
+            state_file.unlink()
+            logger.info("[CLONE-CHECK] Removed tailscaled.state")
+
+        # Remove any log files
+        for log_file in tailscale_state_dir.glob('tailscaled.log*'):
+            log_file.unlink()
+            logger.info(f"[CLONE-CHECK] Removed {log_file.name}")
+
+        # Store the new device UUID marker
+        device_marker_file.write_text(device_uuid)
+        logger.info(f"[CLONE-CHECK] Stored new device UUID marker: {device_uuid}")
+
+        # Restart tailscaled
+        run_command(['systemctl', 'start', 'tailscaled'])
+        time.sleep(2)
+
+        logger.info("[CLONE-CHECK] Tailscale state cleared successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"[CLONE-CHECK] Error clearing Tailscale state: {e}")
+        return False
+
+
 def main():
     log_service_start(logger, 'JAM Tailscale Service')
 
@@ -409,9 +564,19 @@ def main():
         logger.error("Tailscale is not installed - cannot configure remote access")
         sys.exit(1)
 
+    # TEMPORARY: Check for cloned image and clear Tailscale state if needed
+    # TODO: Remove once proper image creation process is in place
+    clone_cleared = check_and_clear_cloned_tailscale_state()
+    if clone_cleared:
+        logger.info("Tailscale state was cleared due to clone detection - will reconfigure")
+
     # Wait for existing connection (may reconnect after boot)
     if wait_for_existing_connection():
-        logger.info("Tailscale already connected - nothing to do")
+        logger.info("Tailscale already connected")
+        # Report IP to backend (even if already connected - ensures backend has current IP)
+        ip = get_tailscale_ip()
+        if ip:
+            report_tailscale_ip_to_backend(ip)
         sys.exit(0)
 
     # Tailscale not connected - need to set it up
@@ -452,6 +617,10 @@ def main():
     # Set up Tailscale
     if setup_tailscale(auth_key):
         logger.info("Tailscale setup completed successfully")
+        # Report IP to backend
+        ip = get_tailscale_ip()
+        if ip:
+            report_tailscale_ip_to_backend(ip)
         sys.exit(0)
     else:
         logger.error("Tailscale setup failed")
