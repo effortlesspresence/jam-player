@@ -27,12 +27,10 @@ import time
 import hashlib
 import shutil
 import subprocess
-import tempfile
 import signal
 import threading
 from typing import List, Optional, Dict, Any
 from pathlib import Path
-from datetime import datetime
 
 from jam_player import constants
 
@@ -241,91 +239,6 @@ def download_media(url: str, dest_path: Path) -> bool:
             return False
 
     return False
-
-
-def stitch_scenes_to_loop(scenes: List[Dict[str, Any]], media_dir: Path, output_path: Path) -> bool:
-    """
-    Stitch all scenes into a single loop.mp4 video for gapless playback.
-
-    Uses stream copy (-c copy) for fast concatenation. All input videos
-    must be pre-normalized to the same format (done during download).
-
-    Args:
-        scenes: List of processed scene dicts with video_clip field
-        media_dir: Directory containing media files
-        output_path: Where to write the stitched loop.mp4
-
-    Returns:
-        True if successful, False otherwise.
-    """
-    if not scenes:
-        logger.warning("No scenes to stitch")
-        return False
-
-    logger.info(f"Stitching {len(scenes)} scenes into loop video (stream copy)...")
-
-    try:
-        # Create concat file listing all video clips
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            concat_file = f.name
-
-            for scene in scenes:
-                video_clip = scene.get('video_clip')
-                if not video_clip:
-                    logger.warning(f"Scene {scene.get('id')} has no video_clip, skipping")
-                    continue
-
-                clip_path = media_dir / video_clip
-                if not clip_path.exists():
-                    logger.warning(f"Video clip not found: {clip_path}")
-                    continue
-
-                f.write(f"file '{clip_path}'\n")
-
-        # Concatenate with stream copy (very fast, no re-encoding)
-        stitch_cmd = [
-            'ffmpeg', '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', concat_file,
-            '-c', 'copy',  # Stream copy - no re-encoding!
-            '-movflags', '+faststart',
-            str(output_path)
-        ]
-
-        logger.info("Running ffmpeg concat with stream copy...")
-        start_time = time.time()
-
-        result = subprocess.run(stitch_cmd, capture_output=True, timeout=60)
-
-        elapsed = time.time() - start_time
-
-        if result.returncode != 0:
-            logger.error(f"Failed to stitch videos: {result.stderr.decode()[:500]}")
-            # Clean up concat file
-            try:
-                os.unlink(concat_file)
-            except:
-                pass
-            return False
-
-        # Clean up concat file
-        os.unlink(concat_file)
-
-        # Get final loop duration
-        loop_duration = get_video_duration(output_path)
-        file_size_mb = output_path.stat().st_size / (1024 * 1024)
-
-        logger.info(f"Stitched loop.mp4: {loop_duration:.1f}s, {file_size_mb:.1f}MB (took {elapsed:.1f}s)")
-
-        return True
-
-    except subprocess.TimeoutExpired:
-        logger.error("Stitch operation timed out")
-        return False
-    except Exception as e:
-        logger.error(f"Error stitching scenes: {e}", exc_info=True)
-        return False
 
 
 def get_video_duration(file_path: Path) -> Optional[float]:
@@ -555,13 +468,6 @@ def load_content() -> bool:
         live_scenes_path = LIVE_SCENES_DIR / "scenes.json"
         with open(live_scenes_path, 'w') as f:
             json.dump([], f)
-        # Clear loop video if it exists
-        loop_video = LIVE_MEDIA_DIR / "loop.mp4"
-        if loop_video.exists():
-            loop_video.unlink()
-        loop_meta = LIVE_SCENES_DIR / "loop_meta.json"
-        if loop_meta.exists():
-            loop_meta.unlink()
         logger.info("Live content cleared - player should show waiting screen")
         return True
 

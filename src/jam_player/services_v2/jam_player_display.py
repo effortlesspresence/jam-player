@@ -1237,37 +1237,13 @@ class JamPlayerDisplayManager:
     # Main Content Loop with Wall Clock Sync
     # =========================================================================
 
-    def _load_loop_metadata(self) -> Optional[dict]:
-        """Load loop_meta.json if available."""
-        meta_path = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "loop_meta.json"
-        if meta_path.exists():
-            try:
-                with open(meta_path, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Could not load loop metadata: {e}")
-        return None
-
-    def _has_scheduled_scenes(self) -> bool:
-        """Check if any scene has scheduling constraints."""
-        scenes = self._load_scenes(apply_schedule_filter=False)
-        for scene in scenes:
-            days_scheduled = scene.get('days_scheduled', [])
-            if days_scheduled:
-                return True
-        return False
-
     def run_video_loop(self):
         """
         Main content playback loop with wall clock synchronization.
 
-        If scenes have scheduling constraints (days_scheduled), uses scene-by-scene
-        playback so we can dynamically filter based on current day/time.
-
-        Otherwise uses the stitched loop.mp4 if available (preferred - gapless playback).
-
-        All JAM Players displaying the same Screen will show the same content
-        at the same time, synchronized via wall clock (chrony/NTP).
+        Plays scenes one-by-one with wall clock sync. All JAM Players displaying
+        the same Screen will show the same content at the same time, synchronized
+        via wall clock (chrony/NTP).
         """
         # Ensure MPV is running - restart if it died
         if not self.mpv or not self.mpv.is_running():
@@ -1287,158 +1263,7 @@ class JamPlayerDisplayManager:
         logger.info(f"Sync config: check={SYNC_CHECK_INTERVAL_MS}ms, tolerance={TARGET_SYNC_TOLERANCE_MS}ms")
         logger.info("=" * 60)
 
-        media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
-
-        # Check if any scene has scheduling - if so, use scene-by-scene for dynamic filtering
-        if self._has_scheduled_scenes():
-            logger.info("Scenes have scheduling constraints - using scene-by-scene playback for dynamic filtering")
-            self._run_scene_by_scene_sync()
-            return
-
-        # Check for stitched loop.mp4 (preferred for gapless playback)
-        loop_path = media_dir / "loop.mp4"
-        loop_meta = self._load_loop_metadata()
-
-        if loop_path.exists() and loop_meta:
-            self._run_loop_video_sync(loop_path, loop_meta)
-        else:
-            logger.warning("No stitched loop.mp4 found - using scene-by-scene playback (may have transition glitches)")
-            self._run_scene_by_scene_sync()
-
-    def _run_loop_video_sync(self, loop_path: Path, loop_meta: dict):
-        """
-        Play the stitched loop.mp4 with wall clock synchronization.
-        This is the preferred mode - gapless playback with tight sync.
-        """
-        loop_duration_sec = loop_meta.get('total_duration', 60)
-        loop_duration_ms = int(loop_duration_sec * 1000)
-        scene_count = loop_meta.get('scene_count', 0)
-
-        logger.info(f"Playing stitched loop: {loop_path}")
-        logger.info(f"Loop duration: {loop_duration_sec:.1f}s ({scene_count} scenes)")
-
-        # Load the loop video
-        self.mpv.load_file(str(loop_path))
-        time.sleep(0.5)
-
-        # Ensure loop is enabled (loadfile can reset the property)
-        self.mpv.set_property('loop-file', 'inf')
-
-        # Initial sync - seek to correct position
-        expected_ms = self._calculate_expected_position(loop_duration_ms)
-        expected_sec = expected_ms / 1000.0
-        self.mpv.seek(expected_sec)
-        self.mpv.set_property('pause', False)
-        self.mpv.set_speed(SPEED_NORMAL)
-        self._current_speed = SPEED_NORMAL
-
-        logger.info(f"Initial sync: seeking to {expected_sec:.2f}s")
-
-        self._last_sync_check = 0
-        self._last_sync_log = 0
-        self._last_content_mtime = 0
-        sync_stats = {'adjustments': 0, 'seeks': 0, 'in_sync': 0}
-
-        while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
-            # Check for content updates (loop.mp4 rebuilt)
-            try:
-                current_mtime = loop_path.stat().st_mtime
-                if self._last_content_mtime == 0:
-                    self._last_content_mtime = current_mtime
-                elif current_mtime != self._last_content_mtime:
-                    logger.info("Loop video updated - reloading")
-                    self._last_content_mtime = current_mtime
-                    # Reload loop metadata
-                    new_meta = self._load_loop_metadata()
-                    if new_meta:
-                        loop_duration_sec = new_meta.get('total_duration', 60)
-                        loop_duration_ms = int(loop_duration_sec * 1000)
-                    # Reload and sync
-                    self.mpv.load_file(str(loop_path))
-                    time.sleep(0.3)
-                    expected_ms = self._calculate_expected_position(loop_duration_ms)
-                    self.mpv.seek(expected_ms / 1000.0)
-                    self.mpv.set_speed(SPEED_NORMAL)
-                    self._current_speed = SPEED_NORMAL
-                    continue
-            except Exception as e:
-                logger.warning(f"Error checking loop file: {e}")
-
-            # Check if MPV died and needs restart
-            if self.mpv and not self.mpv.is_running():
-                logger.warning("MPV process died in stitched loop playback, exiting to retry")
-                try:
-                    self.mpv.stop_mpv()
-                except Exception as e:
-                    logger.warning(f"Error stopping dead MPV: {e}")
-                self.mpv = None
-                return  # Exit to let caller retry
-
-            # Sync adjustment
-            current_time_ms = self._get_wall_clock_ms()
-
-            if current_time_ms - self._last_sync_check >= SYNC_CHECK_INTERVAL_MS:
-                self._last_sync_check = current_time_ms
-
-                # Get actual playback position
-                actual_sec = self.mpv.get_playback_time()
-                if actual_sec is not None:
-                    actual_ms = int(actual_sec * 1000)
-                    expected_ms = self._calculate_expected_position(loop_duration_ms)
-                    offset_ms = self._get_sync_offset_ms(expected_ms, actual_ms, loop_duration_ms)
-                    abs_offset = abs(offset_ms)
-
-                    # Apply proportional speed control
-                    if abs_offset > SEEK_THRESHOLD_MS:
-                        # Emergency seek
-                        target_sec = expected_ms / 1000.0
-                        logger.warning(f"SYNC EMERGENCY SEEK: offset={offset_ms}ms -> {target_sec:.2f}s")
-                        self.mpv.seek(target_sec)
-                        self.mpv.set_speed(SPEED_NORMAL)
-                        self._current_speed = SPEED_NORMAL
-                        sync_stats['seeks'] += 1
-
-                    elif abs_offset > 100:
-                        new_speed = SPEED_AGGRESSIVE_FAST if offset_ms < 0 else SPEED_AGGRESSIVE_SLOW
-                        if new_speed != self._current_speed:
-                            self.mpv.set_speed(new_speed)
-                            self._current_speed = new_speed
-                            sync_stats['adjustments'] += 1
-
-                    elif abs_offset > 30:
-                        new_speed = SPEED_MODERATE_FAST if offset_ms < 0 else SPEED_MODERATE_SLOW
-                        if new_speed != self._current_speed:
-                            self.mpv.set_speed(new_speed)
-                            self._current_speed = new_speed
-                            sync_stats['adjustments'] += 1
-
-                    elif abs_offset > TARGET_SYNC_TOLERANCE_MS:
-                        new_speed = SPEED_GENTLE_FAST if offset_ms < 0 else SPEED_GENTLE_SLOW
-                        if new_speed != self._current_speed:
-                            self.mpv.set_speed(new_speed)
-                            self._current_speed = new_speed
-                            sync_stats['adjustments'] += 1
-
-                    else:
-                        if self._current_speed != SPEED_NORMAL:
-                            self.mpv.set_speed(SPEED_NORMAL)
-                            self._current_speed = SPEED_NORMAL
-                        sync_stats['in_sync'] += 1
-
-                    # Log sync status every 5 seconds
-                    if current_time_ms - self._last_sync_log >= 5000:
-                        self._last_sync_log = current_time_ms
-                        status = "IN_SYNC" if abs_offset <= TARGET_SYNC_TOLERANCE_MS else "ADJUSTING"
-                        speed_str = f"{self._current_speed:.2f}x"
-                        logger.info(
-                            f"SYNC [{status}]: offset={offset_ms:+d}ms speed={speed_str} "
-                            f"| pos={actual_sec:.1f}s/{loop_duration_sec:.1f}s "
-                            f"| stats={{seeks:{sync_stats['seeks']}, adj:{sync_stats['adjustments']}, sync:{sync_stats['in_sync']}}}"
-                        )
-
-            # Notify systemd watchdog
-            sd_notifier.notify("WATCHDOG=1")
-            time.sleep(0.05)
+        self._run_scene_by_scene_sync()
 
     def _show_no_scheduled_content_screen(self):
         """Show a message when content exists but all scenes are scheduled off."""
