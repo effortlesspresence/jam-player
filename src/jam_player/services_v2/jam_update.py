@@ -69,6 +69,7 @@ JAM_PLAYER_SRC = JAM_REPO_DIR / 'src' / 'jam_player'
 SYSTEMD_SRC = JAM_REPO_DIR / 'systemd'
 CRON_SRC = JAM_REPO_DIR / 'cron'
 LOGROTATE_SRC = JAM_REPO_DIR / 'logrotate_config'
+CONFIG_SRC = JAM_REPO_DIR / 'jam_player' / 'config'
 
 # Backup paths (for rollback on failed updates)
 BACKUP_DIR = OPT_JAM_DIR / 'backup'
@@ -926,6 +927,49 @@ def install_logrotate_config():
         logger.warning(f"  Failed to install logrotate config: {e}")
 
 
+def install_chrony_peering_config():
+    """
+    Install chrony peering configuration for offline clock sync.
+
+    This enables JAM Players in the same ScreenLayout to sync their clocks
+    with each other when internet connectivity is lost. The config:
+    - Allows peer queries from local network (10.x, 172.16.x, 192.168.x)
+    - Enables local stratum 10 for serving time when NTP is unavailable
+
+    The jam-chrony-peering.service discovers other JAM Players and adds
+    them as chrony peers dynamically.
+    """
+    logger.info("Installing chrony peering config...")
+
+    chrony_src = CONFIG_SRC / 'chrony-jam-peering.conf'
+    chrony_dest = Path('/etc/chrony/conf.d/jam-peering.conf')
+
+    if not chrony_src.exists():
+        logger.warning(f"Chrony peering config not found: {chrony_src}")
+        return
+
+    try:
+        # Ensure conf.d directory exists (it should on most systems)
+        chrony_dest.parent.mkdir(parents=True, exist_ok=True)
+
+        # Copy config file
+        shutil.copy2(chrony_src, chrony_dest)
+        os.chown(chrony_dest, 0, 0)  # root:root
+        os.chmod(chrony_dest, 0o644)
+
+        logger.info(f"  Installed {chrony_dest}")
+
+        # Restart chrony to pick up the new config
+        success, _, stderr = run_command(['systemctl', 'restart', 'chrony'], timeout=30)
+        if success:
+            logger.info("  Restarted chrony to apply config")
+        else:
+            logger.warning(f"  Failed to restart chrony: {stderr}")
+
+    except Exception as e:
+        logger.warning(f"  Failed to install chrony peering config: {e}")
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
@@ -946,6 +990,7 @@ def restart_services():
         'jam-health-monitor.service',     # Type=notify, sends READY=1 early
         'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
         'jam-ws-commands.service',        # Type=notify, WebSocket commands (has ConditionPath)
+        'jam-chrony-peering.service',     # Type=simple, chrony peer discovery
         'jam-tailscale.service',          # Type=oneshot, runs once
     ]
 
@@ -1145,6 +1190,9 @@ def main():
 
     # Install logrotate config
     install_logrotate_config()
+
+    # Install chrony peering config for offline clock sync
+    install_chrony_peering_config()
 
     # Restart services to pick up changes
     restart_services()

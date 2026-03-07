@@ -18,6 +18,7 @@ Before=jam-ble-state-manager.service
 Before=jam-content-manager.service
 Before=jam-heartbeat.service
 Before=jam-health-monitor.service
+Before=jam-chrony-peering.service
 
 [Service]
 Type=oneshot

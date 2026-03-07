@@ -1,0 +1,34 @@
+[Unit]
+Description=JAM Chrony Peering - Local network clock sync for offline resilience
+Documentation=https://github.com/just-a-menu/jam-player
+After=network-online.target chrony.service
+Wants=network-online.target
+Requires=chrony.service
+
+[Service]
+Type=simple
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/services_v2/jam_chrony_peering.py
+WorkingDirectory=/opt/jam/services
+
+# Run as root to access chronyc
+User=root
+Group=root
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-chrony-peering
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/jam /var/run/chrony
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
