@@ -335,7 +335,7 @@ def get_font(size: int, bold: bool = True):
 
 def create_gradient_background(width: int, height: int, color_top: tuple, color_bottom: tuple) -> Image.Image:
     """
-    Create a vertical gradient background.
+    Create a vertical gradient background using fast line drawing.
 
     Args:
         width: Image width
@@ -347,6 +347,7 @@ def create_gradient_background(width: int, height: int, color_top: tuple, color_
         PIL Image with gradient background
     """
     img = Image.new('RGB', (width, height))
+    draw = ImageDraw.Draw(img)
 
     for y in range(height):
         # Calculate interpolation factor (0.0 at top, 1.0 at bottom)
@@ -357,55 +358,125 @@ def create_gradient_background(width: int, height: int, color_top: tuple, color_
         g = int(color_top[1] + (color_bottom[1] - color_top[1]) * t)
         b = int(color_top[2] + (color_bottom[2] - color_top[2]) * t)
 
-        # Draw horizontal line at this y position
-        for x in range(width):
-            img.putpixel((x, y), (r, g, b))
+        # Draw horizontal line (much faster than putpixel)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
 
     return img
 
 
-def create_radial_gradient_background(width: int, height: int,
-                                       color_center: tuple, color_edge: tuple,
-                                       center_offset_y: float = -0.2) -> Image.Image:
+def create_diagonal_gradient_background(width: int, height: int,
+                                         color_top_left: tuple,
+                                         color_bottom_right: tuple) -> Image.Image:
     """
-    Create a radial gradient background with center glow effect.
+    Create a diagonal gradient from top-left to bottom-right.
+    More visually interesting than a simple vertical gradient.
+    """
+    img = Image.new('RGB', (width, height))
+    draw = ImageDraw.Draw(img)
+
+    # Draw horizontal lines with color interpolated based on y position
+    for y in range(height):
+        for x in range(0, width, 4):  # Draw in chunks for speed
+            # Diagonal interpolation: combine x and y position
+            t = (x / width * 0.4 + y / height * 0.6)
+            t = min(max(t, 0), 1)
+
+            r = int(color_top_left[0] + (color_bottom_right[0] - color_top_left[0]) * t)
+            g = int(color_top_left[1] + (color_bottom_right[1] - color_top_left[1]) * t)
+            b = int(color_top_left[2] + (color_bottom_right[2] - color_top_left[2]) * t)
+
+            # Draw a small horizontal segment
+            draw.line([(x, y), (min(x + 4, width), y)], fill=(r, g, b))
+
+    return img
+
+
+def create_premium_gradient_background(width: int, height: int, theme: str = "orange") -> Image.Image:
+    """
+    Create a premium multi-stop gradient background.
 
     Args:
         width: Image width
         height: Image height
-        color_center: RGB tuple for center color (brighter)
-        color_edge: RGB tuple for edge color (darker)
-        center_offset_y: Vertical offset of center (-1 to 1, negative = higher)
+        theme: Color theme - "orange" (setup), "blue" (loading), "purple" (off-hours)
 
     Returns:
-        PIL Image with radial gradient background
+        PIL Image with premium gradient background
     """
     img = Image.new('RGB', (width, height))
+    draw = ImageDraw.Draw(img)
 
-    # Center point (offset vertically for more dramatic effect)
-    cx = width / 2
-    cy = height / 2 + (height * center_offset_y)
+    # Define color stops for each theme (top, middle, bottom)
+    themes = {
+        "orange": [
+            (45, 25, 15),    # Dark warm brown at top
+            (30, 20, 25),    # Deep purple-brown middle
+            (15, 15, 20),    # Near black at bottom
+        ],
+        "blue": [
+            (20, 30, 50),    # Dark blue at top
+            (20, 25, 40),    # Slightly lighter middle
+            (15, 18, 25),    # Near black at bottom
+        ],
+        "purple": [
+            (35, 20, 45),    # Dark purple at top
+            (25, 18, 35),    # Mid purple
+            (15, 15, 22),    # Near black at bottom
+        ],
+    }
 
-    # Maximum distance (corner to center)
-    max_dist = ((width/2)**2 + (height/2)**2) ** 0.5 * 1.2
+    colors = themes.get(theme, themes["orange"])
+
+    # Three-stop gradient
+    mid_point = height // 2
 
     for y in range(height):
-        for x in range(width):
-            # Calculate distance from center
-            dist = ((x - cx)**2 + (y - cy)**2) ** 0.5
+        if y < mid_point:
+            # Top to middle
+            t = y / mid_point
+            c1, c2 = colors[0], colors[1]
+        else:
+            # Middle to bottom
+            t = (y - mid_point) / (height - mid_point)
+            c1, c2 = colors[1], colors[2]
 
-            # Normalize distance (0 at center, 1 at max)
-            t = min(dist / max_dist, 1.0)
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
 
-            # Use easing for smoother gradient
-            t = t * t  # Quadratic ease-in for softer center glow
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-            # Interpolate colors
-            r = int(color_center[0] + (color_edge[0] - color_center[0]) * t)
-            g = int(color_center[1] + (color_edge[1] - color_center[1]) * t)
-            b = int(color_center[2] + (color_edge[2] - color_center[2]) * t)
+    # Add a subtle glow spot at the top center for premium feel
+    glow_colors = {
+        "orange": (80, 45, 25),
+        "blue": (40, 60, 90),
+        "purple": (60, 35, 75),
+    }
+    glow_color = glow_colors.get(theme, glow_colors["orange"])
 
-            img.putpixel((x, y), (r, g, b))
+    # Draw elliptical glow using concentric ellipses
+    glow_width = width // 2
+    glow_height = height // 3
+    cx, cy = width // 2, height // 6
+
+    for i in range(20, 0, -1):
+        # Fade from glow color to transparent (blend with background)
+        alpha = i / 20.0 * 0.3  # Max 30% opacity
+        scale = i / 20.0
+
+        ew = int(glow_width * scale)
+        eh = int(glow_height * scale)
+
+        # Blend glow color with the background color at this position
+        bg = colors[0]  # Top color
+        r = int(bg[0] + (glow_color[0] - bg[0]) * alpha)
+        g = int(bg[1] + (glow_color[1] - bg[1]) * alpha)
+        b = int(bg[2] + (glow_color[2] - bg[2]) * alpha)
+
+        draw.ellipse(
+            [cx - ew, cy - eh, cx + ew, cy + eh],
+            fill=(r, g, b)
+        )
 
     return img
 
@@ -488,15 +559,8 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         logger.error("PIL not available for creating display images")
         return None
 
-    # Create gradient background - dark with subtle orange glow from top
-    # Use radial gradient for premium "spotlight" effect
-    glow_color = (45, 35, 35)  # Very subtle warm tint in center
-    img = create_radial_gradient_background(
-        width, height,
-        color_center=glow_color,
-        color_edge=JAM_DARKER,
-        center_offset_y=-0.3  # Glow positioned higher
-    )
+    # Create premium gradient background with warm orange glow
+    img = create_premium_gradient_background(width, height, theme="orange")
     draw = ImageDraw.Draw(img)
 
     # Fonts
@@ -625,14 +689,8 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
         logger.error("PIL not available for creating display images")
         return None
 
-    # Create gradient background - subtle blue-ish tint for "loading" feel
-    glow_color = (35, 40, 50)  # Subtle cool tint
-    img = create_radial_gradient_background(
-        width, height,
-        color_center=glow_color,
-        color_edge=JAM_DARKER,
-        center_offset_y=0  # Centered glow
-    )
+    # Create premium gradient background with blue "loading" theme
+    img = create_premium_gradient_background(width, height, theme="blue")
     draw = ImageDraw.Draw(img)
 
     # Fonts
@@ -1415,13 +1473,9 @@ class JamPlayerDisplayManager:
 
         # Create and show a message with gradient background
         if HAS_PIL:
-            # Subtle purple-ish tint for "off hours" feel
-            glow_color = (40, 35, 50)
-            img = create_radial_gradient_background(
-                self.screen_width, self.screen_height,
-                color_center=glow_color,
-                color_edge=JAM_DARKER,
-                center_offset_y=0
+            # Premium gradient with purple "off hours" theme
+            img = create_premium_gradient_background(
+                self.screen_width, self.screen_height, theme="purple"
             )
             draw = ImageDraw.Draw(img)
 
