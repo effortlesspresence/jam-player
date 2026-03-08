@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger WebSocket commands service when internet is available
+
+[Service]
+Type=oneshot
+
+# Try to restart jam-ws-commands (it has its own ConditionPath checks)
+ExecStart=/bin/systemctl restart jam-ws-commands.service
+
+# Don't fail if ws-commands can't start (conditions not met yet)
+ExecStart=-/bin/true

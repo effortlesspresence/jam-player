@@ -49,7 +49,7 @@ STAGED_SCENES_DIR = Path(constants.APP_DATA_STAGED_SCENES_DIR)
 # Polling interval in seconds (fallback when WebSocket push fails)
 POLL_INTERVAL_SECONDS = 120
 
-# Event to signal immediate content refresh (set by SIGUSR1 handler)
+# Event to signal immediatejam-ha  content refresh (set by SIGUSR1 handler)
 refresh_event = threading.Event()
 
 

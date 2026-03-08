@@ -215,7 +215,7 @@ def create_backup() -> bool:
         SYSTEMD_BACKUP.mkdir(parents=True, exist_ok=True)
         systemd_dir = Path('/etc/systemd/system')
         backed_up_units = 0
-        for pattern in ['jam-*.service', 'jam-*.timer']:
+        for pattern in ['jam-*.service', 'jam-*.timer', 'jam-*.path']:
             for unit_file in systemd_dir.glob(pattern):
                 shutil.copy2(unit_file, SYSTEMD_BACKUP / unit_file.name)
                 backed_up_units += 1
@@ -713,6 +713,12 @@ def install_systemd_units() -> bool:
             dest = Path('/etc/systemd/system') / timer_file.name
             shutil.copy2(timer_file, dest)
             logger.info(f"  Installed {timer_file.name}")
+
+        # Copy path files (for file-watching triggers)
+        for path_file in SYSTEMD_SRC.glob('*.path'):
+            dest = Path('/etc/systemd/system') / path_file.name
+            shutil.copy2(path_file, dest)
+            logger.info(f"  Installed {path_file.name}")
 
         # Reload systemd
         logger.info("  Reloading systemd daemon...")

@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for internet connectivity to trigger WebSocket commands service
+
+[Path]
+# Watch for the internet_verified flag (created by jam-ble-state-manager)
+PathExists=/etc/jam/device_data/.internet_verified
+
+# Trigger the service when the file appears
+Unit=jam-ws-commands-trigger.service
+
+[Install]
+WantedBy=multi-user.target

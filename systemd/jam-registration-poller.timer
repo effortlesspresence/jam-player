@@ -9,11 +9,11 @@ ConditionPathExists=!/etc/jam/device_data/.registered
 ConditionPathExists=/etc/jam/device_data/.announced
 
 [Timer]
-# First run 2 minutes after boot (gives time for network to stabilize)
-OnBootSec=2min
+# First run 30 seconds after boot (check quickly during initial setup)
+OnBootSec=30sec
 
-# Then every 30 minutes
-OnUnitActiveSec=30min
+# Then every 1 minute until registered (timer stops when .registered exists due to ConditionPath)
+OnUnitActiveSec=1min
 
 # Persist timer across reboots
 Persistent=true
