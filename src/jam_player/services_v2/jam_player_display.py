@@ -333,150 +333,117 @@ def get_font(size: int, bold: bool = True):
     return ImageFont.load_default()
 
 
-def create_gradient_background(width: int, height: int, color_top: tuple, color_bottom: tuple) -> Image.Image:
+def create_mesh_gradient_background(width: int, height: int, theme: str = "vibrant") -> Image.Image:
     """
-    Create a vertical gradient background using fast line drawing.
+    Create a vibrant mesh gradient background with multiple color points.
+
+    This creates the colorful gradient effect seen in modern app designs,
+    with colors blending smoothly across the image.
 
     Args:
         width: Image width
         height: Image height
-        color_top: RGB tuple for top color
-        color_bottom: RGB tuple for bottom color
+        theme: Color theme - "vibrant" (setup), "cool" (loading), "warm" (off-hours)
 
     Returns:
-        PIL Image with gradient background
+        PIL Image with mesh gradient background
     """
+    import math
+
     img = Image.new('RGB', (width, height))
-    draw = ImageDraw.Draw(img)
 
-    for y in range(height):
-        # Calculate interpolation factor (0.0 at top, 1.0 at bottom)
-        t = y / height
-
-        # Interpolate each color channel
-        r = int(color_top[0] + (color_bottom[0] - color_top[0]) * t)
-        g = int(color_top[1] + (color_bottom[1] - color_top[1]) * t)
-        b = int(color_top[2] + (color_bottom[2] - color_top[2]) * t)
-
-        # Draw horizontal line (much faster than putpixel)
-        draw.line([(0, y), (width, y)], fill=(r, g, b))
-
-    return img
-
-
-def create_diagonal_gradient_background(width: int, height: int,
-                                         color_top_left: tuple,
-                                         color_bottom_right: tuple) -> Image.Image:
-    """
-    Create a diagonal gradient from top-left to bottom-right.
-    More visually interesting than a simple vertical gradient.
-    """
-    img = Image.new('RGB', (width, height))
-    draw = ImageDraw.Draw(img)
-
-    # Draw horizontal lines with color interpolated based on y position
-    for y in range(height):
-        for x in range(0, width, 4):  # Draw in chunks for speed
-            # Diagonal interpolation: combine x and y position
-            t = (x / width * 0.4 + y / height * 0.6)
-            t = min(max(t, 0), 1)
-
-            r = int(color_top_left[0] + (color_bottom_right[0] - color_top_left[0]) * t)
-            g = int(color_top_left[1] + (color_bottom_right[1] - color_top_left[1]) * t)
-            b = int(color_top_left[2] + (color_bottom_right[2] - color_top_left[2]) * t)
-
-            # Draw a small horizontal segment
-            draw.line([(x, y), (min(x + 4, width), y)], fill=(r, g, b))
-
-    return img
-
-
-def create_premium_gradient_background(width: int, height: int, theme: str = "orange") -> Image.Image:
-    """
-    Create a premium multi-stop gradient background.
-
-    Args:
-        width: Image width
-        height: Image height
-        theme: Color theme - "orange" (setup), "blue" (loading), "purple" (off-hours)
-
-    Returns:
-        PIL Image with premium gradient background
-    """
-    img = Image.new('RGB', (width, height))
-    draw = ImageDraw.Draw(img)
-
-    # Define color stops for each theme (top, middle, bottom)
+    # Define color anchor points for each theme
+    # Each point is (x_ratio, y_ratio, (r, g, b))
     themes = {
-        "orange": [
-            (45, 25, 15),    # Dark warm brown at top
-            (30, 20, 25),    # Deep purple-brown middle
-            (15, 15, 20),    # Near black at bottom
+        "vibrant": [
+            # Deep blue/purple top
+            (0.5, 0.0, (65, 40, 180)),
+            # Pink/magenta left side
+            (0.0, 0.4, (180, 50, 140)),
+            # Orange/yellow center-left glow
+            (0.2, 0.5, (255, 140, 50)),
+            # Cyan/blue bottom-right
+            (1.0, 0.8, (40, 160, 220)),
+            # Purple bottom-left
+            (0.0, 1.0, (120, 60, 180)),
+            # Blue bottom
+            (0.5, 1.0, (60, 100, 200)),
         ],
-        "blue": [
-            (20, 30, 50),    # Dark blue at top
-            (20, 25, 40),    # Slightly lighter middle
-            (15, 18, 25),    # Near black at bottom
+        "cool": [
+            # Deep blue top
+            (0.5, 0.0, (30, 60, 150)),
+            # Teal left
+            (0.0, 0.5, (40, 140, 160)),
+            # Purple right
+            (1.0, 0.3, (100, 60, 160)),
+            # Cyan bottom
+            (0.5, 1.0, (50, 180, 200)),
+            # Blue bottom-left
+            (0.0, 1.0, (40, 80, 180)),
         ],
-        "purple": [
-            (35, 20, 45),    # Dark purple at top
-            (25, 18, 35),    # Mid purple
-            (15, 15, 22),    # Near black at bottom
+        "warm": [
+            # Purple top
+            (0.5, 0.0, (100, 50, 150)),
+            # Orange left
+            (0.0, 0.5, (220, 100, 50)),
+            # Pink right
+            (1.0, 0.4, (200, 80, 140)),
+            # Magenta bottom
+            (0.5, 1.0, (160, 60, 130)),
+            # Deep red bottom-left
+            (0.0, 1.0, (150, 40, 80)),
         ],
     }
 
-    colors = themes.get(theme, themes["orange"])
+    color_points = themes.get(theme, themes["vibrant"])
 
-    # Three-stop gradient
-    mid_point = height // 2
+    # Process in chunks for speed (every 2 pixels, then interpolate)
+    step = 2
+    pixels = []
 
-    for y in range(height):
-        if y < mid_point:
-            # Top to middle
-            t = y / mid_point
-            c1, c2 = colors[0], colors[1]
-        else:
-            # Middle to bottom
-            t = (y - mid_point) / (height - mid_point)
-            c1, c2 = colors[1], colors[2]
+    for y in range(0, height, step):
+        row = []
+        for x in range(0, width, step):
+            # Normalize coordinates
+            nx = x / width
+            ny = y / height
 
-        r = int(c1[0] + (c2[0] - c1[0]) * t)
-        g = int(c1[1] + (c2[1] - c1[1]) * t)
-        b = int(c1[2] + (c2[2] - c1[2]) * t)
+            # Calculate weighted color based on distance to each anchor point
+            total_weight = 0.0
+            r_sum, g_sum, b_sum = 0.0, 0.0, 0.0
 
-        draw.line([(0, y), (width, y)], fill=(r, g, b))
+            for px, py, color in color_points:
+                # Distance from this pixel to the color point
+                dx = nx - px
+                dy = ny - py
+                dist = math.sqrt(dx * dx + dy * dy)
 
-    # Add a subtle glow spot at the top center for premium feel
-    glow_colors = {
-        "orange": (80, 45, 25),
-        "blue": (40, 60, 90),
-        "purple": (60, 35, 75),
-    }
-    glow_color = glow_colors.get(theme, glow_colors["orange"])
+                # Inverse distance weighting with falloff
+                # Add small epsilon to avoid division by zero
+                weight = 1.0 / (dist * dist * 4 + 0.01)
 
-    # Draw elliptical glow using concentric ellipses
-    glow_width = width // 2
-    glow_height = height // 3
-    cx, cy = width // 2, height // 6
+                r_sum += color[0] * weight
+                g_sum += color[1] * weight
+                b_sum += color[2] * weight
+                total_weight += weight
 
-    for i in range(20, 0, -1):
-        # Fade from glow color to transparent (blend with background)
-        alpha = i / 20.0 * 0.3  # Max 30% opacity
-        scale = i / 20.0
+            # Normalize
+            r = int(min(255, max(0, r_sum / total_weight)))
+            g = int(min(255, max(0, g_sum / total_weight)))
+            b = int(min(255, max(0, b_sum / total_weight)))
 
-        ew = int(glow_width * scale)
-        eh = int(glow_height * scale)
+            row.append((r, g, b))
 
-        # Blend glow color with the background color at this position
-        bg = colors[0]  # Top color
-        r = int(bg[0] + (glow_color[0] - bg[0]) * alpha)
-        g = int(bg[1] + (glow_color[1] - bg[1]) * alpha)
-        b = int(bg[2] + (glow_color[2] - bg[2]) * alpha)
+        pixels.append(row)
 
-        draw.ellipse(
-            [cx - ew, cy - eh, cx + ew, cy + eh],
-            fill=(r, g, b)
-        )
+    # Draw the gradient
+    draw = ImageDraw.Draw(img)
+    for yi, row in enumerate(pixels):
+        y = yi * step
+        for xi, color in enumerate(row):
+            x = xi * step
+            # Draw a small rectangle for each sampled point
+            draw.rectangle([x, y, x + step, y + step], fill=color)
 
     return img
 
@@ -559,8 +526,8 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         logger.error("PIL not available for creating display images")
         return None
 
-    # Create premium gradient background with warm orange glow
-    img = create_premium_gradient_background(width, height, theme="orange")
+    # Create vibrant mesh gradient background
+    img = create_mesh_gradient_background(width, height, theme="vibrant")
     draw = ImageDraw.Draw(img)
 
     # Fonts
@@ -689,8 +656,8 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
         logger.error("PIL not available for creating display images")
         return None
 
-    # Create premium gradient background with blue "loading" theme
-    img = create_premium_gradient_background(width, height, theme="blue")
+    # Create cool mesh gradient background for loading state
+    img = create_mesh_gradient_background(width, height, theme="cool")
     draw = ImageDraw.Draw(img)
 
     # Fonts
@@ -898,6 +865,11 @@ class MpvIpcClient:
             '--no-audio',
             '--keep-open=yes',  # Don't exit when playback ends
             '--image-display-duration=inf',  # Keep images displayed until we load next file
+            '--no-osc',  # Disable on-screen controller (play/pause bar)
+            '--osd-level=0',  # Disable on-screen display messages
+            '--cursor-autohide=always',  # Always hide cursor
+            '--no-input-default-bindings',  # Disable keyboard/mouse controls
+            '--no-input-cursor',  # Disable cursor input
             f'--input-ipc-server={self.socket_path}',
             f'--video-rotate={rotation_angle}',
             initial_file,
@@ -1473,9 +1445,9 @@ class JamPlayerDisplayManager:
 
         # Create and show a message with gradient background
         if HAS_PIL:
-            # Premium gradient with purple "off hours" theme
-            img = create_premium_gradient_background(
-                self.screen_width, self.screen_height, theme="purple"
+            # Warm mesh gradient for "off hours" theme
+            img = create_mesh_gradient_background(
+                self.screen_width, self.screen_height, theme="warm"
             )
             draw = ImageDraw.Draw(img)
 
