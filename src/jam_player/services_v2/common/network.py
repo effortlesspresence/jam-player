@@ -21,6 +21,9 @@ import subprocess
 import socket
 import time
 import logging
+import os
+import uuid
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
 logger = logging.getLogger(__name__)
@@ -382,10 +385,6 @@ def _connect_wifi_secure(ssid: str, password: str) -> subprocess.CompletedProces
     Returns:
         subprocess.CompletedProcess with the result of the connection attempt
     """
-    import os
-    import tempfile
-    import uuid
-
     # Generate a unique connection name
     conn_name = f"jam-wifi-{uuid.uuid4().hex[:8]}"
 
@@ -445,30 +444,38 @@ method=auto
 method=auto
 """
 
-    temp_keyfile = None
+    # NetworkManager connection files must be in /etc/NetworkManager/system-connections/
+    nm_connections_dir = Path('/etc/NetworkManager/system-connections')
+    keyfile_path = nm_connections_dir / f"{conn_name}.nmconnection"
+
     try:
-        # Create temp file with restricted permissions
-        fd, temp_keyfile = tempfile.mkstemp(suffix='.nmconnection', prefix='jam-wifi-')
+        # Write the keyfile with restricted permissions (required by NetworkManager)
+        # Use os.open with exclusive flags to avoid race conditions
+        fd = os.open(
+            str(keyfile_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600  # rw------- (required by NetworkManager)
+        )
         try:
-            # Set restrictive permissions BEFORE writing content
-            os.fchmod(fd, 0o600)
             os.write(fd, keyfile_content.encode('utf-8'))
         finally:
             os.close(fd)
 
+        # Ensure root ownership (NetworkManager requirement)
+        os.chown(str(keyfile_path), 0, 0)
+
         logger.info(f"Created secure connection profile for SSID: {ssid}")
 
-        # Import the connection profile
-        import_result = subprocess.run(
-            ['nmcli', 'connection', 'load', temp_keyfile],
+        # Tell NetworkManager to reload connection files
+        reload_result = subprocess.run(
+            ['nmcli', 'connection', 'reload'],
             capture_output=True,
             text=True,
             timeout=10
         )
 
-        if import_result.returncode != 0:
-            logger.error(f"Failed to load connection profile: {import_result.stderr}")
-            return import_result
+        if reload_result.returncode != 0:
+            logger.warning(f"nmcli connection reload warning: {reload_result.stderr}")
 
         # Activate the connection
         logger.info(f"Activating connection: {conn_name}")
@@ -492,16 +499,21 @@ method=auto
 
         return result
 
-    finally:
-        # Always clean up the temp file
-        if temp_keyfile and os.path.exists(temp_keyfile):
+    except Exception as e:
+        logger.error(f"Error creating connection profile: {e}")
+        # Clean up on error
+        if keyfile_path.exists():
             try:
-                # Securely overwrite before deletion
-                with open(temp_keyfile, 'wb') as f:
-                    f.write(b'\x00' * 1024)
-                os.unlink(temp_keyfile)
-            except Exception as e:
-                logger.warning(f"Error cleaning up temp keyfile: {e}")
+                keyfile_path.unlink()
+            except:
+                pass
+        # Return a fake failed result
+        return subprocess.CompletedProcess(
+            args=['nmcli'],
+            returncode=1,
+            stdout='',
+            stderr=str(e)
+        )
 
 
 def _stop_comitup_hotspot() -> bool:

@@ -7,7 +7,7 @@ Requires=chrony.service
 
 [Service]
 Type=simple
-ExecStart=/opt/jam/venv/bin/python /opt/jam/services/services_v2/jam_chrony_peering.py
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_chrony_peering.py
 WorkingDirectory=/opt/jam/services
 
 # Run as root to access chronyc
