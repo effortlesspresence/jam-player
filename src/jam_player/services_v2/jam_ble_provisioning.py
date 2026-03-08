@@ -272,6 +272,11 @@ class Advertisement(dbus.service.Object):
                     {dbus.UInt16(self.MANUFACTURER_ID): manufacturer_data},
                     signature='qv'
                 ),
+                # Advertisement interval in units of 0.625ms
+                # MinInterval=160 (100ms), MaxInterval=320 (200ms) for fast discovery
+                # Default BlueZ can be up to 1280ms which causes slow discovery
+                'MinInterval': dbus.UInt16(160),   # 100ms
+                'MaxInterval': dbus.UInt16(320),   # 200ms
             }
         }
 

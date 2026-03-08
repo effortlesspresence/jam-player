@@ -2,24 +2,23 @@
 """
 JAM Player Display Service - Unified Display Manager
 
-This service handles all display states for the JAM Player:
+This service handles all display states for the JAM Player with modern,
+premium gradient-based UI design.
 
-1. UNREGISTERED (.registered doesn't exist)
-   - Display: Welcome screen with QR code to JAM Setup app
-   - Shows JAM-PLAYER-XXXXX identifier for BLE pairing
+Display Modes:
 
-2. REGISTERED_NOT_LINKED (.registered exists, screen_id.txt doesn't exist)
-   - Display: "Registered! Open JAM Setup to link this player to a screen"
-   - Shows same QR code for the app
+1. UNREGISTERED (not registered OR registered but not linked to screen)
+   - Display: Premium setup screen with JAM logo, QR code, and "Get ready to JAM."
+   - Modern dark gradient background with subtle orange glow
+   - Guides user to download JAM Player Setup app
 
-3. LINKED_WAITING_FOR_CONTENT (screen_id.txt exists, no content downloaded)
-   - Display: "Waiting for content..." message
+2. LINKED_WAITING_FOR_CONTENT (linked to screen, content downloading)
+   - Display: "Waiting for content..." with animated-style loading indicator
+   - Shows progress while content is being downloaded
 
-4. PLAYING_CONTENT (screen_id.txt exists, content is available)
+3. PLAYING_CONTENT (linked and content available)
    - Display: Plays scenes sequentially from scenes.json
-   - Supports both IMAGE and VIDEO media types
-   - Images display for their configured duration
-   - Videos play for their duration
+   - Wall clock synchronized playback for multi-display setups
    - Automatically reloads when content is updated
 
 This service monitors state changes and transitions between display modes automatically.
@@ -110,8 +109,8 @@ def get_rotation_angle() -> int:
     # Map orientation to MPV rotation angle
     orientation_to_rotation = {
         'LANDSCAPE': 0,
-        'PORTRAIT_BOTTOM_ON_LEFT': 270,
-        'PORTRAIT_BOTTOM_ON_RIGHT': 90,
+        'PORTRAIT_BOTTOM_ON_LEFT': 90,
+        'PORTRAIT_BOTTOM_ON_RIGHT': 270,
     }
 
     rotation = orientation_to_rotation.get(orientation, 0)
@@ -148,9 +147,8 @@ SPEED_AGGRESSIVE_SLOW = 0.95
 
 
 class DisplayMode(Enum):
-    """The 4 display modes from the design doc."""
-    UNREGISTERED = "unregistered"
-    REGISTERED_NOT_LINKED = "registered_not_linked"
+    """The 3 display modes for JAM Player."""
+    UNREGISTERED = "unregistered"  # Not registered OR registered but not linked
     LINKED_WAITING_FOR_CONTENT = "linked_waiting_for_content"
     PLAYING_CONTENT = "playing_content"
 
@@ -266,17 +264,29 @@ def filter_scenes_by_schedule(scenes: List[Dict[str, Any]]) -> List[Dict[str, An
 # Configuration Constants
 # =============================================================================
 
+# JAM Brand Colors (from web app design system)
+JAM_ORANGE_PRIMARY = (255, 107, 53)    # #FF6B35 - Vibrant Orange
+JAM_ORANGE_SECONDARY = (247, 147, 30)  # #F7931E - Golden Orange
+JAM_RED = (196, 30, 58)                # #C41E3A - Deep Red
+JAM_GOLD = (212, 175, 55)              # #D4AF37 - Gold
+JAM_DARK = (31, 41, 55)                # #1F2937 - Dark Gray
+JAM_DARKER = (17, 24, 39)              # #111827 - Darker background
+
 # Display configuration
-BACKGROUND_COLOR = (0, 0, 0)  # Black
+BACKGROUND_COLOR = JAM_DARKER
 TEXT_COLOR = (255, 255, 255)  # White
-ACCENT_COLOR = (235, 68, 15)  # JAM orange #eb440f
-SECONDARY_COLOR = (180, 180, 180)  # Grey for less prominent text
+ACCENT_COLOR = JAM_ORANGE_PRIMARY
+SECONDARY_COLOR = (156, 163, 175)  # #9CA3AF - Muted gray
 
 FONT_SIZE_TITLE = 72
 FONT_SIZE_SUBTITLE = 36
 FONT_SIZE_INSTRUCTIONS = 32
 FONT_SIZE_URL = 28
 FONT_SIZE_DEVICE_ID = 24
+FONT_SIZE_TAGLINE = 42
+
+# Logo path on device
+JAM_LOGO_PATH = "/root/jam_logo.png"
 
 # URLs for setup
 UNIVERSAL_SETUP_URL = "https://setup.justamenu.com"
@@ -299,22 +309,140 @@ def get_fb_size() -> tuple:
         return 1920, 1080
 
 
-def get_font(size: int):
+def get_font(size: int, bold: bool = True):
     """Get a font, falling back to default if needed."""
     if not HAS_PIL:
         return None
 
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
+    if bold:
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    else:
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
     for path in font_paths:
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
+
+
+def create_gradient_background(width: int, height: int, color_top: tuple, color_bottom: tuple) -> Image.Image:
+    """
+    Create a vertical gradient background.
+
+    Args:
+        width: Image width
+        height: Image height
+        color_top: RGB tuple for top color
+        color_bottom: RGB tuple for bottom color
+
+    Returns:
+        PIL Image with gradient background
+    """
+    img = Image.new('RGB', (width, height))
+
+    for y in range(height):
+        # Calculate interpolation factor (0.0 at top, 1.0 at bottom)
+        t = y / height
+
+        # Interpolate each color channel
+        r = int(color_top[0] + (color_bottom[0] - color_top[0]) * t)
+        g = int(color_top[1] + (color_bottom[1] - color_top[1]) * t)
+        b = int(color_top[2] + (color_bottom[2] - color_top[2]) * t)
+
+        # Draw horizontal line at this y position
+        for x in range(width):
+            img.putpixel((x, y), (r, g, b))
+
+    return img
+
+
+def create_radial_gradient_background(width: int, height: int,
+                                       color_center: tuple, color_edge: tuple,
+                                       center_offset_y: float = -0.2) -> Image.Image:
+    """
+    Create a radial gradient background with center glow effect.
+
+    Args:
+        width: Image width
+        height: Image height
+        color_center: RGB tuple for center color (brighter)
+        color_edge: RGB tuple for edge color (darker)
+        center_offset_y: Vertical offset of center (-1 to 1, negative = higher)
+
+    Returns:
+        PIL Image with radial gradient background
+    """
+    img = Image.new('RGB', (width, height))
+
+    # Center point (offset vertically for more dramatic effect)
+    cx = width / 2
+    cy = height / 2 + (height * center_offset_y)
+
+    # Maximum distance (corner to center)
+    max_dist = ((width/2)**2 + (height/2)**2) ** 0.5 * 1.2
+
+    for y in range(height):
+        for x in range(width):
+            # Calculate distance from center
+            dist = ((x - cx)**2 + (y - cy)**2) ** 0.5
+
+            # Normalize distance (0 at center, 1 at max)
+            t = min(dist / max_dist, 1.0)
+
+            # Use easing for smoother gradient
+            t = t * t  # Quadratic ease-in for softer center glow
+
+            # Interpolate colors
+            r = int(color_center[0] + (color_edge[0] - color_center[0]) * t)
+            g = int(color_center[1] + (color_edge[1] - color_center[1]) * t)
+            b = int(color_center[2] + (color_edge[2] - color_center[2]) * t)
+
+            img.putpixel((x, y), (r, g, b))
+
+    return img
+
+
+def load_and_scale_logo(target_height: int) -> Optional[Image.Image]:
+    """
+    Load the JAM logo and scale it to the target height while maintaining aspect ratio.
+
+    Args:
+        target_height: Desired height in pixels
+
+    Returns:
+        PIL Image of scaled logo, or None if logo not found
+    """
+    if not HAS_PIL:
+        return None
+
+    if not os.path.exists(JAM_LOGO_PATH):
+        logger.warning(f"Logo not found at {JAM_LOGO_PATH}")
+        return None
+
+    try:
+        logo = Image.open(JAM_LOGO_PATH)
+
+        # Convert to RGBA if needed for transparency support
+        if logo.mode != 'RGBA':
+            logo = logo.convert('RGBA')
+
+        # Calculate new dimensions maintaining aspect ratio
+        aspect = logo.width / logo.height
+        new_width = int(target_height * aspect)
+
+        logo = logo.resize((new_width, target_height), Image.Resampling.LANCZOS)
+        return logo
+    except Exception as e:
+        logger.error(f"Failed to load logo: {e}")
+        return None
 
 
 def generate_qr_code(url: str, size: int = 300) -> Optional[Image.Image]:
@@ -347,171 +475,142 @@ def generate_qr_code(url: str, size: int = 300) -> Optional[Image.Image]:
 
 def create_unregistered_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
     """
-    Create the welcome/setup screen for UNREGISTERED mode.
-    Shows QR code and instructions for using JAM Setup app.
+    Create the setup screen for UNREGISTERED mode.
+
+    Modern gradient design with:
+    - JAM Player logo
+    - "JAM Player" title
+    - Setup instructions
+    - QR code
+    - "Get ready to JAM." tagline
     """
     if not HAS_PIL:
         logger.error("PIL not available for creating display images")
         return None
 
-    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
+    # Create gradient background - dark with subtle orange glow from top
+    # Use radial gradient for premium "spotlight" effect
+    glow_color = (45, 35, 35)  # Very subtle warm tint in center
+    img = create_radial_gradient_background(
+        width, height,
+        color_center=glow_color,
+        color_edge=JAM_DARKER,
+        center_offset_y=-0.3  # Glow positioned higher
+    )
     draw = ImageDraw.Draw(img)
 
+    # Fonts
     title_font = get_font(FONT_SIZE_TITLE)
     subtitle_font = get_font(FONT_SIZE_SUBTITLE)
-    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS)
-    url_font = get_font(FONT_SIZE_URL)
+    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
+    tagline_font = get_font(FONT_SIZE_TAGLINE)
+    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
 
     center_x = width // 2
-    qr_size = min(400, height // 3)
-    y = height // 8
 
-    # Title
-    title = "Welcome to JAM Player"
+    # Calculate layout - vertically centered content block
+    logo_height = min(120, height // 8)
+    qr_size = min(320, height // 4)
+
+    # Start from top with some padding
+    y = int(height * 0.08)
+
+    # Logo
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        # Paste with alpha mask for transparency
+        img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
+        y += logo.height + 30
+    else:
+        # Fallback: draw a simple placeholder or skip
+        y += 40
+
+    # "JAM Player" title with gradient-like orange
+    title = "JAM Player"
+    draw.text(
+        (center_x, y),
+        title,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mt"
+    )
     bbox = draw.textbbox((0, 0), title, font=title_font)
-    x = center_x - bbox[2] // 2
-    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
     y += bbox[3] + 40
 
-    # Subtitle
-    subtitle = "Let's get your device set up"
-    bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
-    x = center_x - bbox[2] // 2
-    draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
-    y += bbox[3] + 60
+    # Instruction text
+    instruction = "Set up your JAM Player with the JAM Player Setup App."
+    draw.text(
+        (center_x, y),
+        instruction,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), instruction, font=instructions_font)
+    y += bbox[3] + 20
 
-    # BLE device name (if we have the UUID)
-    device_short = get_device_uuid_short()
-    if device_short:
-        ble_name = f"JAM-PLAYER-{device_short}"
-        ble_text = f"Select this device in the app: {ble_name}"
-        bbox = draw.textbbox((0, 0), ble_text, font=instructions_font)
-        x = center_x - bbox[2] // 2
-        draw.text((x, y), ble_text, font=instructions_font, fill=ACCENT_COLOR)
-        y += bbox[3] + 40
+    # "Scan the QR code to begin."
+    scan_text = "Scan the QR code to begin."
+    draw.text(
+        (center_x, y),
+        scan_text,
+        font=instructions_font,
+        fill=SECONDARY_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), scan_text, font=instructions_font)
+    y += bbox[3] + 40
 
-    # QR Code
+    # QR Code with subtle border/glow effect
     qr_img = generate_qr_code(UNIVERSAL_SETUP_URL, qr_size)
     if qr_img:
         qr_x = center_x - qr_size // 2
         qr_y = y
+
+        # Draw subtle orange border around QR code
+        border_padding = 8
+        border_color = JAM_ORANGE_PRIMARY
+        draw.rectangle(
+            [qr_x - border_padding, qr_y - border_padding,
+             qr_x + qr_size + border_padding, qr_y + qr_size + border_padding],
+            outline=border_color,
+            width=3
+        )
+
         img.paste(qr_img, (qr_x, qr_y))
-        y += qr_size + 40
+        y += qr_size + 50
 
-    # Instructions
-    instructions = [
-        "1. Scan the QR code with your phone",
-        "2. Download the JAM Setup app",
-        "3. Follow the in-app instructions",
-    ]
-
-    for instruction in instructions:
-        bbox = draw.textbbox((0, 0), instruction, font=instructions_font)
-        x = center_x - bbox[2] // 2
-        draw.text((x, y), instruction, font=instructions_font, fill=TEXT_COLOR)
-        y += bbox[3] + 20
-
-    # Bottom elements - using anchor="ms" (middle-baseline) for easy positioning
-    # Layout from bottom: Device UUID at bottom, URL 60px above it
-
-    # URL - draw right after instructions (continues from current y position)
-    y += 40  # spacing after instructions
-    url_text = f"Or visit: {UNIVERSAL_SETUP_URL}"
+    # "Get ready to JAM." tagline
+    tagline = "Get ready to JAM."
     draw.text(
         (center_x, y),
-        url_text,
-        font=url_font,
-        fill=SECONDARY_COLOR,
-        anchor="mm"
+        tagline,
+        font=tagline_font,
+        fill=JAM_ORANGE_SECONDARY,
+        anchor="mt"
     )
 
-    # Device UUID at fixed position at bottom
+    # Device UUID at bottom (small, subtle)
     if device_uuid:
         device_text = f"Device: {device_uuid}"
-        device_font = get_font(FONT_SIZE_DEVICE_ID)
         draw.text(
-            (center_x, height - 80),
+            (center_x, height - 50),
             device_text,
             font=device_font,
             fill=SECONDARY_COLOR,
             anchor="mm"
         )
 
-    # Version indicator in bottom-right corner (temporary - to verify deployment)
-    version_font = get_font(16)
-    draw.text((width - 50, height - 30), "v2", font=version_font, fill=SECONDARY_COLOR)
-
-    return img
-
-
-def create_registered_not_linked_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
-    """
-    Create the screen for REGISTERED_NOT_LINKED mode.
-    Shows "Registered! Link to a screen" message with QR code.
-    """
-    if not HAS_PIL:
-        logger.error("PIL not available for creating display images")
-        return None
-
-    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
-    draw = ImageDraw.Draw(img)
-
-    title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE)
-    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS)
-    url_font = get_font(FONT_SIZE_URL)
-
-    center_x = width // 2
-    qr_size = min(350, height // 4)
-    y = height // 8
-
-    # Title - success message
-    title = "Registered!"
-    bbox = draw.textbbox((0, 0), title, font=title_font)
-    x = center_x - bbox[2] // 2
-    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
-    y += bbox[3] + 40
-
-    # Subtitle
-    subtitle = "Open JAM Setup to link this player to a screen"
-    bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
-    x = center_x - bbox[2] // 2
-    draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
-    y += bbox[3] + 60
-
-    # QR Code
-    qr_img = generate_qr_code(UNIVERSAL_SETUP_URL, qr_size)
-    if qr_img:
-        qr_x = center_x - qr_size // 2
-        qr_y = y
-        img.paste(qr_img, (qr_x, qr_y))
-        y += qr_size + 40
-
-    # Instructions
-    instructions = [
-        "1. Open the JAM Setup app",
-        "2. Go to 'My JAM Players'",
-        "3. Select this device and link it to a screen",
-    ]
-
-    # Calculate device UUID position first (fixed at bottom)
-    device_uuid_y = height - 70  # Reserve space at bottom
-
-    for instruction in instructions:
-        bbox = draw.textbbox((0, 0), instruction, font=instructions_font)
-        # Only draw if it won't overlap with device UUID area
-        if y + bbox[3] < device_uuid_y - 20:
-            x = center_x - bbox[2] // 2
-            draw.text((x, y), instruction, font=instructions_font, fill=TEXT_COLOR)
-            y += bbox[3] + 20
-
-    # Device UUID at bottom (fixed position)
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        device_font = get_font(FONT_SIZE_DEVICE_ID)
-        bbox = draw.textbbox((0, 0), device_text, font=device_font)
-        x = center_x - bbox[2] // 2
-        draw.text((x, device_uuid_y), device_text, font=device_font, fill=SECONDARY_COLOR)
+    # Version indicator in bottom-right corner
+    version_font = get_font(14, bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),  # Very subtle
+        anchor="mm"
+    )
 
     return img
 
@@ -519,43 +618,97 @@ def create_registered_not_linked_screen(width: int, height: int, device_uuid: st
 def create_waiting_for_content_screen(width: int, height: int, screen_id: str = None) -> Image.Image:
     """
     Create the screen for LINKED_WAITING_FOR_CONTENT mode.
-    Shows "Waiting for content" message.
+
+    Modern gradient design showing content download progress message.
     """
     if not HAS_PIL:
         logger.error("PIL not available for creating display images")
         return None
 
-    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
+    # Create gradient background - subtle blue-ish tint for "loading" feel
+    glow_color = (35, 40, 50)  # Subtle cool tint
+    img = create_radial_gradient_background(
+        width, height,
+        color_center=glow_color,
+        color_edge=JAM_DARKER,
+        center_offset_y=0  # Centered glow
+    )
     draw = ImageDraw.Draw(img)
 
+    # Fonts
     title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE)
+    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
+    screen_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
 
     center_x = width // 2
     center_y = height // 2
 
-    # Title
+    # Logo at top
+    logo_height = min(80, height // 10)
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        logo_y = int(height * 0.15)
+        img.paste(logo, (logo_x, logo_y), logo if logo.mode == 'RGBA' else None)
+
+    # Title - centered
     title = "Waiting for content..."
-    bbox = draw.textbbox((0, 0), title, font=title_font)
-    x = center_x - bbox[2] // 2
-    y = center_y - bbox[3] - 20
-    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
+    draw.text(
+        (center_x, center_y - 40),
+        title,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mm"
+    )
 
     # Subtitle
     subtitle = "Content is being downloaded. This may take a few minutes."
-    bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
-    x = center_x - bbox[2] // 2
-    y = center_y + 20
-    draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
+    draw.text(
+        (center_x, center_y + 40),
+        subtitle,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mm"
+    )
+
+    # Animated-looking dots (static, but gives impression of activity)
+    # Draw three dots with varying opacity to suggest animation
+    dot_y = center_y + 100
+    dot_spacing = 30
+    dot_radius = 8
+    for i, alpha in enumerate([255, 180, 100]):
+        dot_x = center_x + (i - 1) * dot_spacing
+        dot_color = (
+            int(JAM_ORANGE_SECONDARY[0] * alpha / 255),
+            int(JAM_ORANGE_SECONDARY[1] * alpha / 255),
+            int(JAM_ORANGE_SECONDARY[2] * alpha / 255)
+        )
+        draw.ellipse(
+            [dot_x - dot_radius, dot_y - dot_radius,
+             dot_x + dot_radius, dot_y + dot_radius],
+            fill=dot_color
+        )
 
     # Screen ID at bottom if available
     if screen_id:
-        screen_text = f"Screen ID: {screen_id}"
-        screen_font = get_font(FONT_SIZE_DEVICE_ID)
-        bbox = draw.textbbox((0, 0), screen_text, font=screen_font)
-        x = center_x - bbox[2] // 2
-        y = height - bbox[3] - 30
-        draw.text((x, y), screen_text, font=screen_font, fill=SECONDARY_COLOR)
+        screen_text = f"Screen: {screen_id}"
+        draw.text(
+            (center_x, height - 50),
+            screen_text,
+            font=screen_font,
+            fill=SECONDARY_COLOR,
+            anchor="mm"
+        )
+
+    # Version indicator
+    version_font = get_font(14, bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),
+        anchor="mm"
+    )
 
     return img
 
@@ -912,14 +1065,15 @@ class JamPlayerDisplayManager:
     def determine_display_mode(self) -> DisplayMode:
         """Determine which display mode we should be in based on current state."""
 
-        # Check registration status
+        # Check registration status - if not registered OR not linked to a screen,
+        # show the setup/unregistered screen
         if not is_device_registered():
             return DisplayMode.UNREGISTERED
 
-        # Check if linked to a screen
+        # Check if linked to a screen - if not linked, still show setup screen
         screen_id = get_screen_id()
         if not screen_id:
-            return DisplayMode.REGISTERED_NOT_LINKED
+            return DisplayMode.UNREGISTERED
 
         # Check if content is available
         if not self._has_content():
@@ -1019,34 +1173,19 @@ class JamPlayerDisplayManager:
         device_uuid = get_device_uuid()
 
         if new_mode == DisplayMode.UNREGISTERED:
-            logger.info("Showing UNREGISTERED screen (welcome/QR code)")
+            logger.info("Showing UNREGISTERED screen (setup/QR code)")
             img = create_unregistered_screen(
                 self.screen_width, self.screen_height, device_uuid
             )
             self.feh_process = display_image_with_feh(
                 img, "jam_display_unregistered",
-                fallback_message="Welcome to JAM Player\n\nDownload JAM Setup app\nto configure this device"
+                fallback_message="JAM Player\n\nSet up with JAM Player Setup App\nScan QR code to begin"
             )
             if self.feh_process:
                 logger.info(f"feh process started: PID {self.feh_process.pid}")
             else:
                 logger.error("Failed to start feh for UNREGISTERED screen")
             sd_notifier.notify("STATUS=Showing setup screen")
-
-        elif new_mode == DisplayMode.REGISTERED_NOT_LINKED:
-            logger.info("Showing REGISTERED_NOT_LINKED screen")
-            img = create_registered_not_linked_screen(
-                self.screen_width, self.screen_height, device_uuid
-            )
-            self.feh_process = display_image_with_feh(
-                img, "jam_display_not_linked",
-                fallback_message="Registered!\n\nOpen JAM Setup app\nto link this player to a screen"
-            )
-            if self.feh_process:
-                logger.info(f"feh process started: PID {self.feh_process.pid}")
-            else:
-                logger.error("Failed to start feh for REGISTERED_NOT_LINKED screen")
-            sd_notifier.notify("STATUS=Registered - waiting for screen link")
 
         elif new_mode == DisplayMode.LINKED_WAITING_FOR_CONTENT:
             logger.info("Showing LINKED_WAITING_FOR_CONTENT screen")
@@ -1274,27 +1413,61 @@ class JamPlayerDisplayManager:
             self.mpv.stop_mpv()
             self.mpv = None
 
-        # Create and show a message
+        # Create and show a message with gradient background
         if HAS_PIL:
-            img = Image.new('RGB', (self.screen_width, self.screen_height), BACKGROUND_COLOR)
+            # Subtle purple-ish tint for "off hours" feel
+            glow_color = (40, 35, 50)
+            img = create_radial_gradient_background(
+                self.screen_width, self.screen_height,
+                color_center=glow_color,
+                color_edge=JAM_DARKER,
+                center_offset_y=0
+            )
             draw = ImageDraw.Draw(img)
+
             title_font = get_font(FONT_SIZE_TITLE)
-            subtitle_font = get_font(FONT_SIZE_SUBTITLE)
+            subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
 
             center_x = self.screen_width // 2
             center_y = self.screen_height // 2
 
-            title = "No Content Scheduled"
-            bbox = draw.textbbox((0, 0), title, font=title_font)
-            x = center_x - bbox[2] // 2
-            y = center_y - bbox[3] - 20
-            draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
+            # Logo at top
+            logo_height = min(80, self.screen_height // 10)
+            logo = load_and_scale_logo(logo_height)
+            if logo:
+                logo_x = center_x - logo.width // 2
+                logo_y = int(self.screen_height * 0.15)
+                img.paste(logo, (logo_x, logo_y), logo if logo.mode == 'RGBA' else None)
 
+            # Title
+            title = "No Content Scheduled"
+            draw.text(
+                (center_x, center_y - 30),
+                title,
+                font=title_font,
+                fill=JAM_ORANGE_PRIMARY,
+                anchor="mm"
+            )
+
+            # Subtitle
             subtitle = "Content will appear during scheduled hours."
-            bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
-            x = center_x - bbox[2] // 2
-            y = center_y + 20
-            draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
+            draw.text(
+                (center_x, center_y + 40),
+                subtitle,
+                font=subtitle_font,
+                fill=TEXT_COLOR,
+                anchor="mm"
+            )
+
+            # Version indicator
+            version_font = get_font(14, bold=False)
+            draw.text(
+                (self.screen_width - 30, self.screen_height - 25),
+                "v2",
+                font=version_font,
+                fill=(80, 80, 80),
+                anchor="mm"
+            )
         else:
             img = None
 
