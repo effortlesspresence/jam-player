@@ -433,9 +433,8 @@ def get_latest_version(branch: str) -> Optional[str]:
 # =============================================================================
 
 # Display configuration
-BACKGROUND_COLOR = (20, 20, 30)  # Dark blue-grey
 TEXT_COLOR = (255, 255, 255)
-ACCENT_COLOR = (0, 180, 255)  # JAM blue
+JAM_ORANGE = (255, 107, 53)  # #FF6B35
 
 # Global to track if we're showing the update screen
 _update_display_process = None
@@ -451,58 +450,135 @@ def get_fb_size() -> tuple:
         return 1920, 1080
 
 
-def get_font(size: int):
+def get_font(size: int, bold: bool = True):
     """Get a font, falling back to default if needed."""
     if not HAS_PIL:
         return None
 
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ]
+    if bold:
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    else:
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
     for path in font_paths:
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
+def create_mesh_gradient_background(width: int, height: int) -> Image.Image:
+    """
+    Create a vibrant mesh gradient background for the update screen.
+    Uses teal/cyan/blue colors to indicate "updating" state.
+    """
+    import math
+
+    img = Image.new('RGB', (width, height))
+
+    # Color anchor points: (x_ratio, y_ratio, (r, g, b))
+    # Teal/cyan theme for "updating" feel
+    color_points = [
+        # Deep blue top
+        (0.5, 0.0, (40, 60, 160)),
+        # Teal left
+        (0.0, 0.4, (30, 150, 160)),
+        # Cyan center glow
+        (0.5, 0.5, (50, 200, 220)),
+        # Purple right
+        (1.0, 0.3, (120, 60, 180)),
+        # Blue bottom-right
+        (1.0, 1.0, (40, 100, 200)),
+        # Teal bottom-left
+        (0.0, 1.0, (30, 140, 150)),
+    ]
+
+    # Process in chunks for speed
+    step = 2
+
+    draw = ImageDraw.Draw(img)
+
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            # Normalize coordinates
+            nx = x / width
+            ny = y / height
+
+            # Calculate weighted color based on distance to each anchor point
+            total_weight = 0.0
+            r_sum, g_sum, b_sum = 0.0, 0.0, 0.0
+
+            for px, py, color in color_points:
+                dx = nx - px
+                dy = ny - py
+                dist = math.sqrt(dx * dx + dy * dy)
+                weight = 1.0 / (dist * dist * 4 + 0.01)
+
+                r_sum += color[0] * weight
+                g_sum += color[1] * weight
+                b_sum += color[2] * weight
+                total_weight += weight
+
+            r = int(min(255, max(0, r_sum / total_weight)))
+            g = int(min(255, max(0, g_sum / total_weight)))
+            b = int(min(255, max(0, b_sum / total_weight)))
+
+            draw.rectangle([x, y, x + step, y + step], fill=(r, g, b))
+
+    return img
+
+
 def create_updating_screen(width: int, height: int) -> Optional[Image.Image]:
-    """Create the 'Updating...' screen image."""
+    """Create the 'Updating...' screen image with vibrant gradient."""
     if not HAS_PIL:
         logger.warning("PIL not available for creating update screen")
         return None
 
-    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
+    # Create vibrant gradient background
+    img = create_mesh_gradient_background(width, height)
     draw = ImageDraw.Draw(img)
 
     title_font = get_font(72)
-    subtitle_font = get_font(36)
+    subtitle_font = get_font(36, bold=False)
+    warning_font = get_font(28, bold=False)
 
     center_x = width // 2
     center_y = height // 2
 
     # Title
     title = "Updating JAM Player..."
-    bbox = draw.textbbox((0, 0), title, font=title_font)
-    x = center_x - bbox[2] // 2
-    y = center_y - bbox[3] - 30
-    draw.text((x, y), title, font=title_font, fill=ACCENT_COLOR)
+    draw.text(
+        (center_x, center_y - 50),
+        title,
+        font=title_font,
+        fill=TEXT_COLOR,
+        anchor="mm"
+    )
 
     # Subtitle
     subtitle = "Please wait. This may take a few minutes."
-    bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
-    x = center_x - bbox[2] // 2
-    y = center_y + 30
-    draw.text((x, y), subtitle, font=subtitle_font, fill=TEXT_COLOR)
+    draw.text(
+        (center_x, center_y + 30),
+        subtitle,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mm"
+    )
 
-    # Warning
+    # Warning - use orange instead of red for better visibility on gradient
     warning = "Do not disconnect power."
-    warning_font = get_font(28)
-    bbox = draw.textbbox((0, 0), warning, font=warning_font)
-    x = center_x - bbox[2] // 2
-    y = center_y + 100
-    draw.text((x, y), warning, font=warning_font, fill=(255, 100, 100))  # Red warning
+    draw.text(
+        (center_x, center_y + 100),
+        warning,
+        font=warning_font,
+        fill=JAM_ORANGE,
+        anchor="mm"
+    )
 
     return img
 
