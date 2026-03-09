@@ -58,6 +58,7 @@ which is Linux's inter-process communication (IPC) system. Our service:
 
 import sys
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -1389,6 +1390,37 @@ def find_adapter(bus) -> Optional[str]:
         return None
 
 
+def reset_bluetooth_adapter(adapter_path: str):
+    """
+    Reset the Bluetooth adapter to clear any stale state.
+
+    This is important when swapping SD cards - the Bluetooth adapter
+    may retain state from the previous image, causing registration
+    conflicts. Power cycling the adapter clears this.
+    """
+    logger.info("Resetting Bluetooth adapter to clear stale state...")
+
+    try:
+        # Use hciconfig to reset the adapter (more reliable than D-Bus for reset)
+        # Extract adapter name from path (e.g., /org/bluez/hci0 -> hci0)
+        adapter_name = adapter_path.split('/')[-1]
+
+        # Power down the adapter
+        subprocess.run(['hciconfig', adapter_name, 'down'],
+                       capture_output=True, timeout=5)
+        time.sleep(0.5)
+
+        # Power it back up
+        subprocess.run(['hciconfig', adapter_name, 'up'],
+                       capture_output=True, timeout=5)
+        time.sleep(0.5)
+
+        logger.info(f"Bluetooth adapter {adapter_name} reset complete")
+
+    except Exception as e:
+        logger.warning(f"Could not reset adapter (non-fatal): {e}")
+
+
 def configure_adapter(bus, adapter_path: str):
     """
     Configure the Bluetooth adapter for our use case.
@@ -1500,6 +1532,9 @@ def main():
         sys.exit(1)
 
     logger.info(f"Using Bluetooth adapter: {adapter_path}")
+
+    # Reset adapter to clear any stale state from previous SD card
+    reset_bluetooth_adapter(adapter_path)
 
     # Configure adapter (disable pairing popup, etc.)
     configure_adapter(bus, adapter_path)

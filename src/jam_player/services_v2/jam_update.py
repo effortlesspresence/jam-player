@@ -1052,6 +1052,67 @@ def install_chrony_peering_config():
         logger.warning(f"  Failed to install chrony peering config: {e}")
 
 
+def install_boot_config():
+    """
+    Install/update HDMI and display settings in the Raspberry Pi boot config.
+
+    This ensures proper 4K output and HDMI detection. Settings include:
+    - hdmi_enable_4kp60=1: Enable 4K at 60Hz
+    - hdmi_force_hotplug=1: Don't wait for display detection
+    - disable_overscan=1: Remove black borders
+    - hdmi_group=0: Auto-detect resolution from EDID
+
+    The config is appended to /boot/firmware/config.txt if the marker
+    isn't already present. Changes require a reboot to take effect.
+    """
+    logger.info("Checking boot config for HDMI settings...")
+
+    boot_config_src = CONFIG_SRC / 'boot-config.txt'
+
+    # Try both possible locations (newer and older Pi OS)
+    boot_config_paths = [
+        Path('/boot/firmware/config.txt'),
+        Path('/boot/config.txt'),
+    ]
+
+    boot_config_dest = None
+    for path in boot_config_paths:
+        if path.exists():
+            boot_config_dest = path
+            break
+
+    if not boot_config_dest:
+        logger.warning("Could not find boot config.txt - skipping HDMI config")
+        return
+
+    if not boot_config_src.exists():
+        logger.warning(f"Boot config source not found: {boot_config_src}")
+        return
+
+    try:
+        # Check if our settings are already present
+        marker = "# JAM Player HDMI/Display Configuration"
+        current_config = boot_config_dest.read_text()
+
+        if marker in current_config:
+            logger.info("  Boot config already has JAM HDMI settings")
+            return
+
+        # Read our settings
+        jam_settings = boot_config_src.read_text()
+
+        # Append to boot config
+        with open(boot_config_dest, 'a') as f:
+            f.write("\n")
+            f.write(jam_settings)
+
+        logger.info(f"  Appended HDMI settings to {boot_config_dest}")
+        logger.info("  NOTE: Reboot required for boot config changes to take effect")
+
+    except Exception as e:
+        logger.warning(f"  Failed to install boot config: {e}")
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
@@ -1275,6 +1336,9 @@ def main():
 
     # Install chrony peering config for offline clock sync
     install_chrony_peering_config()
+
+    # Install boot config for proper 4K/HDMI output
+    install_boot_config()
 
     # Restart services to pick up changes
     restart_services()

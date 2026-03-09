@@ -1,0 +1,22 @@
+# JAM Player HDMI/Display Configuration
+# These settings are appended to /boot/firmware/config.txt
+
+# Enable 4K output at 60Hz (Raspberry Pi 4/5)
+hdmi_enable_4kp60=1
+
+# Force HDMI hotplug detection (don't wait for display)
+hdmi_force_hotplug=1
+
+# Disable overscan (removes black borders)
+disable_overscan=1
+
+# Use EDID to auto-detect the best resolution
+# Group 0 = auto-detect from EDID
+hdmi_group=0
+
+# Boost HDMI signal for longer cables or problematic displays
+config_hdmi_boost=4
+
+# Force HDMI mode even if no display detected at boot
+# This prevents fallback to composite/low-res
+hdmi_blanking=1
