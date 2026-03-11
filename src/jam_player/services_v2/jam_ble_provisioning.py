@@ -146,6 +146,10 @@ GATT_SERVICE_IFACE = 'org.bluez.GattService1'
 GATT_CHRC_IFACE = 'org.bluez.GattCharacteristic1'
 LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
 
+# BlueZ Agent interfaces - for handling pairing without popups
+AGENT_MANAGER_IFACE = 'org.bluez.AgentManager1'
+AGENT_IFACE = 'org.bluez.Agent1'
+
 # jam-ble-state-manager D-Bus service - we subscribe to connectivity signals
 # to update BLE advertisement status in real-time
 JAM_BLE_STATE_SERVICE = 'com.jam.BLEStateManager'
@@ -206,6 +210,138 @@ class NotSupportedException(dbus.exceptions.DBusException):
 class NotPermittedException(dbus.exceptions.DBusException):
     """Raised when an operation is not permitted."""
     _dbus_error_name = 'org.bluez.Error.NotPermitted'
+
+
+# ============================================================================
+# NoInputNoOutput Pairing Agent
+# ============================================================================
+
+class NoInputNoOutputAgent(dbus.service.Object):
+    """
+    BlueZ pairing agent that uses "NoInputNoOutput" capability.
+
+    This agent automatically accepts all pairing requests without user
+    interaction. This is appropriate for headless devices that:
+    1. Don't have a display for showing PINs
+    2. Don't have input for entering PINs
+    3. Want to allow connections without pairing popups
+
+    By registering this agent with BlueZ as the default agent, we override
+    any desktop bluetooth agent that would show pairing confirmation dialogs.
+
+    Security note: This uses "JustWorks" pairing which provides encryption
+    but no MITM protection. For a provisioning service where we're just
+    configuring WiFi, this is acceptable.
+    """
+
+    AGENT_PATH = '/org/bluez/jam/agent'
+
+    def __init__(self, bus):
+        """
+        Initialize and register the agent with BlueZ.
+
+        Args:
+            bus: D-Bus system bus connection
+        """
+        self.bus = bus
+        dbus.service.Object.__init__(self, bus, self.AGENT_PATH)
+
+    def register(self):
+        """Register this agent as the default agent with BlueZ."""
+        try:
+            agent_manager = dbus.Interface(
+                self.bus.get_object(BLUEZ_SERVICE_NAME, '/org/bluez'),
+                AGENT_MANAGER_IFACE
+            )
+
+            # Unregister any existing agent at our path first
+            try:
+                agent_manager.UnregisterAgent(self.AGENT_PATH)
+            except dbus.exceptions.DBusException:
+                pass  # Agent wasn't registered, that's fine
+
+            # Register our agent with NoInputNoOutput capability
+            agent_manager.RegisterAgent(self.AGENT_PATH, 'NoInputNoOutput')
+            logger.info("Registered NoInputNoOutput pairing agent")
+
+            # Request to be the default agent (override desktop agents)
+            agent_manager.RequestDefaultAgent(self.AGENT_PATH)
+            logger.info("Set as default pairing agent (no pairing popups)")
+
+        except dbus.exceptions.DBusException as e:
+            logger.warning(f"Failed to register pairing agent: {e}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='', out_signature='')
+    def Release(self):
+        """Called when BlueZ unregisters the agent."""
+        logger.info("Pairing agent released")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='os', out_signature='')
+    def AuthorizeService(self, device, uuid):
+        """
+        Authorize a service connection without user interaction.
+
+        This is called when a device wants to use a service that requires
+        authorization. We auto-authorize all services.
+        """
+        logger.info(f"Auto-authorizing service {uuid} for device {device}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='')
+    def RequestAuthorization(self, device):
+        """
+        Authorize a pairing request without user interaction.
+
+        This is called when a device wants to pair. We auto-accept.
+        """
+        logger.info(f"Auto-accepting pairing request from {device}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='u')
+    def RequestPasskey(self, device):
+        """
+        Return a passkey for pairing.
+
+        With NoInputNoOutput capability, this shouldn't be called,
+        but we return 0 just in case.
+        """
+        logger.info(f"Passkey requested for {device} - returning 0")
+        return dbus.UInt32(0)
+
+    @dbus.service.method(AGENT_IFACE, in_signature='ouq', out_signature='')
+    def DisplayPasskey(self, device, passkey, entered):
+        """Display passkey - no-op for headless device."""
+        logger.debug(f"DisplayPasskey called: {device}, {passkey}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='os', out_signature='')
+    def DisplayPinCode(self, device, pincode):
+        """Display PIN code - no-op for headless device."""
+        logger.debug(f"DisplayPinCode called: {device}, {pincode}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='ou', out_signature='')
+    def RequestConfirmation(self, device, passkey):
+        """
+        Confirm a passkey match.
+
+        This is what triggers the "confirm pairing" popup. By implementing
+        this method and NOT raising Rejected, we auto-confirm.
+        """
+        logger.info(f"Auto-confirming passkey {passkey} for {device}")
+        # Simply returning (not raising) means we accept
+
+    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='s')
+    def RequestPinCode(self, device):
+        """
+        Return a PIN code for pairing.
+
+        With NoInputNoOutput capability, this shouldn't be called,
+        but we return "0000" just in case.
+        """
+        logger.info(f"PIN code requested for {device} - returning 0000")
+        return '0000'
+
+    @dbus.service.method(AGENT_IFACE, in_signature='', out_signature='')
+    def Cancel(self):
+        """Called when pairing is cancelled."""
+        logger.info("Pairing cancelled")
 
 
 # ============================================================================
@@ -1687,6 +1823,11 @@ def main():
 
     # Configure adapter (disable pairing popup, etc.)
     configure_adapter(bus, adapter_path)
+
+    # Register NoInputNoOutput agent to prevent pairing popups
+    # This must be done BEFORE accepting any connections
+    agent = NoInputNoOutputAgent(bus)
+    agent.register()
 
     # Generate our BLE device name (JAM-PLAYER-XXXXX)
     device_name = get_device_name()
