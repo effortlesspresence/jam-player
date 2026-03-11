@@ -31,7 +31,7 @@ back to public DNS servers (1.1.1.1, 8.8.8.8).
 These devices are often deployed in restaurants with poor WiFi. To avoid
 the BLE provisioning network constantly appearing/disappearing:
 
-- Going OFFLINE requires 5 consecutive failed checks (~50-60 seconds)
+- Going OFFLINE requires 6 consecutive failed checks (~50-60 seconds)
 - Going ONLINE requires just 1 successful check (immediate response)
 
 This asymmetry prevents BLE from activating during brief WiFi drops while
@@ -112,12 +112,12 @@ NM_STATE_CONNECTED_LOCAL = 50
 
 # Internet connectivity check settings
 # These are tuned for restaurant environments with flaky WiFi:
-# - 5 failures required before declaring offline
-# - 30 second interval when stable = ~2.5 minutes of no connectivity before BLE starts
+# - 6 failures required before declaring offline
+# - 10 second interval when stable = ~1 minute of no connectivity before BLE starts
 # - This prevents BLE from activating during brief WiFi drops
 # - Longer interval reduces SD card writes and log volume
-INTERNET_CHECK_FAILURES_FOR_OFFLINE = 5
-INTERNET_CHECK_INTERVAL_SECONDS = 30
+INTERNET_CHECK_FAILURES_FOR_OFFLINE = 6
+INTERNET_CHECK_INTERVAL_SECONDS = 10
 
 # Services we control
 BLE_PROVISIONING_SERVICE = 'jam-ble-provisioning.service'
@@ -558,7 +558,7 @@ class BLEStateManager:
 
         NOTE: We use check_internet_connectivity() directly here instead of
         the monitor's check() method because:
-        1. The monitor uses hysteresis (requires 5 failures to go offline)
+        1. The monitor uses hysteresis (requires 6 failures to go offline)
         2. The monitor starts with _is_online=True by default
         3. At startup, we need the ACTUAL connectivity state, not hysteresis
         """
