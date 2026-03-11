@@ -146,6 +146,12 @@ GATT_SERVICE_IFACE = 'org.bluez.GattService1'
 GATT_CHRC_IFACE = 'org.bluez.GattCharacteristic1'
 LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
 
+# jam-ble-state-manager D-Bus service - we subscribe to connectivity signals
+# to update BLE advertisement status in real-time
+JAM_BLE_STATE_SERVICE = 'com.jam.BLEStateManager'
+JAM_BLE_STATE_PATH = '/com/jam/BLEStateManager'
+JAM_BLE_STATE_INTERFACE = 'com.jam.BLEStateManager'
+
 # ============================================================================
 # Custom UUIDs for JAM Provisioning
 # ============================================================================
@@ -291,6 +297,31 @@ class Advertisement(dbus.service.Object):
         if interface != LE_ADVERTISEMENT_IFACE:
             raise InvalidArgsException()
         return self.get_properties()[LE_ADVERTISEMENT_IFACE]
+
+    def update_status_flags(self, new_flags: int):
+        """
+        Update the status flags in the advertisement.
+
+        This allows the advertisement to reflect current connectivity/registration
+        state without requiring a service restart. The advertisement must be
+        re-registered with BlueZ for the changes to take effect in broadcasts.
+
+        Args:
+            new_flags: New status flags byte (bits: isConnected, isAnnounced, isRegistered)
+        """
+        if self.status_flags == new_flags:
+            logger.debug(f"Status flags unchanged ({new_flags}), skipping update")
+            return False
+
+        old_flags = self.status_flags
+        self.status_flags = new_flags
+        logger.info(
+            f"Updated advertisement status flags: {old_flags} -> {new_flags} "
+            f"(connected={bool(new_flags & 0x01)}, "
+            f"announced={bool(new_flags & 0x02)}, "
+            f"registered={bool(new_flags & 0x04)})"
+        )
+        return True
 
     @dbus.service.method(LE_ADVERTISEMENT_IFACE, in_signature='', out_signature='')
     def Release(self):
@@ -1493,6 +1524,124 @@ def register_application(bus, adapter_path: str, application):
     )
 
 
+def reregister_advertisement(bus, adapter_path: str, advertisement, reason: str = ""):
+    """
+    Re-register the advertisement with BlueZ.
+
+    This is needed when:
+    1. Early boot timing issues (BlueZ reports success but doesn't broadcast)
+    2. Advertisement status flags change (connectivity/registration state)
+
+    Args:
+        bus: D-Bus system bus connection
+        adapter_path: Path to the Bluetooth adapter
+        advertisement: The Advertisement object to re-register
+        reason: Human-readable reason for re-registration (for logging)
+    """
+    reason_str = f" ({reason})" if reason else ""
+    logger.info(f"Re-registering advertisement{reason_str}...")
+
+    try:
+        ad_manager = dbus.Interface(
+            bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+            LE_ADVERTISING_MANAGER_IFACE
+        )
+
+        # Unregister first
+        try:
+            ad_manager.UnregisterAdvertisement(advertisement.get_path())
+            logger.debug("Unregistered old advertisement")
+        except dbus.exceptions.DBusException:
+            pass  # May not be registered, that's fine
+
+        time.sleep(0.3)
+
+        # Re-register
+        register_advertisement(bus, adapter_path, advertisement)
+        logger.info(f"Re-registered advertisement successfully{reason_str}")
+
+    except Exception as e:
+        logger.warning(f"Re-registration failed (non-fatal): {e}")
+
+
+
+
+# ============================================================================
+# Connectivity State Handler
+# ============================================================================
+
+class ConnectivityStateHandler:
+    """
+    Handles connectivity state changes from jam-ble-state-manager.
+
+    Subscribes to D-Bus signals and updates the BLE advertisement when
+    connectivity state changes. This ensures the mobile app sees accurate
+    device status in the scan list without requiring service restart.
+    """
+
+    def __init__(self, bus, advertisement, adapter_path: str):
+        """
+        Initialize the handler and subscribe to connectivity signals.
+
+        Args:
+            bus: D-Bus system bus connection
+            advertisement: The Advertisement object to update
+            adapter_path: Path to the Bluetooth adapter (for re-registration)
+        """
+        self.bus = bus
+        self.advertisement = advertisement
+        self.adapter_path = adapter_path
+        self._pending_reregister = None  # GLib timeout for debounced re-registration
+
+        # Subscribe to connectivity state changes from jam-ble-state-manager
+        bus.add_signal_receiver(
+            self._on_connectivity_changed,
+            signal_name='ConnectivityStateChanged',
+            dbus_interface=JAM_BLE_STATE_INTERFACE,
+            bus_name=JAM_BLE_STATE_SERVICE,
+            path=JAM_BLE_STATE_PATH
+        )
+        logger.info("Subscribed to jam-ble-state-manager connectivity signals")
+
+    def _on_connectivity_changed(self, is_online: bool, method: str):
+        """
+        Handle connectivity state change signal.
+
+        Args:
+            is_online: Whether internet connectivity is verified
+            method: Which connectivity check succeeded
+        """
+        logger.info(f"Received connectivity change: is_online={is_online}, method={method}")
+
+        # Calculate new status flags
+        new_flags = get_status_flags()
+
+        # Update advertisement if flags changed
+        if self.advertisement.update_status_flags(new_flags):
+            # Debounce re-registration to avoid rapid BlueZ calls
+            if self._pending_reregister is not None:
+                GLib.source_remove(self._pending_reregister)
+
+            self._pending_reregister = GLib.timeout_add(
+                500,  # 500ms debounce
+                self._reregister_advertisement
+            )
+
+    def _reregister_advertisement(self) -> bool:
+        """
+        Re-register the advertisement with BlueZ to broadcast updated status.
+
+        Returns:
+            False (to stop the GLib timeout from repeating)
+        """
+        self._pending_reregister = None
+        reregister_advertisement(
+            self.bus,
+            self.adapter_path,
+            self.advertisement,
+            reason="status flags changed"
+        )
+        return False
 
 
 # ============================================================================
@@ -1573,35 +1722,20 @@ def main():
         logger.error(f"Failed to register with BlueZ: {e}")
         sys.exit(1)
 
+    # Setup handler for connectivity state changes from jam-ble-state-manager
+    # This allows real-time BLE advertisement updates when connectivity changes
+    connectivity_handler = ConnectivityStateHandler(bus, advertisement, adapter_path)
+
     # Schedule a re-registration of the advertisement after a delay.
     # BlueZ sometimes reports "registered successfully" but doesn't actually
     # broadcast until a re-registration occurs. This is a workaround for
     # early-boot timing issues with the Bluetooth adapter.
-    def reregister_advertisement():
-        logger.info("Re-registering advertisement to ensure it's broadcasting...")
-        try:
-            # Unregister first
-            ad_manager = dbus.Interface(
-                bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
-                LE_ADVERTISING_MANAGER_IFACE
-            )
-            try:
-                ad_manager.UnregisterAdvertisement(advertisement.get_path())
-                logger.info("Unregistered old advertisement")
-            except dbus.exceptions.DBusException:
-                pass  # May not be registered, that's fine
-
-            time.sleep(0.5)
-
-            # Re-register
-            register_advertisement(bus, adapter_path, advertisement)
-            logger.info("Re-registered advertisement successfully")
-        except Exception as e:
-            logger.warning(f"Re-registration failed (non-fatal): {e}")
+    def initial_reregister():
+        reregister_advertisement(bus, adapter_path, advertisement, reason="early boot workaround")
         return False  # Don't repeat
 
     # Re-register after 5 seconds
-    GLib.timeout_add_seconds(5, reregister_advertisement)
+    GLib.timeout_add_seconds(5, initial_reregister)
 
     # Setup systemd watchdog pinging
     setup_glib_watchdog(WATCHDOG_INTERVAL)

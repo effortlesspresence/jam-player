@@ -62,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import dbus
 import dbus.mainloop.glib
+import dbus.service
 from gi.repository import GLib
 
 from common.system import manage_service
@@ -139,6 +140,53 @@ WATCHDOG_INTERVAL = 30
 # Prevents rapid start/stop cycles during brief disconnections
 DEBOUNCE_DELAY = 3
 
+# D-Bus service for connectivity state notifications
+# jam-ble-provisioning listens for these signals to update BLE advertisement
+JAM_BLE_STATE_SERVICE = 'com.jam.BLEStateManager'
+JAM_BLE_STATE_PATH = '/com/jam/BLEStateManager'
+JAM_BLE_STATE_INTERFACE = 'com.jam.BLEStateManager'
+
+
+# ============================================================================
+# D-Bus Signal Emitter
+# ============================================================================
+
+class ConnectivitySignalEmitter(dbus.service.Object):
+    """
+    D-Bus service that emits signals when connectivity state changes.
+
+    jam-ble-provisioning subscribes to these signals to update the BLE
+    advertisement manufacturer data in real-time, ensuring the mobile app
+    sees accurate status in the scan list without requiring a service restart.
+
+    Signal: ConnectivityStateChanged(is_online: bool, method: str)
+        - is_online: True if internet connectivity verified, False if offline
+        - method: Which check succeeded ("jam_backend", "cloudflare_dns", etc.)
+    """
+
+    def __init__(self, bus):
+        """
+        Initialize the signal emitter and register on D-Bus.
+
+        Args:
+            bus: D-Bus system bus connection
+        """
+        self.bus_name = dbus.service.BusName(JAM_BLE_STATE_SERVICE, bus)
+        dbus.service.Object.__init__(self, bus, JAM_BLE_STATE_PATH)
+        logger.info(f"Registered D-Bus service: {JAM_BLE_STATE_SERVICE}")
+
+    @dbus.service.signal(JAM_BLE_STATE_INTERFACE, signature='bs')
+    def ConnectivityStateChanged(self, is_online: bool, method: str):
+        """
+        D-Bus signal emitted when connectivity state changes.
+
+        Args:
+            is_online: Whether internet connectivity is verified
+            method: Which connectivity check succeeded (for logging/debugging)
+        """
+        logger.info(f"Emitting ConnectivityStateChanged signal: is_online={is_online}, method={method}")
+        pass  # Signal body is empty - dbus.service.signal decorator handles emission
+
 
 # ============================================================================
 # BLE State Manager
@@ -169,6 +217,10 @@ class BLEStateManager:
         self._pending_action = None  # GLib timeout ID for debounced action
         self._last_connected_state = None  # Track state to avoid redundant actions
         self._internet_check_timer = None  # GLib timeout for periodic checks
+
+        # Initialize D-Bus signal emitter for notifying jam-ble-provisioning
+        # of connectivity changes in real-time
+        self._signal_emitter = ConnectivitySignalEmitter(bus)
 
         # Initialize internet connectivity monitor with conservative settings
         # for flaky restaurant WiFi environments
@@ -509,6 +561,9 @@ class BLEStateManager:
         Also maintains the INTERNET_VERIFIED_FLAG which jam-ble-provisioning
         reads for fast BLE responses (checking file exists vs slow HTTP check).
 
+        Emits D-Bus signal so jam-ble-provisioning can update BLE advertisement
+        in real-time without requiring service restart.
+
         Args:
             is_online: Whether internet connectivity is verified
             method: Which connectivity check succeeded (for logging)
@@ -546,7 +601,28 @@ class BLEStateManager:
 
             logger.info("Internet offline - starting BLE provisioning")
 
+        # Emit D-Bus signal so jam-ble-provisioning can update BLE advertisement
+        # This ensures the mobile app sees accurate status in scan list without
+        # requiring jam-ble-provisioning service restart
+        try:
+            self._signal_emitter.ConnectivityStateChanged(is_online, method)
+        except Exception as e:
+            logger.warning(f"Failed to emit connectivity state signal: {e}")
+
         manage_service(BLE_PROVISIONING_SERVICE, should_run=should_run)
+
+    def _deferred_initial_check(self) -> bool:
+        """
+        Wrapper to run initial state check after mainloop starts.
+
+        This ensures D-Bus signal listeners have had a chance to set up
+        before we emit the initial ConnectivityStateChanged signal.
+
+        Returns:
+            False (to run only once via GLib.idle_add)
+        """
+        self.check_initial_state()
+        return False
 
     def check_initial_state(self):
         """
@@ -624,9 +700,10 @@ class BLEStateManager:
         # Setup signal handler for NM state changes
         self.setup_signal_handler()
 
-        # Check and apply initial state
-        # This may take several seconds for connectivity checks, but service is already "ready"
-        self.check_initial_state()
+        # Defer initial state check to run AFTER mainloop starts.
+        # This ensures any D-Bus signal listeners (like jam-ble-provisioning) have
+        # a chance to set up before we emit the initial ConnectivityStateChanged signal.
+        GLib.idle_add(self._deferred_initial_check)
 
         # Setup periodic internet connectivity checks
         # This catches cases where NM thinks we're connected but internet is down
