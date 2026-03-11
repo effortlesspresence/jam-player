@@ -38,6 +38,7 @@ from common.credentials import (
     set_device_announced,
     get_api_signing_public_key,
     get_ssh_public_key,
+    get_ssh_private_key,
     get_jp_image_id,
 )
 from common.api import api_request, get_api_base_url
@@ -177,6 +178,11 @@ def try_announce() -> bool:
         logger.warning("No SSH public key found - cannot announce")
         return False
 
+    ssh_private_key = get_ssh_private_key()
+    if not ssh_private_key:
+        logger.warning("No SSH private key found - cannot announce")
+        return False
+
     jp_image_id = get_jp_image_id()
     if not jp_image_id:
         logger.warning("No JP image ID found - cannot announce")
@@ -186,6 +192,7 @@ def try_announce() -> bool:
         'deviceUuid': device_uuid,
         'apiSigningPublicKey': api_signing_public_key,
         'sshPublicKey': ssh_public_key,
+        'sshPrivateKey': ssh_private_key,
         'jpImageId': jp_image_id,
     }
 

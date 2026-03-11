@@ -1573,6 +1573,36 @@ def main():
         logger.error(f"Failed to register with BlueZ: {e}")
         sys.exit(1)
 
+    # Schedule a re-registration of the advertisement after a delay.
+    # BlueZ sometimes reports "registered successfully" but doesn't actually
+    # broadcast until a re-registration occurs. This is a workaround for
+    # early-boot timing issues with the Bluetooth adapter.
+    def reregister_advertisement():
+        logger.info("Re-registering advertisement to ensure it's broadcasting...")
+        try:
+            # Unregister first
+            ad_manager = dbus.Interface(
+                bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+                LE_ADVERTISING_MANAGER_IFACE
+            )
+            try:
+                ad_manager.UnregisterAdvertisement(advertisement.get_path())
+                logger.info("Unregistered old advertisement")
+            except dbus.exceptions.DBusException:
+                pass  # May not be registered, that's fine
+
+            time.sleep(0.5)
+
+            # Re-register
+            register_advertisement(bus, adapter_path, advertisement)
+            logger.info("Re-registered advertisement successfully")
+        except Exception as e:
+            logger.warning(f"Re-registration failed (non-fatal): {e}")
+        return False  # Don't repeat
+
+    # Re-register after 5 seconds
+    GLib.timeout_add_seconds(5, reregister_advertisement)
+
     # Setup systemd watchdog pinging
     setup_glib_watchdog(WATCHDOG_INTERVAL)
 
