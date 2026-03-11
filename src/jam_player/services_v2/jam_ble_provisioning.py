@@ -146,16 +146,6 @@ GATT_SERVICE_IFACE = 'org.bluez.GattService1'
 GATT_CHRC_IFACE = 'org.bluez.GattCharacteristic1'
 LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
 
-# BlueZ Agent interfaces - for handling pairing without popups
-AGENT_MANAGER_IFACE = 'org.bluez.AgentManager1'
-AGENT_IFACE = 'org.bluez.Agent1'
-
-# jam-ble-state-manager D-Bus service - we subscribe to connectivity signals
-# to update BLE advertisement status in real-time
-JAM_BLE_STATE_SERVICE = 'com.jam.BLEStateManager'
-JAM_BLE_STATE_PATH = '/com/jam/BLEStateManager'
-JAM_BLE_STATE_INTERFACE = 'com.jam.BLEStateManager'
-
 # ============================================================================
 # Custom UUIDs for JAM Provisioning
 # ============================================================================
@@ -210,138 +200,6 @@ class NotSupportedException(dbus.exceptions.DBusException):
 class NotPermittedException(dbus.exceptions.DBusException):
     """Raised when an operation is not permitted."""
     _dbus_error_name = 'org.bluez.Error.NotPermitted'
-
-
-# ============================================================================
-# NoInputNoOutput Pairing Agent
-# ============================================================================
-
-class NoInputNoOutputAgent(dbus.service.Object):
-    """
-    BlueZ pairing agent that uses "NoInputNoOutput" capability.
-
-    This agent automatically accepts all pairing requests without user
-    interaction. This is appropriate for headless devices that:
-    1. Don't have a display for showing PINs
-    2. Don't have input for entering PINs
-    3. Want to allow connections without pairing popups
-
-    By registering this agent with BlueZ as the default agent, we override
-    any desktop bluetooth agent that would show pairing confirmation dialogs.
-
-    Security note: This uses "JustWorks" pairing which provides encryption
-    but no MITM protection. For a provisioning service where we're just
-    configuring WiFi, this is acceptable.
-    """
-
-    AGENT_PATH = '/org/bluez/jam/agent'
-
-    def __init__(self, bus):
-        """
-        Initialize and register the agent with BlueZ.
-
-        Args:
-            bus: D-Bus system bus connection
-        """
-        self.bus = bus
-        dbus.service.Object.__init__(self, bus, self.AGENT_PATH)
-
-    def register(self):
-        """Register this agent as the default agent with BlueZ."""
-        try:
-            agent_manager = dbus.Interface(
-                self.bus.get_object(BLUEZ_SERVICE_NAME, '/org/bluez'),
-                AGENT_MANAGER_IFACE
-            )
-
-            # Unregister any existing agent at our path first
-            try:
-                agent_manager.UnregisterAgent(self.AGENT_PATH)
-            except dbus.exceptions.DBusException:
-                pass  # Agent wasn't registered, that's fine
-
-            # Register our agent with NoInputNoOutput capability
-            agent_manager.RegisterAgent(self.AGENT_PATH, 'NoInputNoOutput')
-            logger.info("Registered NoInputNoOutput pairing agent")
-
-            # Request to be the default agent (override desktop agents)
-            agent_manager.RequestDefaultAgent(self.AGENT_PATH)
-            logger.info("Set as default pairing agent (no pairing popups)")
-
-        except dbus.exceptions.DBusException as e:
-            logger.warning(f"Failed to register pairing agent: {e}")
-
-    @dbus.service.method(AGENT_IFACE, in_signature='', out_signature='')
-    def Release(self):
-        """Called when BlueZ unregisters the agent."""
-        logger.info("Pairing agent released")
-
-    @dbus.service.method(AGENT_IFACE, in_signature='os', out_signature='')
-    def AuthorizeService(self, device, uuid):
-        """
-        Authorize a service connection without user interaction.
-
-        This is called when a device wants to use a service that requires
-        authorization. We auto-authorize all services.
-        """
-        logger.info(f"Auto-authorizing service {uuid} for device {device}")
-
-    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='')
-    def RequestAuthorization(self, device):
-        """
-        Authorize a pairing request without user interaction.
-
-        This is called when a device wants to pair. We auto-accept.
-        """
-        logger.info(f"Auto-accepting pairing request from {device}")
-
-    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='u')
-    def RequestPasskey(self, device):
-        """
-        Return a passkey for pairing.
-
-        With NoInputNoOutput capability, this shouldn't be called,
-        but we return 0 just in case.
-        """
-        logger.info(f"Passkey requested for {device} - returning 0")
-        return dbus.UInt32(0)
-
-    @dbus.service.method(AGENT_IFACE, in_signature='ouq', out_signature='')
-    def DisplayPasskey(self, device, passkey, entered):
-        """Display passkey - no-op for headless device."""
-        logger.debug(f"DisplayPasskey called: {device}, {passkey}")
-
-    @dbus.service.method(AGENT_IFACE, in_signature='os', out_signature='')
-    def DisplayPinCode(self, device, pincode):
-        """Display PIN code - no-op for headless device."""
-        logger.debug(f"DisplayPinCode called: {device}, {pincode}")
-
-    @dbus.service.method(AGENT_IFACE, in_signature='ou', out_signature='')
-    def RequestConfirmation(self, device, passkey):
-        """
-        Confirm a passkey match.
-
-        This is what triggers the "confirm pairing" popup. By implementing
-        this method and NOT raising Rejected, we auto-confirm.
-        """
-        logger.info(f"Auto-confirming passkey {passkey} for {device}")
-        # Simply returning (not raising) means we accept
-
-    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='s')
-    def RequestPinCode(self, device):
-        """
-        Return a PIN code for pairing.
-
-        With NoInputNoOutput capability, this shouldn't be called,
-        but we return "0000" just in case.
-        """
-        logger.info(f"PIN code requested for {device} - returning 0000")
-        return '0000'
-
-    @dbus.service.method(AGENT_IFACE, in_signature='', out_signature='')
-    def Cancel(self):
-        """Called when pairing is cancelled."""
-        logger.info("Pairing cancelled")
 
 
 # ============================================================================
@@ -434,29 +292,15 @@ class Advertisement(dbus.service.Object):
             raise InvalidArgsException()
         return self.get_properties()[LE_ADVERTISEMENT_IFACE]
 
-    def update_status_flags(self, new_flags: int):
+    def update_status_flags(self, new_flags: int) -> bool:
         """
-        Update the status flags in the advertisement.
+        Update status flags if they changed.
 
-        This allows the advertisement to reflect current connectivity/registration
-        state without requiring a service restart. The advertisement must be
-        re-registered with BlueZ for the changes to take effect in broadcasts.
-
-        Args:
-            new_flags: New status flags byte (bits: isConnected, isAnnounced, isRegistered)
+        Returns True if flags were updated, False if unchanged.
         """
         if self.status_flags == new_flags:
-            logger.debug(f"Status flags unchanged ({new_flags}), skipping update")
             return False
-
-        old_flags = self.status_flags
         self.status_flags = new_flags
-        logger.info(
-            f"Updated advertisement status flags: {old_flags} -> {new_flags} "
-            f"(connected={bool(new_flags & 0x01)}, "
-            f"announced={bool(new_flags & 0x02)}, "
-            f"registered={bool(new_flags & 0x04)})"
-        )
         return True
 
     @dbus.service.method(LE_ADVERTISEMENT_IFACE, in_signature='', out_signature='')
@@ -1660,124 +1504,6 @@ def register_application(bus, adapter_path: str, application):
     )
 
 
-def reregister_advertisement(bus, adapter_path: str, advertisement, reason: str = ""):
-    """
-    Re-register the advertisement with BlueZ.
-
-    This is needed when:
-    1. Early boot timing issues (BlueZ reports success but doesn't broadcast)
-    2. Advertisement status flags change (connectivity/registration state)
-
-    Args:
-        bus: D-Bus system bus connection
-        adapter_path: Path to the Bluetooth adapter
-        advertisement: The Advertisement object to re-register
-        reason: Human-readable reason for re-registration (for logging)
-    """
-    reason_str = f" ({reason})" if reason else ""
-    logger.info(f"Re-registering advertisement{reason_str}...")
-
-    try:
-        ad_manager = dbus.Interface(
-            bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
-            LE_ADVERTISING_MANAGER_IFACE
-        )
-
-        # Unregister first
-        try:
-            ad_manager.UnregisterAdvertisement(advertisement.get_path())
-            logger.debug("Unregistered old advertisement")
-        except dbus.exceptions.DBusException:
-            pass  # May not be registered, that's fine
-
-        time.sleep(0.3)
-
-        # Re-register
-        register_advertisement(bus, adapter_path, advertisement)
-        logger.info(f"Re-registered advertisement successfully{reason_str}")
-
-    except Exception as e:
-        logger.warning(f"Re-registration failed (non-fatal): {e}")
-
-
-
-
-# ============================================================================
-# Connectivity State Handler
-# ============================================================================
-
-class ConnectivityStateHandler:
-    """
-    Handles connectivity state changes from jam-ble-state-manager.
-
-    Subscribes to D-Bus signals and updates the BLE advertisement when
-    connectivity state changes. This ensures the mobile app sees accurate
-    device status in the scan list without requiring service restart.
-    """
-
-    def __init__(self, bus, advertisement, adapter_path: str):
-        """
-        Initialize the handler and subscribe to connectivity signals.
-
-        Args:
-            bus: D-Bus system bus connection
-            advertisement: The Advertisement object to update
-            adapter_path: Path to the Bluetooth adapter (for re-registration)
-        """
-        self.bus = bus
-        self.advertisement = advertisement
-        self.adapter_path = adapter_path
-        self._pending_reregister = None  # GLib timeout for debounced re-registration
-
-        # Subscribe to connectivity state changes from jam-ble-state-manager
-        bus.add_signal_receiver(
-            self._on_connectivity_changed,
-            signal_name='ConnectivityStateChanged',
-            dbus_interface=JAM_BLE_STATE_INTERFACE,
-            bus_name=JAM_BLE_STATE_SERVICE,
-            path=JAM_BLE_STATE_PATH
-        )
-        logger.info("Subscribed to jam-ble-state-manager connectivity signals")
-
-    def _on_connectivity_changed(self, is_online: bool, method: str):
-        """
-        Handle connectivity state change signal.
-
-        Args:
-            is_online: Whether internet connectivity is verified
-            method: Which connectivity check succeeded
-        """
-        logger.info(f"Received connectivity change: is_online={is_online}, method={method}")
-
-        # Calculate new status flags
-        new_flags = get_status_flags()
-
-        # Update advertisement if flags changed
-        if self.advertisement.update_status_flags(new_flags):
-            # Debounce re-registration to avoid rapid BlueZ calls
-            if self._pending_reregister is not None:
-                GLib.source_remove(self._pending_reregister)
-
-            self._pending_reregister = GLib.timeout_add(
-                500,  # 500ms debounce
-                self._reregister_advertisement
-            )
-
-    def _reregister_advertisement(self) -> bool:
-        """
-        Re-register the advertisement with BlueZ to broadcast updated status.
-
-        Returns:
-            False (to stop the GLib timeout from repeating)
-        """
-        self._pending_reregister = None
-        reregister_advertisement(
-            self.bus,
-            self.adapter_path,
-            self.advertisement,
-            reason="status flags changed"
-        )
-        return False
 
 
 # ============================================================================
@@ -1824,11 +1550,6 @@ def main():
     # Configure adapter (disable pairing popup, etc.)
     configure_adapter(bus, adapter_path)
 
-    # Register NoInputNoOutput agent to prevent pairing popups
-    # This must be done BEFORE accepting any connections
-    agent = NoInputNoOutputAgent(bus)
-    agent.register()
-
     # Generate our BLE device name (JAM-PLAYER-XXXXX)
     device_name = get_device_name()
     logger.info(f"BLE device name: {device_name}")
@@ -1863,20 +1584,43 @@ def main():
         logger.error(f"Failed to register with BlueZ: {e}")
         sys.exit(1)
 
-    # Setup handler for connectivity state changes from jam-ble-state-manager
-    # This allows real-time BLE advertisement updates when connectivity changes
-    connectivity_handler = ConnectivityStateHandler(bus, advertisement, adapter_path)
+    # Helper to re-register advertisement with BlueZ
+    def do_reregister():
+        try:
+            ad_manager = dbus.Interface(
+                bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+                LE_ADVERTISING_MANAGER_IFACE
+            )
+            try:
+                ad_manager.UnregisterAdvertisement(advertisement.get_path())
+            except dbus.exceptions.DBusException:
+                pass
+            time.sleep(0.3)
+            register_advertisement(bus, adapter_path, advertisement)
+        except Exception as e:
+            logger.warning(f"Re-registration failed (non-fatal): {e}")
 
-    # Schedule a re-registration of the advertisement after a delay.
-    # BlueZ sometimes reports "registered successfully" but doesn't actually
-    # broadcast until a re-registration occurs. This is a workaround for
-    # early-boot timing issues with the Bluetooth adapter.
+    # Initial re-registration after 5 seconds (BlueZ early-boot workaround)
     def initial_reregister():
-        reregister_advertisement(bus, adapter_path, advertisement, reason="early boot workaround")
+        logger.info("Re-registering advertisement (early boot workaround)...")
+        do_reregister()
         return False  # Don't repeat
 
-    # Re-register after 5 seconds
     GLib.timeout_add_seconds(5, initial_reregister)
+
+    # Periodic refresh of advertisement status flags every 30 seconds
+    # This ensures the mobile app sees accurate status without service restart
+    def refresh_advertisement_flags():
+        try:
+            new_flags = get_status_flags()
+            if advertisement.update_status_flags(new_flags):
+                logger.info(f"Status flags changed, re-registering advertisement...")
+                do_reregister()
+        except Exception as e:
+            logger.warning(f"Failed to refresh advertisement flags: {e}")
+        return True  # Keep repeating
+
+    GLib.timeout_add_seconds(30, refresh_advertisement_flags)
 
     # Setup systemd watchdog pinging
     setup_glib_watchdog(WATCHDOG_INTERVAL)
