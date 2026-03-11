@@ -70,6 +70,7 @@ SYSTEMD_SRC = JAM_REPO_DIR / 'systemd'
 CRON_SRC = JAM_REPO_DIR / 'cron'
 LOGROTATE_SRC = JAM_REPO_DIR / 'logrotate_config'
 CONFIG_SRC = JAM_REPO_DIR / 'jam_player' / 'config'
+DBUS_SRC = JAM_REPO_DIR / 'dbus'
 
 # Backup paths (for rollback on failed updates)
 BACKUP_DIR = OPT_JAM_DIR / 'backup'
@@ -1009,6 +1010,48 @@ def install_logrotate_config():
         logger.warning(f"  Failed to install logrotate config: {e}")
 
 
+def install_dbus_configs():
+    """
+    Install D-Bus policy files to /etc/dbus-1/system.d/.
+
+    D-Bus requires explicit policy files to allow services to register
+    bus names on the system bus. Without these, services get AccessDenied
+    when trying to own their bus names.
+    """
+    logger.info("Installing D-Bus config files...")
+
+    dbus_dest_dir = Path('/etc/dbus-1/system.d')
+
+    if not DBUS_SRC.exists():
+        logger.debug(f"No D-Bus config directory found: {DBUS_SRC}")
+        return
+
+    try:
+        dbus_dest_dir.mkdir(parents=True, exist_ok=True)
+
+        installed_count = 0
+        for conf_file in DBUS_SRC.glob('*.conf'):
+            dest = dbus_dest_dir / conf_file.name
+            shutil.copy2(conf_file, dest)
+            os.chown(dest, 0, 0)  # root:root
+            os.chmod(dest, 0o644)
+            logger.info(f"  Installed {conf_file.name}")
+            installed_count += 1
+
+        if installed_count > 0:
+            # Reload D-Bus to pick up new policies
+            success, _, stderr = run_command(['systemctl', 'reload', 'dbus'], timeout=10)
+            if success:
+                logger.info("  Reloaded D-Bus daemon")
+            else:
+                logger.warning(f"  Failed to reload D-Bus: {stderr}")
+        else:
+            logger.debug("  No D-Bus config files to install")
+
+    except Exception as e:
+        logger.warning(f"  Failed to install D-Bus configs: {e}")
+
+
 def install_chrony_peering_config():
     """
     Install chrony peering configuration for offline clock sync.
@@ -1333,6 +1376,9 @@ def main():
 
     # Install logrotate config
     install_logrotate_config()
+
+    # Install D-Bus policy files (required for services to register bus names)
+    install_dbus_configs()
 
     # Install chrony peering config for offline clock sync
     install_chrony_peering_config()
