@@ -26,8 +26,9 @@ WorkingDirectory=/opt/jam/services
 # Environment
 Environment=PYTHONUNBUFFERED=1
 
-# Run scenes_manager_service.py from the new location
-# This handles polling for content updates and downloading media
+# NOTE: This runs scenes_manager_service.py (legacy name) rather than jam_content_manager.py
+# The file lives in src/jam_player/ instead of src/jam_player/services_v2/ for historical reasons.
+# It works fine - just inconsistent naming. Not worth the refactor risk to rename/move it.
 ExecStart=/opt/jam/venv/bin/python /opt/jam/services/scenes_manager_service.py
 
 # Restart on failure

@@ -213,7 +213,7 @@ def download_media(url: str, dest_path: Path) -> bool:
                         ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                          '-show_entries', 'stream=duration', '-of', 'csv=p=0',
                          str(dest_path)],
-                        capture_output=True, text=True, timeout=10
+                        capture_output=True, text=True, timeout=20
                     )
                     if probe_result.returncode != 0:
                         logger.error(f"Downloaded video is invalid: {dest_path}")
@@ -357,6 +357,9 @@ def load_content() -> bool:
         logger.error("Failed to fetch content from API")
         return False
 
+    # Track how many scenes the API returned (before download attempts)
+    api_scene_count = len(scenes) if scenes else 0
+
     if not scenes:
         logger.warning("No scenes returned from API")
         # Still write empty scenes file so player knows there's nothing to show
@@ -462,14 +465,25 @@ def load_content() -> bool:
     logger.info(f"Staged {len(processed_scenes)} scenes")
 
     if not processed_scenes:
-        logger.info("No scenes to display - clearing live content")
-        # Write empty scenes.json to live directory so player knows there's nothing to show
-        LIVE_SCENES_DIR.mkdir(parents=True, exist_ok=True)
-        live_scenes_path = LIVE_SCENES_DIR / "scenes.json"
-        with open(live_scenes_path, 'w') as f:
-            json.dump([], f)
-        logger.info("Live content cleared - player should show waiting screen")
-        return True
+        # Distinguish between "API returned no scenes" vs "all downloads failed"
+        if api_scene_count > 0:
+            # API returned scenes but we couldn't download any of them
+            # Keep existing content rather than blanking the display
+            logger.error(
+                f"API returned {api_scene_count} scenes but all downloads failed - "
+                "keeping existing content to avoid blank display"
+            )
+            return False
+        else:
+            # API explicitly returned no scenes - this might be intentional
+            # (user removed all content from the screen)
+            logger.info("No scenes returned from API - clearing live content")
+            LIVE_SCENES_DIR.mkdir(parents=True, exist_ok=True)
+            live_scenes_path = LIVE_SCENES_DIR / "scenes.json"
+            with open(live_scenes_path, 'w') as f:
+                json.dump([], f)
+            logger.info("Live content cleared - player should show waiting screen")
+            return True
 
     # Calculate total duration and write metadata
     total_duration = sum(s.get('duration', 0) for s in processed_scenes)
@@ -522,19 +536,16 @@ def load_content() -> bool:
             shutil.rmtree(live_new)
         raise
 
-    # NOTE: We defer media cleanup to give the display service time to switch
-    # to the new content. The cleanup will happen on the NEXT content load,
-    # deleting files that weren't referenced in THIS load.
-    # Store current referenced files for deferred cleanup
-    global _previous_referenced_files
-    current_referenced = {s.get('media_file') for s in processed_scenes if s.get('media_file')}
-
-    # Clean up files that weren't referenced in the PREVIOUS load
-    # (giving display service time to switch)
-    if '_previous_referenced_files' in dir() and _previous_referenced_files:
-        cleanup_unused_media(_previous_referenced_files | current_referenced)
-
-    _previous_referenced_files = current_referenced
+    # Clean up media files that are no longer referenced
+    # The atomic swap above ensures display service sees consistent content,
+    # so it's safe to clean up immediately
+    # IMPORTANT: Only cleanup if we have referenced files - never delete everything
+    # This protects against API returning empty scenes (backend bug, user error, etc.)
+    referenced_files = {s.get('media_file') for s in processed_scenes if s.get('media_file')}
+    if referenced_files:
+        cleanup_unused_media(referenced_files)
+    else:
+        logger.warning("No referenced media files - skipping cleanup to preserve existing content")
 
     logger.info("Content loaded successfully")
     return True

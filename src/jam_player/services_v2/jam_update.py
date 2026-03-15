@@ -1113,6 +1113,49 @@ def install_boot_config():
         logger.warning(f"  Failed to install boot config: {e}")
 
 
+def install_wifi_stability_configs():
+    """
+    Install NetworkManager configuration for WiFi stability.
+
+    These configs improve WiFi reliability on Raspberry Pi:
+    - wifi-powersave-off.conf: Disables WiFi power management to prevent
+      the Broadcom chip from becoming unresponsive
+    - wifi-stability.conf: Unlimited auth retries, disable MAC randomization
+
+    Also immediately disables power save for the current session using iw.
+    """
+    logger.info("Installing WiFi stability configs...")
+
+    nm_conf_src = ETC_SRC / 'NetworkManager' / 'conf.d'
+    nm_conf_dest = Path('/etc/NetworkManager/conf.d')
+
+    if not nm_conf_src.exists():
+        logger.warning(f"NetworkManager config source not found: {nm_conf_src}")
+        return
+
+    try:
+        nm_conf_dest.mkdir(parents=True, exist_ok=True)
+
+        # Install all config files from the source directory
+        for conf_file in nm_conf_src.glob('*.conf'):
+            dest_file = nm_conf_dest / conf_file.name
+            shutil.copy2(conf_file, dest_file)
+            os.chown(dest_file, 0, 0)  # root:root
+            os.chmod(dest_file, 0o644)
+            logger.info(f"  Installed {dest_file}")
+
+        # Immediately disable power save for current session
+        # (config file takes effect on next NetworkManager restart or reboot)
+        success, _, stderr = run_command(['iw', 'wlan0', 'set', 'power_save', 'off'], timeout=10)
+        if success:
+            logger.info("  Disabled WiFi power save for current session")
+        else:
+            logger.warning(f"  Failed to disable power save immediately: {stderr}")
+
+    except Exception as e:
+        logger.warning(f"  Failed to install WiFi stability configs: {e}")
+
+
 def install_ble_configs():
     """
     Install D-Bus and BlueZ configuration files for BLE provisioning.
@@ -1373,6 +1416,9 @@ def main():
 
     # Install boot config for proper 4K/HDMI output
     install_boot_config()
+
+    # Install WiFi stability configs (power save off, unlimited retries)
+    install_wifi_stability_configs()
 
     # Install BLE configuration (D-Bus and BlueZ) for pairing-free provisioning
     install_ble_configs()
