@@ -35,8 +35,7 @@ T = TypeVar('T')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common.logging_config import setup_service_logging, log_service_start
-from common.credentials import is_device_registered
-from common.api import api_request
+from common.api import report_error as api_report_error, ErrorSeverity, SystemService
 from common.paths import ENVIRONMENT_FILE
 
 # Try to import PIL for update screen display
@@ -1189,31 +1188,11 @@ def restart_services():
 
 def report_error(error_message: str):
     """Report an update failure to the backend."""
-    try:
-        if not is_device_registered():
-            logger.warning("Device not registered, skipping error report")
-            return
-
-        if len(error_message) > 2048:
-            error_message = error_message[:2045] + "..."
-
-        response = api_request(
-            method='POST',
-            path='/jam-players/errors',
-            body={
-                'affectedService': 'JAM_UPDATE',
-                'errorMessage': f"Update failed: {error_message}",
-                'severity': 'HIGH'
-            },
-            signed=True
-        )
-
-        if response and response.status_code == 200:
-            logger.info("Error reported to backend")
-        else:
-            logger.warning("Failed to report error to backend")
-    except Exception as e:
-        logger.warning(f"Failed to report error: {e}")
+    api_report_error(
+        SystemService.JAM_UPDATE,
+        f"Update failed: {error_message}",
+        ErrorSeverity.HIGH,
+    )
 
 
 # =============================================================================

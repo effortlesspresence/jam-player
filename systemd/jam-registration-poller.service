@@ -5,9 +5,6 @@ Documentation=https://github.com/anthropics/jam-player
 # Only run if not yet registered
 ConditionPathExists=!/etc/jam/device_data/.registered
 
-# Requires announce to have completed first (device must be in backend)
-ConditionPathExists=/etc/jam/device_data/.announced
-
 # Requires network
 After=network-online.target
 Wants=network-online.target

@@ -23,7 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     get_device_uuid,
+    is_device_announced,
     is_device_registered,
+    set_device_announced,
     set_device_registered,
 )
 from common.api import get_api_base_url, api_request
@@ -100,6 +102,12 @@ def main():
         sys.exit(0)  # Exit cleanly, timer will retry
 
     logger.info(f"Registration status: {status}")
+
+    # If backend knows about this device, ensure .announced flag exists locally
+    # This handles the case where mobile app announced directly to backend
+    if status in ('ANNOUNCED', 'REGISTERED') and not is_device_announced():
+        logger.info("Device exists in backend but .announced missing locally - creating it")
+        set_device_announced()
 
     if status == 'REGISTERED':
         logger.info("Device is REGISTERED - creating flag file")

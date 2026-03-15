@@ -3,17 +3,16 @@
 JAM Player WebSocket Commands Service
 
 This service connects to the JAM backend WebSocket API to receive real-time
-commands like WiFi reconnect requests.
+commands for device control.
 
 Purpose:
 1. Establish and maintain a WebSocket connection to the backend
 2. Subscribe to DEVICE_COMMANDS for this device's UUID
-3. Handle incoming commands (e.g., WIFI_RECONNECT)
-4. Execute commands with proper fallback behavior
+3. Handle incoming commands (e.g., SET_ORIENTATION, SET_SCREEN_ID, REFRESH_CONTENT)
+4. Execute commands with proper error handling
 
 Key behaviors:
 - Reconnects automatically if the WebSocket connection drops
-- Handles WIFI_RECONNECT commands with fallback to previous network on failure
 - Uses exponential backoff for reconnection attempts
 - Notifies systemd watchdog to prove liveness
 - Designed to be stable - recovers from all errors gracefully
@@ -41,11 +40,6 @@ except ImportError:
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import get_device_uuid, is_device_announced, update_screen_id_if_changed
-from common.network import (
-    connect_to_wifi,
-    connect_to_saved_wifi,
-    check_internet_connectivity,
-)
 from common.paths import DISPLAY_ORIENTATION_FILE, ENVIRONMENT_FILE
 
 logger = setup_service_logging('jam-ws-commands')
@@ -108,62 +102,6 @@ def signal_handler(signum, frame):
     global running
     logger.info(f"Received signal {signum}, shutting down...")
     running = False
-
-
-def handle_wifi_reconnect(payload: dict, command_id: str) -> bool:
-    """
-    Handle a WiFi reconnect command.
-
-    Args:
-        payload: The command payload containing ssid, password, etc.
-        command_id: The unique command ID for logging
-
-    Returns:
-        True if the reconnect succeeded, False otherwise
-    """
-    ssid = payload.get('ssid')
-    password = payload.get('password')
-    connection_name = payload.get('connectionName')
-    use_saved_credentials = payload.get('useSavedCredentials', False)
-
-    if not ssid:
-        logger.error(f"[{command_id}] WiFi reconnect command missing ssid")
-        return False
-
-    logger.info(f"[{command_id}] Handling WiFi reconnect to: {ssid} (useSaved={use_saved_credentials})")
-
-    try:
-        if use_saved_credentials and connection_name:
-            # Use saved credentials
-            logger.info(f"[{command_id}] Connecting with saved credentials: {connection_name}")
-            success, error = connect_to_saved_wifi(connection_name)
-        elif password:
-            # Connect with provided password
-            logger.info(f"[{command_id}] Connecting with provided password")
-            success, error = connect_to_wifi(ssid, password)
-        else:
-            logger.error(f"[{command_id}] No password and not using saved credentials")
-            return False
-
-        if success:
-            logger.info(f"[{command_id}] WiFi reconnect successful to: {ssid}")
-            # Verify we actually have internet
-            has_internet, method = check_internet_connectivity(timeout=10)
-            if has_internet:
-                logger.info(f"[{command_id}] Internet connectivity verified via {method}")
-                return True
-            else:
-                logger.warning(f"[{command_id}] Connected to WiFi but no internet")
-                # The network.py functions already handle fallback, so just report failure
-                return False
-        else:
-            logger.error(f"[{command_id}] WiFi reconnect failed: {error}")
-            # Fallback is already handled by connect_to_wifi / connect_to_saved_wifi
-            return False
-
-    except Exception as e:
-        logger.error(f"[{command_id}] Exception during WiFi reconnect: {e}")
-        return False
 
 
 def handle_set_orientation(payload: dict, command_id: str) -> bool:
@@ -332,13 +270,7 @@ def handle_device_command(message: dict):
 
     logger.info(f"Received command: {command_type} (id: {command_id})")
 
-    if command_type == 'WIFI_RECONNECT':
-        success = handle_wifi_reconnect(payload, command_id)
-        if success:
-            logger.info(f"[{command_id}] Command completed successfully")
-        else:
-            logger.warning(f"[{command_id}] Command failed (fallback applied if needed)")
-    elif command_type == 'SET_ORIENTATION':
+    if command_type == 'SET_ORIENTATION':
         success = handle_set_orientation(payload, command_id)
         if success:
             logger.info(f"[{command_id}] Orientation set successfully")

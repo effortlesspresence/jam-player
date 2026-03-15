@@ -19,6 +19,7 @@ from .paths import ENVIRONMENT_FILE
 from .credentials import (
     get_device_uuid,
     get_api_signing_private_key,
+    is_device_announced,
 )
 
 logger = logging.getLogger(__name__)
@@ -226,3 +227,158 @@ def api_request(
     except Exception as e:
         logger.error(f"API request error: {method} {url} - {type(e).__name__}: {e}")
         return None
+
+
+# Error severity levels matching jam_player_error_severity enum in the database
+class ErrorSeverity:
+    """
+    Severity levels for JAM Player errors reported to the backend.
+
+    These values match the jam_player_error_severity enum in the database:
+    - CRITICAL: Critical service completely failed, not recoverable
+    - HIGH: Service failed but was recovered, or restart failed
+    - MEDIUM: Transient issue, may self-resolve
+    - LOW: Informational, no action needed
+    """
+    CRITICAL = 'CRITICAL'
+    HIGH = 'HIGH'
+    MEDIUM = 'MEDIUM'
+    LOW = 'LOW'
+
+
+# Valid affected service values (matches jam_player_system_service enum in database)
+class SystemService:
+    """
+    System service identifiers for error reporting.
+
+    These values match the jam_player_system_service enum in the database.
+    """
+    JAM_FIRST_BOOT = 'JAM_FIRST_BOOT'
+    JAM_BOOT_CHECK = 'JAM_BOOT_CHECK'
+    JAM_BLE_PROVISIONING = 'JAM_BLE_PROVISIONING'
+    JAM_BLE_STATE_MANAGER = 'JAM_BLE_STATE_MANAGER'
+    JAM_CONTENT_MANAGER = 'JAM_CONTENT_MANAGER'
+    JAM_PLAYER_DISPLAY = 'JAM_PLAYER_DISPLAY'
+    JAM_HEALTH_MONITOR = 'JAM_HEALTH_MONITOR'
+    JAM_HEARTBEAT = 'JAM_HEARTBEAT'
+    JAM_WEBSOCKET_COMMANDS = 'JAM_WEBSOCKET_COMMANDS'
+    JAM_REGISTRATION_POLLER = 'JAM_REGISTRATION_POLLER'
+    JAM_ANNOUNCE = 'JAM_ANNOUNCE'
+    JAM_UPDATE = 'JAM_UPDATE'
+    NETWORK_MANAGER = 'NETWORK_MANAGER'
+    BLUETOOTH = 'BLUETOOTH'
+    CHRONY = 'CHRONY'
+    TAILSCALE = 'TAILSCALE'
+    OTHER = 'OTHER'
+
+
+# Mapping from systemd service names to SystemService values
+SYSTEMD_TO_SYSTEM_SERVICE = {
+    'jam-first-boot.service': SystemService.JAM_FIRST_BOOT,
+    'jam-boot-check.service': SystemService.JAM_BOOT_CHECK,
+    'jam-ble-provisioning.service': SystemService.JAM_BLE_PROVISIONING,
+    'jam-ble-state-manager.service': SystemService.JAM_BLE_STATE_MANAGER,
+    'jam-content-manager.service': SystemService.JAM_CONTENT_MANAGER,
+    'jam-player-display.service': SystemService.JAM_PLAYER_DISPLAY,
+    'jam-health-monitor.service': SystemService.JAM_HEALTH_MONITOR,
+    'jam-heartbeat.service': SystemService.JAM_HEARTBEAT,
+    'jam-ws-commands.service': SystemService.JAM_WEBSOCKET_COMMANDS,
+    'jam-registration-poller.service': SystemService.JAM_REGISTRATION_POLLER,
+    'jam-announce.service': SystemService.JAM_ANNOUNCE,
+    'jam-update.service': SystemService.JAM_UPDATE,
+}
+
+
+# Maximum error message length (backend limit)
+MAX_ERROR_MESSAGE_LENGTH = 2048
+
+# Retry settings for error reporting
+ERROR_REPORT_MAX_ATTEMPTS = 3
+ERROR_REPORT_RETRY_DELAY = 10  # seconds between retries
+
+
+def report_error(
+    affected_service: SystemService,
+    error_message: str,
+    severity: str = ErrorSeverity.HIGH,
+    check_connectivity: bool = False,
+    timeout: int = 30,
+) -> bool:
+    """
+    Report an error to the JAM backend API.
+
+    This is a best-effort operation - if we're offline, the device isn't
+    announced, or the API is down, we log locally and return False.
+    Retries up to 3 times with a 10-second delay between attempts.
+
+    Args:
+        affected_service: The service that experienced the error. Must be one of
+                         the SystemService constants (e.g., SystemService.JAM_UPDATE,
+                         SystemService.JAM_BLE_PROVISIONING).
+        error_message: Human-readable error message describing what happened
+        severity: Error severity level (use ErrorSeverity constants)
+        check_connectivity: If True, check internet connectivity before attempting
+                           to report (avoids unnecessary timeouts when offline)
+        timeout: Request timeout in seconds
+
+    Returns:
+        True if the error was reported successfully, False otherwise.
+    """
+    import time
+
+    # Check if device is announced (has credentials to sign API requests)
+    if not is_device_announced():
+        logger.debug("Device not announced, skipping error report")
+        return False
+
+    # Optionally check connectivity first to avoid timeouts when offline
+    if check_connectivity:
+        from .network import check_internet_connectivity
+        has_internet, _ = check_internet_connectivity()
+        if not has_internet:
+            logger.debug("No internet connectivity, skipping error report")
+            return False
+
+    # Truncate message if too long
+    if len(error_message) > MAX_ERROR_MESSAGE_LENGTH:
+        error_message = error_message[:MAX_ERROR_MESSAGE_LENGTH - 3] + "..."
+
+    for attempt in range(1, ERROR_REPORT_MAX_ATTEMPTS + 1):
+        try:
+            response = api_request(
+                method='POST',
+                path='/jam-players/errors',
+                body={
+                    'affectedService': affected_service,
+                    'severity': severity,
+                    'errorMessage': error_message,
+                },
+                timeout=timeout,
+                signed=True,
+            )
+
+            if response is not None and response.status_code == 200:
+                if attempt > 1:
+                    logger.info(f"Reported error to backend on attempt {attempt}: {affected_service} ({severity})")
+                else:
+                    logger.info(f"Reported error to backend: {affected_service} ({severity})")
+                return True
+
+            # Log failure reason
+            if response is None:
+                logger.warning(f"Error report attempt {attempt}/{ERROR_REPORT_MAX_ATTEMPTS} failed (request failed)")
+            else:
+                logger.warning(
+                    f"Error report attempt {attempt}/{ERROR_REPORT_MAX_ATTEMPTS} failed: "
+                    f"status {response.status_code}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Error report attempt {attempt}/{ERROR_REPORT_MAX_ATTEMPTS} failed: {e}")
+
+        # Retry after delay if not the last attempt
+        if attempt < ERROR_REPORT_MAX_ATTEMPTS:
+            time.sleep(ERROR_REPORT_RETRY_DELAY)
+
+    logger.warning(f"Failed to report error to backend after {ERROR_REPORT_MAX_ATTEMPTS} attempts")
+    return False

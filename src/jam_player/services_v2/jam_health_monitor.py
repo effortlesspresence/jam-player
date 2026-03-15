@@ -48,7 +48,6 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
-from enum import Enum
 
 # Add services directory to path for common module imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -60,8 +59,7 @@ from common.system import (
     setup_signal_handlers,
     WatchdogPinger,
 )
-from common.network import check_internet_connectivity
-from common.api import api_request
+from common.api import report_error, ErrorSeverity, SystemService, SYSTEMD_TO_SYSTEM_SERVICE
 
 # ============================================================================
 # Logging Configuration
@@ -116,26 +114,6 @@ WATCHDOG_INTERVAL = 30
 
 # Bluetooth health check interval (only check every N cycles to avoid spam)
 BT_CHECK_INTERVAL_CYCLES = 2    # Check BT every 2 cycles (60 seconds)
-
-
-# ============================================================================
-# Error Severity Enum (matches jam_player_error_severity in DB)
-# ============================================================================
-
-class ErrorSeverity(Enum):
-    """
-    Severity levels for JAM Player errors reported to the backend.
-
-    These values match the jam_player_error_severity enum in the database:
-    - CRITICAL: Critical service completely failed, not recoverable
-    - HIGH: Service failed but was recovered, or restart failed
-    - MEDIUM: Transient issue, may self-resolve
-    - LOW: Informational, no action needed
-    """
-    CRITICAL = 'CRITICAL'
-    HIGH = 'HIGH'
-    MEDIUM = 'MEDIUM'
-    LOW = 'LOW'
 
 
 # ============================================================================
@@ -260,39 +238,13 @@ class HealthMonitor:
         we just log locally and continue.
 
         Args:
-            service: The affected service name
-            severity: Error severity level
+            service: The systemd service name (e.g., 'jam-ble-provisioning.service')
+            severity: Error severity level (use ErrorSeverity constants)
             message: Human-readable error message
         """
-        # First check if we have internet connectivity
-        has_internet, _ = check_internet_connectivity()
-        if not has_internet:
-            logger.debug("No internet connectivity, skipping backend report")
-            return
-
-        try:
-            response = api_request(
-                method='POST',
-                path='/jam-players/errors',
-                body={
-                    'affectedService': service,
-                    'severity': severity.value,
-                    'errorMessage': message,
-                },
-                timeout=10,
-            )
-
-            if response is None:
-                logger.warning("Failed to report error to backend (request failed)")
-            elif response.status_code == 200:
-                logger.info(f"Reported error to backend: {service} ({severity.value})")
-            else:
-                logger.warning(
-                    f"Backend returned {response.status_code} when reporting error: "
-                    f"{response.text[:200] if response.text else 'no response body'}"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to report to backend: {e}")
+        # Map systemd service name to SystemService enum value
+        system_service = SYSTEMD_TO_SYSTEM_SERVICE.get(service, SystemService.OTHER)
+        report_error(system_service, message, severity)
 
     def _should_attempt_restart(self, service: str) -> bool:
         """

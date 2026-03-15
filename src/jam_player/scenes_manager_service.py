@@ -482,10 +482,45 @@ def load_content() -> bool:
         json.dump(content_meta, f, indent=2)
     logger.info(f"Content metadata written: {total_duration:.1f}s total, {len(processed_scenes)} scenes")
 
-    # Atomically swap staged to live
-    if LIVE_SCENES_DIR.exists():
-        shutil.rmtree(LIVE_SCENES_DIR)
-    shutil.copytree(STAGED_SCENES_DIR, LIVE_SCENES_DIR)
+    # Atomically swap staged to live using a safe 3-step process:
+    # 1. Copy staged to a NEW temp directory (if interrupted, live is untouched)
+    # 2. Rename live -> live.old, temp -> live (atomic renames)
+    # 3. Delete old backup
+    # This prevents 0-byte files if the process is killed mid-operation
+    live_backup = LIVE_SCENES_DIR.with_suffix('.old')
+    live_new = LIVE_SCENES_DIR.with_suffix('.new')
+
+    try:
+        # Clean up any leftover temp directories from previous failed swaps
+        if live_new.exists():
+            shutil.rmtree(live_new)
+
+        # Step 1: Copy staged to new temp location (safe - doesn't touch live)
+        shutil.copytree(STAGED_SCENES_DIR, live_new)
+
+        # Step 2a: Move current live to backup (atomic)
+        if live_backup.exists():
+            shutil.rmtree(live_backup)
+        if LIVE_SCENES_DIR.exists():
+            LIVE_SCENES_DIR.rename(live_backup)
+
+        # Step 2b: Move new to live (atomic)
+        live_new.rename(LIVE_SCENES_DIR)
+
+        # Step 3: Remove backup only after successful swap
+        if live_backup.exists():
+            shutil.rmtree(live_backup)
+
+    except Exception as e:
+        logger.error(f"Error during atomic swap: {e}")
+        # Try to recover: if live is gone but backup exists, restore it
+        if live_backup.exists() and not LIVE_SCENES_DIR.exists():
+            logger.info("Restoring from backup after failed swap")
+            live_backup.rename(LIVE_SCENES_DIR)
+        # Clean up failed new directory
+        if live_new.exists():
+            shutil.rmtree(live_new)
+        raise
 
     # NOTE: We defer media cleanup to give the display service time to switch
     # to the new content. The cleanup will happen on the NEXT content load,
@@ -505,11 +540,58 @@ def load_content() -> bool:
     return True
 
 
+def recover_from_corrupt_live_scenes():
+    """
+    Check if live_scenes has corrupt (0-byte) files and recover from staged_scenes.
+
+    This handles the case where the device was powered off during a content swap,
+    leaving live_scenes with truncated files.
+    """
+    live_scenes_json = LIVE_SCENES_DIR / "scenes.json"
+    staged_scenes_json = STAGED_SCENES_DIR / "scenes.json"
+
+    # Check if live scenes.json exists but is empty/corrupt
+    if live_scenes_json.exists():
+        try:
+            if live_scenes_json.stat().st_size == 0:
+                logger.warning("live_scenes/scenes.json is 0 bytes (corrupt)")
+
+                # Check if staged has valid content
+                if staged_scenes_json.exists() and staged_scenes_json.stat().st_size > 0:
+                    logger.info("Recovering from staged_scenes...")
+                    if LIVE_SCENES_DIR.exists():
+                        shutil.rmtree(LIVE_SCENES_DIR)
+                    shutil.copytree(STAGED_SCENES_DIR, LIVE_SCENES_DIR)
+                    logger.info("Recovery complete - copied staged_scenes to live_scenes")
+                else:
+                    logger.warning("staged_scenes also missing or empty - cannot recover")
+        except Exception as e:
+            logger.error(f"Error during recovery check: {e}")
+
+    # Also check for .old backup from failed swap
+    live_backup = LIVE_SCENES_DIR.with_suffix('.old')
+    if live_backup.exists():
+        logger.info("Found leftover .old backup from previous failed swap")
+        if not LIVE_SCENES_DIR.exists() or (live_scenes_json.exists() and live_scenes_json.stat().st_size == 0):
+            logger.info("Restoring from .old backup...")
+            if LIVE_SCENES_DIR.exists():
+                shutil.rmtree(LIVE_SCENES_DIR)
+            live_backup.rename(LIVE_SCENES_DIR)
+            logger.info("Restored from .old backup")
+        else:
+            # live_scenes is fine, just clean up the backup
+            shutil.rmtree(live_backup)
+            logger.info("Cleaned up leftover .old backup")
+
+
 def run():
     """Main service loop."""
     logger.info("=" * 60)
     logger.info("JAM Player 2.0 - Scenes Manager Service Starting")
     logger.info("=" * 60)
+
+    # Check for and recover from corrupt live_scenes (e.g., from power loss during swap)
+    recover_from_corrupt_live_scenes()
 
     # Register signal handler for WebSocket-triggered refresh
     signal.signal(signal.SIGUSR1, handle_refresh_signal)
