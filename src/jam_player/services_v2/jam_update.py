@@ -69,6 +69,7 @@ SYSTEMD_SRC = JAM_REPO_DIR / 'systemd'
 CRON_SRC = JAM_REPO_DIR / 'cron'
 LOGROTATE_SRC = JAM_REPO_DIR / 'logrotate_config'
 CONFIG_SRC = JAM_REPO_DIR / 'jam_player' / 'config'
+ETC_SRC = JAM_REPO_DIR / 'etc'  # System config files (dbus, bluetooth)
 
 # Backup paths (for rollback on failed updates)
 BACKUP_DIR = OPT_JAM_DIR / 'backup'
@@ -1112,6 +1113,59 @@ def install_boot_config():
         logger.warning(f"  Failed to install boot config: {e}")
 
 
+def install_ble_configs():
+    """
+    Install D-Bus and BlueZ configuration files for BLE provisioning.
+
+    These configs are required for the NoInputNoOutput pairing agent to work
+    properly, preventing Bluetooth pairing popups on both the Pi and mobile devices.
+
+    Installs:
+    - /etc/dbus-1/system.d/jam-ble-provisioning.conf: D-Bus permissions for agent
+    - /etc/bluetooth/main.conf: BlueZ configuration for JustWorks pairing
+    """
+    logger.info("Installing BLE configuration files...")
+
+    # Install D-Bus config for BLE agent
+    dbus_config_src = ETC_SRC / 'dbus-1' / 'system.d' / 'jam-ble-provisioning.conf'
+    dbus_config_dest = Path('/etc/dbus-1/system.d/jam-ble-provisioning.conf')
+
+    if dbus_config_src.exists():
+        try:
+            dbus_config_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dbus_config_src, dbus_config_dest)
+            os.chown(dbus_config_dest, 0, 0)  # root:root
+            os.chmod(dbus_config_dest, 0o644)
+            logger.info(f"  Installed {dbus_config_dest}")
+        except Exception as e:
+            logger.warning(f"  Failed to install D-Bus config: {e}")
+    else:
+        logger.debug(f"  D-Bus config not found: {dbus_config_src}")
+
+    # Install BlueZ main.conf
+    bluetooth_config_src = ETC_SRC / 'bluetooth' / 'main.conf'
+    bluetooth_config_dest = Path('/etc/bluetooth/main.conf')
+
+    if bluetooth_config_src.exists():
+        try:
+            bluetooth_config_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(bluetooth_config_src, bluetooth_config_dest)
+            os.chown(bluetooth_config_dest, 0, 0)  # root:root
+            os.chmod(bluetooth_config_dest, 0o644)
+            logger.info(f"  Installed {bluetooth_config_dest}")
+
+            # Restart bluetooth service to pick up new config
+            success, _, stderr = run_command(['systemctl', 'restart', 'bluetooth'], timeout=30)
+            if success:
+                logger.info("  Restarted bluetooth service to apply config")
+            else:
+                logger.warning(f"  Failed to restart bluetooth: {stderr}")
+        except Exception as e:
+            logger.warning(f"  Failed to install BlueZ config: {e}")
+    else:
+        logger.debug(f"  BlueZ config not found: {bluetooth_config_src}")
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
@@ -1127,6 +1181,7 @@ def restart_services():
     # Services to restart - ordered by dependency (independent ones first)
     services_to_restart = [
         'jam-content-manager.service',    # Type=simple, starts fast
+        'jam-ble-provisioning.service',   # Type=notify, BLE provisioning (must restart after BLE config)
         'jam-ble-state-manager.service',  # Type=notify, but sends READY=1 early
         'jam-player-display.service',     # Type=notify, sends READY=1 early
         'jam-health-monitor.service',     # Type=notify, sends READY=1 early
@@ -1318,6 +1373,9 @@ def main():
 
     # Install boot config for proper 4K/HDMI output
     install_boot_config()
+
+    # Install BLE configuration (D-Bus and BlueZ) for pairing-free provisioning
+    install_ble_configs()
 
     # Restart services to pick up changes
     restart_services()
