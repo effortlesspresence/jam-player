@@ -12,12 +12,15 @@ After=jam-first-boot.service
 # Run after update service completes (ensures we have latest code)
 After=jam-update.service
 
-# Restart limits
-StartLimitIntervalSec=300
-StartLimitBurst=3
+# Restart limits - allow more retries for slow network establishment
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=30
 
 # Run as root for systemctl access
 User=root

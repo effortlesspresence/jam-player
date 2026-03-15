@@ -41,7 +41,7 @@ from common.credentials import (
     get_ssh_private_key,
     get_jp_image_id,
 )
-from common.api import api_request, get_api_base_url
+from common.api import api_request, get_api_base_url, report_error, ErrorSeverity, SystemService
 
 logger = setup_service_logging('jam-tailscale')
 
@@ -52,6 +52,18 @@ TAILSCALE_TAILNET = "effortlesspresence.com"
 
 # Connection check settings
 MAX_CONNECTION_WAIT = 60  # seconds to wait for existing connection
+
+
+def report_tailscale_error(error_message: str):
+    """Report a Tailscale error to the backend."""
+    try:
+        report_error(
+            SystemService.TAILSCALE,
+            f"Tailscale setup failed: {error_message}",
+            ErrorSeverity.HIGH,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to report error to backend: {e}")
 
 
 def run_command(cmd: list, timeout: int = 30) -> Tuple[bool, str, str]:
@@ -506,9 +518,10 @@ def main():
     if not is_device_announced():
         logger.info("Device not yet announced - attempting to announce now...")
         if not try_announce():
-            logger.info("Could not announce device - Tailscale will be provisioned via mobile app setup")
-            logger.info("Exiting - jam-tailscale will retry on next boot or after app provisioning")
-            sys.exit(0)
+            # Exit with failure so Restart=on-failure will retry
+            # This handles the case where network is slow to establish after boot
+            logger.warning("Could not announce device - will retry after RestartSec")
+            sys.exit(1)
         logger.info("Device announced successfully!")
 
     # Device is announced - we can use the authenticated API
@@ -517,7 +530,9 @@ def main():
     # Fetch credentials from backend
     credentials = fetch_tailscale_credentials()
     if not credentials:
-        logger.error("Failed to fetch Tailscale credentials from backend")
+        error_msg = "Failed to fetch Tailscale credentials from backend"
+        logger.error(error_msg)
+        report_tailscale_error(error_msg)
         sys.exit(1)
 
     client_id, client_secret = credentials
@@ -525,13 +540,17 @@ def main():
     # Get OAuth access token
     access_token = get_oauth_access_token(client_id, client_secret)
     if not access_token:
-        logger.error("Failed to get Tailscale access token")
+        error_msg = "Failed to get Tailscale OAuth access token"
+        logger.error(error_msg)
+        report_tailscale_error(error_msg)
         sys.exit(1)
 
     # Generate auth key
     auth_key = generate_auth_key(access_token)
     if not auth_key:
-        logger.error("Failed to generate Tailscale auth key")
+        error_msg = "Failed to generate Tailscale auth key"
+        logger.error(error_msg)
+        report_tailscale_error(error_msg)
         sys.exit(1)
 
     # Set up Tailscale
@@ -543,7 +562,9 @@ def main():
             report_tailscale_ip_to_backend(ip)
         sys.exit(0)
     else:
-        logger.error("Tailscale setup failed")
+        error_msg = "Tailscale setup failed - could not connect after authentication"
+        logger.error(error_msg)
+        report_tailscale_error(error_msg)
         sys.exit(1)
 
 
