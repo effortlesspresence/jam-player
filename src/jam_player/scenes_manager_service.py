@@ -157,7 +157,12 @@ def fetch_content() -> Optional[List[Dict[str, Any]]]:
 
 def download_media(url: str, dest_path: Path) -> bool:
     """
-    Download media file from URL to destination path.
+    Download media file from URL to destination path using chunked streaming.
+
+    Uses chunked downloads to:
+    - Avoid loading entire file into memory
+    - Detect connection stalls quickly (per-chunk timeout vs per-file)
+    - Handle large files on slow connections gracefully
 
     Args:
         url: URL to download from
@@ -169,6 +174,11 @@ def download_media(url: str, dest_path: Path) -> bool:
     import requests
     from requests.exceptions import ReadTimeout, ConnectionError as ReqConnectionError
 
+    # Chunked download settings
+    CHUNK_SIZE = 64 * 1024  # 64KB chunks
+    CONNECT_TIMEOUT = 10    # 10 seconds to establish connection
+    READ_TIMEOUT = 30       # 30 seconds between chunks (detects stalls)
+
     if not url:
         logger.warning("Empty URL, skipping download")
         return False
@@ -179,21 +189,24 @@ def download_media(url: str, dest_path: Path) -> bool:
 
     # Log the full URL for debugging
     logger.info(f"Downloading media: {url[:100]}{'...' if len(url) > 100 else ''}")
-    logger.info(f"  Destination: {dest_path}")
+
+    # Ensure parent directory exists before we start downloading
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Retry logic for transient network issues
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            response = requests.get(url, timeout=120)
-            response.raise_for_status()
+            # Use streaming download with per-chunk timeout
+            # timeout=(connect, read) - read timeout applies between chunks
+            with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as response:
+                response.raise_for_status()
 
-            # Ensure parent directory exists
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Write file
-            with open(dest_path, 'wb') as f:
-                f.write(response.content)
+                # Write file in chunks as data arrives
+                with open(dest_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                        if chunk:  # filter out keep-alive chunks
+                            f.write(chunk)
 
             # Verify file was written and has content
             if not dest_path.exists():
@@ -228,13 +241,28 @@ def download_media(url: str, dest_path: Path) -> bool:
             return True
 
         except (ReqConnectionError, ReadTimeout) as e:
+            # Clean up partial file before retry
+            if dest_path.exists():
+                try:
+                    dest_path.unlink()
+                except Exception:
+                    pass
+
             if attempt < max_retries - 1:
                 logger.warning(f"Download attempt {attempt + 1} failed, retrying: {e}")
                 time.sleep(5)
             else:
                 logger.error(f"Failed to download after {max_retries} attempts: {e}")
                 return False
+
         except Exception as e:
+            # Clean up partial file on unexpected error
+            if dest_path.exists():
+                try:
+                    dest_path.unlink()
+                except Exception:
+                    pass
+
             logger.error(f"Error downloading media: {e}", exc_info=True)
             return False
 
