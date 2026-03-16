@@ -324,6 +324,85 @@ def cleanup_backup():
             logger.warning(f"Failed to clean up backup: {e}")
 
 
+def check_and_reexec_if_updated() -> bool:
+    """
+    Check if jam_update.py itself has changed and re-exec if needed.
+
+    This solves the chicken-and-egg problem where changes to jam_update.py
+    (like new install functions) don't take effect until the NEXT update,
+    because the currently running process is the old version.
+
+    Flow:
+    1. Compare repo version vs currently running version
+    2. If different and not already re-execed:
+       a. Copy new version to /opt/jam/services/
+       b. Re-exec with the new version
+
+    Uses JAM_UPDATE_REEXEC environment variable to prevent infinite loops.
+
+    Returns:
+        True if we should continue (no re-exec needed or re-exec failed safely)
+        Does not return if re-exec succeeds (process is replaced)
+    """
+    REEXEC_ENV_VAR = 'JAM_UPDATE_REEXEC'
+
+    # Check if we've already re-execed (prevent infinite loop)
+    if os.environ.get(REEXEC_ENV_VAR) == '1':
+        logger.info("Running after re-exec - continuing with new version")
+        return True
+
+    # Paths
+    repo_script = SERVICES_V2_SRC / 'jam_update.py'
+    installed_script = SERVICES_DEST / 'jam_update.py'
+
+    # If repo script doesn't exist, something is wrong - continue anyway
+    if not repo_script.exists():
+        logger.warning(f"Repo script not found at {repo_script} - skipping re-exec check")
+        return True
+
+    # If installed script doesn't exist, this is first install - no need to re-exec
+    if not installed_script.exists():
+        logger.info("No installed jam_update.py yet - skipping re-exec check")
+        return True
+
+    try:
+        repo_content = repo_script.read_text()
+        installed_content = installed_script.read_text()
+
+        if repo_content == installed_content:
+            logger.info("jam_update.py unchanged - no re-exec needed")
+            return True
+
+        logger.info("jam_update.py has changed - preparing to re-exec with new version...")
+
+        # Copy new version to installed location
+        shutil.copy2(repo_script, installed_script)
+        logger.info(f"Copied new jam_update.py to {installed_script}")
+
+        # Set environment variable to prevent infinite loop
+        os.environ[REEXEC_ENV_VAR] = '1'
+
+        # Re-exec with the new script
+        # Use the same Python interpreter and the installed script path
+        python_exe = sys.executable
+        script_path = str(installed_script)
+
+        logger.info(f"Re-executing: {python_exe} {script_path}")
+
+        # os.execv replaces the current process - this does not return on success
+        os.execv(python_exe, [python_exe, script_path])
+
+        # If we get here, execv failed
+        logger.error("os.execv returned unexpectedly - this should not happen")
+        return True
+
+    except Exception as e:
+        # If anything goes wrong, log it and continue with old version
+        # Better to complete the update with old logic than to fail entirely
+        logger.error(f"Re-exec check failed: {e} - continuing with current version")
+        return True
+
+
 def configure_git_safe_directory():
     """
     Configure git to trust the JAM repo directory.
@@ -1369,6 +1448,11 @@ def main():
     # Pull latest code (git repo, not the installed files)
     if not pull_latest(branch):
         fail_update("Failed to pull latest code from git", should_rollback=False)
+
+    # Check if jam_update.py itself changed - if so, re-exec with new version
+    # This ensures new install functions (like install_wifi_stability_configs)
+    # take effect immediately, not on the next update cycle
+    check_and_reexec_if_updated()
 
     # Ensure venv exists (before backup since we're not backing up venv)
     if not ensure_venv_exists():
