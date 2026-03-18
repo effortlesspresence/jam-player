@@ -6,6 +6,7 @@ This service runs once on every boot after jam-first-boot.service completes.
 It validates the system state and ensures the device is ready to operate.
 
 Checks performed:
+0. Clear network impairments (from jam-simulate-network testing tool)
 1. Network connectivity (WiFi or Ethernet)
 2. JAM 2.0 API availability (non-blocking)
 3. System clock synchronization via chrony
@@ -36,6 +37,7 @@ from common.system import (
     check_chrony_sync,
     check_required_services,
     manage_service,
+    clear_network_impairments,
 )
 
 logger = setup_service_logging('jam-boot-check')
@@ -60,6 +62,12 @@ def run_boot_check() -> bool:
 
     # Notify systemd we're starting
     sd_notifier.notify("STATUS=Running boot checks...")
+
+    # 0. Clear any network impairments left from testing
+    # This ensures jam-simulate-network settings don't persist across reboots
+    # or get baked into device images
+    sd_notifier.notify("STATUS=Clearing network impairments...")
+    clear_network_impairments()
 
     device_uuid = get_device_uuid()
     if device_uuid:

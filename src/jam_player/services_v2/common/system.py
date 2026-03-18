@@ -431,3 +431,79 @@ def get_service_status(service_name: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"Error getting status of {service_name}: {e}")
         return None
+
+
+def clear_network_impairments() -> bool:
+    """
+    Clear any network traffic control (tc) impairments and stop chaos processes.
+
+    This is called on every boot to ensure that network simulation settings
+    from jam-simulate-network are not accidentally left enabled when creating
+    device images.
+
+    Returns:
+        True if cleared successfully (or nothing to clear), False on error.
+    """
+    # First, stop any running chaos process from jam-simulate-network
+    chaos_pid_file = '/tmp/jam-network-chaos.pid'
+    try:
+        if Path(chaos_pid_file).exists():
+            pid_str = Path(chaos_pid_file).read_text().strip()
+            if pid_str:
+                pid = int(pid_str)
+                try:
+                    import os as os_module
+                    os_module.kill(pid, 9)  # SIGKILL
+                    logger.info(f"Stopped network chaos process (PID {pid})")
+                except ProcessLookupError:
+                    pass  # Process already dead
+                except Exception as e:
+                    logger.debug(f"Could not kill chaos process {pid}: {e}")
+            Path(chaos_pid_file).unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug(f"Error checking chaos PID file: {e}")
+
+    # Try wlan0 first, then eth0
+    interfaces = ['wlan0', 'eth0']
+
+    for iface in interfaces:
+        try:
+            # Check if interface exists
+            check_result = subprocess.run(
+                ['ip', 'link', 'show', iface],
+                capture_output=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT
+            )
+            if check_result.returncode != 0:
+                continue  # Interface doesn't exist
+
+            # Ensure interface is up (chaos mode may have left it down)
+            subprocess.run(
+                ['ip', 'link', 'set', iface, 'up'],
+                capture_output=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT
+            )
+
+            # Try to delete any tc qdisc rules
+            result = subprocess.run(
+                ['tc', 'qdisc', 'del', 'dev', iface, 'root'],
+                capture_output=True,
+                text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT
+            )
+
+            # returncode 2 means "no qdisc to delete" which is fine
+            if result.returncode == 0:
+                logger.info(f"Cleared network impairments from {iface}")
+            # Don't log if there was nothing to clear
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Timeout clearing network impairments from {iface}")
+        except FileNotFoundError:
+            # tc command not found - shouldn't happen on a real JAM Player
+            logger.debug("tc command not found")
+            return True
+        except Exception as e:
+            logger.warning(f"Error clearing network impairments from {iface}: {e}")
+
+    return True  # Always return True - failure to clear shouldn't block boot

@@ -1,0 +1,393 @@
+#!/bin/bash
+#
+# jam-simulate-network - Simulate poor network conditions for testing
+#
+# This script uses Linux traffic control (tc) with netem to simulate
+# various network conditions commonly found in restaurant environments.
+#
+# SAFETY: Network impairments are automatically cleared on every boot
+# by jam-boot-check.service, so you can't accidentally bake bad settings
+# into a device image.
+#
+# Usage:
+#   jam-simulate-network bad         - Basic bad WiFi (fixed degradation)
+#   jam-simulate-network terrible    - Severe degradation (fixed)
+#   jam-simulate-network flaky       - High packet loss (fixed)
+#   jam-simulate-network bursty      - Realistic bursty packet loss
+#   jam-simulate-network disconnect  - Drop connection for N seconds
+#   jam-simulate-network chaos       - Random disconnects (background)
+#   jam-simulate-network restaurant  - Full restaurant simulation (background)
+#   jam-simulate-network off         - Remove all impairments, stop chaos
+#   jam-simulate-network status      - Show current state
+#
+
+set -e
+
+# PID file for background chaos processes
+CHAOS_PID_FILE="/tmp/jam-network-chaos.pid"
+
+# Detect the primary network interface (prefer wlan0, fall back to eth0)
+get_interface() {
+    if ip link show wlan0 &>/dev/null; then
+        echo "wlan0"
+    elif ip link show eth0 &>/dev/null; then
+        echo "eth0"
+    else
+        echo "ERROR: No wlan0 or eth0 interface found" >&2
+        exit 1
+    fi
+}
+
+IFACE=$(get_interface)
+
+# Clear any existing tc rules
+clear_tc_rules() {
+    tc qdisc del dev "$IFACE" root 2>/dev/null || true
+}
+
+# Stop any running chaos process
+stop_chaos() {
+    if [ -f "$CHAOS_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$CHAOS_PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping chaos process (PID $pid)..."
+            kill "$pid" 2>/dev/null || true
+            # Wait for it to die
+            for i in {1..10}; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.5
+            done
+            # Force kill if still running
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$CHAOS_PID_FILE"
+    fi
+}
+
+# Bring interface back up (in case it was left down)
+ensure_interface_up() {
+    ip link set "$IFACE" up 2>/dev/null || true
+}
+
+# Full cleanup
+full_cleanup() {
+    stop_chaos
+    clear_tc_rules
+    ensure_interface_up
+}
+
+# Show current tc status
+show_status() {
+    echo "Interface: $IFACE"
+    echo ""
+
+    # Check if chaos is running
+    if [ -f "$CHAOS_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$CHAOS_PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Chaos process: RUNNING (PID $pid)"
+        else
+            echo "Chaos process: not running (stale PID file)"
+        fi
+    else
+        echo "Chaos process: not running"
+    fi
+    echo ""
+
+    # Check interface state
+    local state
+    state=$(ip link show "$IFACE" | grep -o 'state [A-Z]*' | cut -d' ' -f2)
+    echo "Interface state: $state"
+    echo ""
+
+    echo "Current tc rules:"
+    tc qdisc show dev "$IFACE" 2>/dev/null | grep -v "^qdisc fq_codel" || echo "  (none/default)"
+    echo ""
+}
+
+# ============================================================================
+# BASIC MODES (fixed degradation, no disconnects)
+# ============================================================================
+
+mode_bad() {
+    full_cleanup
+    # Basic bad WiFi - fixed degradation
+    # Good for testing timeout handling and slow responses
+    tc qdisc add dev "$IFACE" root netem \
+        delay 200ms 50ms distribution normal \
+        loss random 5% \
+        rate 500kbit
+    echo "Network impairment ENABLED on $IFACE"
+    echo "  Mode: bad (basic degradation)"
+    echo "  Bandwidth: 500Kbps"
+    echo "  Latency: 200ms +/- 50ms"
+    echo "  Packet loss: 5% random"
+    echo ""
+    echo "Run 'jam-simulate-network off' to disable"
+}
+
+mode_terrible() {
+    full_cleanup
+    # Severe degradation - worst case fixed conditions
+    tc qdisc add dev "$IFACE" root netem \
+        delay 500ms 200ms distribution normal \
+        loss random 10% \
+        rate 256kbit
+    echo "Network impairment ENABLED on $IFACE"
+    echo "  Mode: terrible (severe degradation)"
+    echo "  Bandwidth: 256Kbps"
+    echo "  Latency: 500ms +/- 200ms"
+    echo "  Packet loss: 10% random"
+    echo ""
+    echo "Run 'jam-simulate-network off' to disable"
+}
+
+mode_flaky() {
+    full_cleanup
+    # High packet loss - tests retry logic
+    tc qdisc add dev "$IFACE" root netem \
+        delay 100ms 30ms \
+        loss random 20%
+    echo "Network impairment ENABLED on $IFACE"
+    echo "  Mode: flaky (high packet loss)"
+    echo "  Bandwidth: unlimited"
+    echo "  Latency: 100ms +/- 30ms"
+    echo "  Packet loss: 20% random"
+    echo ""
+    echo "Run 'jam-simulate-network off' to disable"
+}
+
+# ============================================================================
+# REALISTIC MODES (bursty loss, disconnects)
+# ============================================================================
+
+mode_bursty() {
+    full_cleanup
+    # Bursty packet loss using Gilbert-Elliott model
+    # This is MORE REALISTIC than random loss - packets are lost in bursts
+    # like real WiFi interference (microwave, someone walking by, etc.)
+    #
+    # Gilbert-Elliott parameters: p=5% h=25%
+    # p = probability of entering bad state (5%)
+    # h = probability of loss while in bad state (25%)
+    # This creates bursts of ~4 packets lost at a time
+    tc qdisc add dev "$IFACE" root netem \
+        delay 150ms 75ms distribution normal \
+        loss gemodel 1% 10% 70% 0% \
+        rate 1mbit
+    echo "Network impairment ENABLED on $IFACE"
+    echo "  Mode: bursty (realistic burst packet loss)"
+    echo "  Bandwidth: 1Mbps"
+    echo "  Latency: 150ms +/- 75ms"
+    echo "  Packet loss: Gilbert-Elliott model (bursty, ~5% avg)"
+    echo "  Simulates: WiFi interference, microwave, people walking by"
+    echo ""
+    echo "Run 'jam-simulate-network off' to disable"
+}
+
+mode_disconnect() {
+    local duration="${1:-5}"
+
+    echo "Disconnecting $IFACE for ${duration} seconds..."
+    ip link set "$IFACE" down
+    sleep "$duration"
+    ip link set "$IFACE" up
+    echo "Interface $IFACE is back up"
+    echo ""
+    echo "Note: It may take a few seconds for WiFi to reassociate"
+}
+
+# ============================================================================
+# CHAOS MODES (background processes)
+# ============================================================================
+
+# This function runs in the background
+chaos_loop() {
+    local mode="$1"
+    local iface="$2"
+
+    echo $$ > "$CHAOS_PID_FILE"
+
+    case "$mode" in
+        random)
+            # Random disconnects every 30-90 seconds, down for 2-8 seconds
+            while true; do
+                local wait_time=$((RANDOM % 60 + 30))
+                sleep "$wait_time"
+
+                local down_time=$((RANDOM % 6 + 2))
+                logger -t jam-network-chaos "Dropping $iface for ${down_time}s"
+                ip link set "$iface" down
+                sleep "$down_time"
+                ip link set "$iface" up
+                logger -t jam-network-chaos "Restored $iface"
+            done
+            ;;
+        restaurant)
+            # Full restaurant simulation:
+            # - Bursty packet loss always on
+            # - Random disconnects every 1-5 minutes
+            # - Bandwidth fluctuates
+            # - Occasional longer outages
+
+            while true; do
+                # Set random degradation level
+                local profiles=(
+                    "delay 100ms 30ms loss gemodel 0.5% 5% 80% 0% rate 2mbit"   # decent
+                    "delay 200ms 75ms loss gemodel 1% 10% 70% 0% rate 1mbit"   # degraded
+                    "delay 300ms 100ms loss gemodel 2% 15% 60% 0% rate 500kbit" # bad
+                    "delay 500ms 150ms loss gemodel 3% 20% 50% 0% rate 256kbit" # terrible
+                )
+                local profile_idx=$((RANDOM % ${#profiles[@]}))
+                local profile="${profiles[$profile_idx]}"
+
+                tc qdisc replace dev "$iface" root netem $profile 2>/dev/null || \
+                    tc qdisc add dev "$iface" root netem $profile 2>/dev/null || true
+
+                # How long until next change (30s to 3min)
+                local hold_time=$((RANDOM % 150 + 30))
+
+                # 20% chance of a disconnect during this period
+                if [ $((RANDOM % 5)) -eq 0 ]; then
+                    local disconnect_delay=$((RANDOM % hold_time))
+                    sleep "$disconnect_delay"
+
+                    # 10% chance of long outage (30-60s), otherwise short (2-10s)
+                    local down_time
+                    if [ $((RANDOM % 10)) -eq 0 ]; then
+                        down_time=$((RANDOM % 30 + 30))
+                        logger -t jam-network-chaos "Long outage: dropping $iface for ${down_time}s"
+                    else
+                        down_time=$((RANDOM % 8 + 2))
+                        logger -t jam-network-chaos "Brief dropout: $iface down for ${down_time}s"
+                    fi
+
+                    ip link set "$iface" down
+                    sleep "$down_time"
+                    ip link set "$iface" up
+
+                    sleep $((hold_time - disconnect_delay))
+                else
+                    sleep "$hold_time"
+                fi
+            done
+            ;;
+    esac
+}
+
+mode_chaos() {
+    full_cleanup
+
+    echo "Starting chaos mode (random disconnects)..."
+    echo "  Interface: $IFACE"
+    echo "  Disconnects: every 30-90 seconds"
+    echo "  Down time: 2-8 seconds each"
+    echo ""
+    echo "This runs in the background. Use 'jam-simulate-network off' to stop."
+    echo "Check 'journalctl -t jam-network-chaos -f' to see disconnect events."
+    echo ""
+
+    # Start background process
+    chaos_loop "random" "$IFACE" &
+    disown
+
+    sleep 1
+    if [ -f "$CHAOS_PID_FILE" ]; then
+        echo "Chaos process started (PID $(cat "$CHAOS_PID_FILE"))"
+    fi
+}
+
+mode_restaurant() {
+    full_cleanup
+
+    echo "Starting restaurant simulation mode..."
+    echo "  Interface: $IFACE"
+    echo "  Bandwidth: fluctuates 256Kbps - 2Mbps"
+    echo "  Latency: fluctuates 100-500ms"
+    echo "  Packet loss: bursty (Gilbert-Elliott model)"
+    echo "  Disconnects: random, 20% chance per period"
+    echo "  Long outages: occasional 30-60 second drops"
+    echo ""
+    echo "This is the most realistic simulation of actual restaurant WiFi."
+    echo "Runs in background. Use 'jam-simulate-network off' to stop."
+    echo "Check 'journalctl -t jam-network-chaos -f' to see events."
+    echo ""
+
+    # Start background process
+    chaos_loop "restaurant" "$IFACE" &
+    disown
+
+    sleep 1
+    if [ -f "$CHAOS_PID_FILE" ]; then
+        echo "Restaurant simulation started (PID $(cat "$CHAOS_PID_FILE"))"
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+case "$1" in
+    bad)
+        mode_bad
+        ;;
+    terrible)
+        mode_terrible
+        ;;
+    flaky)
+        mode_flaky
+        ;;
+    bursty)
+        mode_bursty
+        ;;
+    disconnect)
+        mode_disconnect "$2"
+        ;;
+    chaos)
+        mode_chaos
+        ;;
+    restaurant)
+        mode_restaurant
+        ;;
+    off)
+        full_cleanup
+        echo "All network impairments DISABLED"
+        echo "Chaos processes stopped"
+        echo "Interface $IFACE restored to normal"
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Usage: jam-simulate-network <mode> [options]"
+        echo ""
+        echo "Basic modes (fixed degradation):"
+        echo "  bad         - 500Kbps, 200ms latency, 5% random loss"
+        echo "  terrible    - 256Kbps, 500ms latency, 10% random loss"
+        echo "  flaky       - Normal speed, 20% random packet loss"
+        echo ""
+        echo "Realistic modes (bursty loss, disconnects):"
+        echo "  bursty      - Realistic burst packet loss (Gilbert-Elliott model)"
+        echo "  disconnect [N]  - Drop interface for N seconds (default: 5)"
+        echo "  chaos       - Random disconnects every 30-90s (background)"
+        echo "  restaurant  - Full restaurant simulation (background)"
+        echo "               Combines: variable bandwidth, bursty loss,"
+        echo "               random disconnects, occasional long outages"
+        echo ""
+        echo "Control:"
+        echo "  off         - Remove all impairments, stop background processes"
+        echo "  status      - Show current network simulation state"
+        echo ""
+        echo "Examples:"
+        echo "  jam-simulate-network restaurant  # Most realistic test"
+        echo "  jam-simulate-network disconnect 10  # Force 10s disconnect"
+        echo "  jam-simulate-network off  # Back to normal"
+        echo ""
+        echo "Note: All impairments are automatically cleared on boot"
+        exit 1
+        ;;
+esac

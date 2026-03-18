@@ -8,7 +8,7 @@ commands for device control.
 Purpose:
 1. Establish and maintain a WebSocket connection to the backend
 2. Subscribe to DEVICE_COMMANDS for this device's UUID
-3. Handle incoming commands (e.g., SET_ORIENTATION, SET_SCREEN_ID, REFRESH_CONTENT)
+3. Handle incoming commands (e.g., SET_ORIENTATION, SET_SCREEN_ID, REFRESH_CONTENT, TERMINAL_COMMAND)
 4. Execute commands with proper error handling
 
 Key behaviors:
@@ -41,6 +41,7 @@ except ImportError:
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import get_device_uuid, is_device_announced, update_screen_id_if_changed
 from common.paths import DISPLAY_ORIENTATION_FILE, ENVIRONMENT_FILE
+from common.api import api_request
 
 logger = setup_service_logging('jam-ws-commands')
 
@@ -60,6 +61,12 @@ RECONNECT_BACKOFF_MULTIPLIER = 2
 
 # Watchdog interval (ping systemd every 30 seconds)
 WATCHDOG_INTERVAL = 30
+
+# Terminal command execution timeout (90 seconds)
+TERMINAL_COMMAND_TIMEOUT = 90
+
+# Maximum output size (256KB - with some headroom)
+MAX_OUTPUT_SIZE = 250 * 1024
 
 # Systemd notifier
 notifier = sdnotify.SystemdNotifier()
@@ -257,6 +264,111 @@ def handle_refresh_content(payload: dict, command_id: str) -> bool:
         return False
 
 
+def handle_terminal_command(payload: dict, command_id: str) -> bool:
+    """
+    Handle a terminal command.
+
+    Executes a terminal command and reports the result back to the backend.
+    Commands are executed with a 90 second timeout to prevent hanging.
+
+    Args:
+        payload: The command payload containing the command to execute
+        command_id: The unique command ID for logging and result reporting
+
+    Returns:
+        True if the command was handled (even if it failed), False if there was
+        a critical error preventing execution or reporting.
+    """
+    import subprocess
+    from datetime import datetime, timezone
+
+    command = payload.get('command')
+
+    if not command:
+        logger.error(f"[{command_id}] TERMINAL_COMMAND missing command")
+        return False
+
+    logger.info(f"[{command_id}] Executing terminal command: {command[:100]}...")
+
+    # Track timing
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    # Execute the command
+    status = 'COMPLETED'
+    exit_code = 0
+    output = ''
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=TERMINAL_COMMAND_TIMEOUT,
+        )
+        exit_code = result.returncode
+        # Combine stdout and stderr
+        output = result.stdout
+        if result.stderr:
+            if output:
+                output += '\n\n--- STDERR ---\n'
+            output += result.stderr
+
+        if exit_code != 0:
+            status = 'FAILED'
+            logger.info(f"[{command_id}] Command completed with exit code {exit_code}")
+        else:
+            logger.info(f"[{command_id}] Command completed successfully")
+
+    except subprocess.TimeoutExpired:
+        status = 'TIMED_OUT'
+        exit_code = -1
+        output = f"Command timed out after {TERMINAL_COMMAND_TIMEOUT} seconds"
+        logger.warning(f"[{command_id}] Command timed out")
+    except Exception as e:
+        status = 'FAILED'
+        exit_code = -1
+        output = f"Error executing command: {str(e)}"
+        logger.error(f"[{command_id}] Command execution error: {e}")
+
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    # Truncate output if too long
+    if len(output) > MAX_OUTPUT_SIZE:
+        output = output[:MAX_OUTPUT_SIZE - 50] + '\n\n[OUTPUT TRUNCATED - exceeded 250KB limit]'
+
+    # Report result back to the backend
+    device_uuid = get_device_uuid()
+    if not device_uuid:
+        logger.error(f"[{command_id}] Cannot report result: device UUID not found")
+        return False
+
+    logger.info(f"[{command_id}] Reporting result to backend (status: {status}, exitCode: {exit_code})")
+
+    response = api_request(
+        method='POST',
+        path=f'/jam-players/{device_uuid}/terminal-command-result',
+        body={
+            'commandId': command_id,
+            'commandOutput': output,
+            'exitCode': exit_code,
+            'startedAt': started_at,
+            'completedAt': completed_at,
+            'status': status,
+        },
+        timeout=30,
+        signed=True,
+    )
+
+    if response and response.status_code == 200:
+        logger.info(f"[{command_id}] Result reported successfully")
+        return True
+    else:
+        status_code = response.status_code if response else 'no response'
+        logger.warning(f"[{command_id}] Failed to report result: {status_code}")
+        return False
+
+
 def handle_device_command(message: dict):
     """
     Handle an incoming device command message.
@@ -288,6 +400,12 @@ def handle_device_command(message: dict):
             logger.info(f"[{command_id}] Content refresh triggered successfully")
         else:
             logger.warning(f"[{command_id}] Failed to trigger content refresh")
+    elif command_type == 'TERMINAL_COMMAND':
+        success = handle_terminal_command(payload, command_id)
+        if success:
+            logger.info(f"[{command_id}] Terminal command handled successfully")
+        else:
+            logger.warning(f"[{command_id}] Failed to handle terminal command")
     else:
         logger.warning(f"Unknown command type: {command_type}")
 
