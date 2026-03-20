@@ -109,8 +109,8 @@ def get_rotation_angle() -> int:
     # Map orientation to MPV rotation angle
     orientation_to_rotation = {
         'LANDSCAPE': 0,
-        'PORTRAIT_BOTTOM_ON_LEFT': 90,
-        'PORTRAIT_BOTTOM_ON_RIGHT': 270,
+        'PORTRAIT_BOTTOM_ON_LEFT': 270,
+        'PORTRAIT_BOTTOM_ON_RIGHT': 90,
     }
 
     rotation = orientation_to_rotation.get(orientation, 0)
