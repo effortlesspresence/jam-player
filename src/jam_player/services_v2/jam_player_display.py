@@ -1585,15 +1585,21 @@ class JamPlayerDisplayManager:
                         if 'actual_duration' not in scene:
                             scene['actual_duration'] = scene.get('duration', 15)
 
-                    # Check if scene list or content changed (IDs or media files)
+                    # Check if scene list changed (IDs or media files) - used to determine if we reset playback
                     old_scene_keys = [(s.get('id'), s.get('media_file')) for s in scenes]
                     new_scene_keys = [(s.get('id'), s.get('media_file')) for s in new_scenes]
+                    scene_list_changed = old_scene_keys != new_scene_keys
 
-                    if old_scene_keys != new_scene_keys:
+                    # Always update scenes when content file changed (catches duration/metadata changes)
+                    if content_changed or scene_list_changed:
                         scenes = new_scenes
                         cycle_duration_ms = self._calculate_cycle_duration_ms(scenes)
-                        self._current_scene_index = -1
-                        logger.info(f"Scenes updated: {len(scenes)} scenes, cycle: {cycle_duration_ms}ms")
+                        if scene_list_changed:
+                            # Only reset playback position when actual scenes changed
+                            self._current_scene_index = -1
+                            logger.info(f"Scene list changed: {len(scenes)} scenes, cycle: {cycle_duration_ms}ms")
+                        else:
+                            logger.info(f"Scene metadata updated (duration, etc): cycle now {cycle_duration_ms}ms")
                 elif not new_scenes and scenes:
                     # All scenes now scheduled off - show message screen
                     logger.info("All scenes now scheduled off - showing waiting screen")
