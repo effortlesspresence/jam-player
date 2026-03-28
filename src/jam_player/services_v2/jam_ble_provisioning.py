@@ -878,10 +878,10 @@ def try_announce_after_wifi():
     This runs in a background thread after successful WiFi connection.
     It waits for internet connectivity, then tries to announce.
     """
-    logger.info("Scheduling post-WiFi announce attempt in 20 seconds...")
+    logger.info("Scheduling post-WiFi announce attempt in 10 seconds...")
 
-    # Wait 20 seconds for connection to fully establish
-    time.sleep(20)
+    # Wait 10 seconds for connection to fully establish
+    time.sleep(10)
 
     # Check for internet connectivity (try a few times)
     for attempt in range(3):
@@ -1043,7 +1043,7 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     self.status_characteristic.set_status('connected', f'Connected to {ssid or connection_name}')
 
                     # Trigger announce + Tailscale setup in another background thread
-                    # This runs 20 seconds after WiFi connects to ensure connection is stable
+                    # This runs 10 seconds after WiFi connects to ensure connection is stable
                     announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
                     announce_thread.start()
                 else:

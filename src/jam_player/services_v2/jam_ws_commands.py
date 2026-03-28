@@ -56,7 +56,7 @@ DEFAULT_ENVIRONMENT = 'prod'
 
 # Reconnection settings
 INITIAL_RECONNECT_DELAY = 5  # seconds
-MAX_RECONNECT_DELAY = 300  # 5 minutes max
+MAX_RECONNECT_DELAY = 60  # 1 minute max (faster recovery during initial setup)
 RECONNECT_BACKOFF_MULTIPLIER = 2
 
 # Watchdog interval (ping systemd every 30 seconds)
