@@ -19,6 +19,9 @@ sdnotify==0.3.2
 requests==2.32.3
 certifi==2024.8.30
 
+# WebSocket client for jam-ws-commands.service
+websocket-client==1.9.0
+
 # Image generation for error screens (writes directly to /dev/fb0)
 pillow==10.4.0
 
