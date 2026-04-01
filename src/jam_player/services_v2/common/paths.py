@@ -32,6 +32,7 @@ Directory structure:
             └── loop.mp4     # Main stitched content video
 """
 
+import os
 from pathlib import Path
 
 # Base directories
@@ -113,3 +114,40 @@ LEGACY_APP_DATA_DIR = LEGACY_JAM_DIR / 'app_data'
 LEGACY_MEDIA_DIR = LEGACY_APP_DATA_DIR / 'live_media'
 LEGACY_SCENES_DIR = LEGACY_APP_DATA_DIR / 'live_scenes'
 LEGACY_LOOP_VIDEO_PATH = LEGACY_MEDIA_DIR / 'loop.mp4'
+
+
+# =============================================================================
+# File writing utilities
+# =============================================================================
+
+def safe_write_text(path: Path, content: str, mode: int = 0o644):
+    """
+    Write text to file and ensure it's flushed to disk immediately.
+
+    This prevents data loss if power is cut shortly after writing.
+    Critical for manufacturing QA where devices are power-cycled quickly.
+
+    Args:
+        path: Path to write to
+        content: Text content to write
+        mode: File permissions (default 0o644)
+    """
+    with open(path, 'w') as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(path, mode)
+
+
+def safe_touch(path: Path, mode: int = 0o644):
+    """
+    Create an empty file and ensure it's flushed to disk immediately.
+
+    Use this instead of Path.touch() for flag files that must persist
+    even if power is cut immediately after.
+
+    Args:
+        path: Path to create
+        mode: File permissions (default 0o644)
+    """
+    safe_write_text(path, '', mode)

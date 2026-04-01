@@ -24,6 +24,8 @@ from .paths import (
     SCREEN_ID_FILE,
     LOCATION_TIMEZONE_FILE,
     DISPLAY_ORIENTATION_FILE,
+    safe_write_text,
+    safe_touch,
 )
 
 logger = logging.getLogger(__name__)
@@ -269,7 +271,7 @@ def set_device_announced() -> bool:
     """
     try:
         ANNOUNCED_FLAG.parent.mkdir(parents=True, exist_ok=True)
-        ANNOUNCED_FLAG.touch()
+        safe_touch(ANNOUNCED_FLAG)
         logger.info("Device marked as announced")
         return True
     except Exception as e:
@@ -291,7 +293,7 @@ def set_device_registered() -> bool:
     try:
         set_device_announced()  # Registered implies announced
         REGISTERED_FLAG.parent.mkdir(parents=True, exist_ok=True)
-        REGISTERED_FLAG.touch()
+        safe_touch(REGISTERED_FLAG)
         logger.info("Device marked as registered")
         return True
     except Exception as e:
@@ -360,7 +362,7 @@ def set_screen_id(screen_id: Optional[str]) -> bool:
     try:
         SCREEN_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
         if screen_id:
-            SCREEN_ID_FILE.write_text(screen_id.strip())
+            safe_write_text(SCREEN_ID_FILE, screen_id.strip())
             logger.info(f"Screen ID set to: {screen_id}")
         else:
             # Clear the file if screen_id is None (device unlinked)
@@ -445,7 +447,7 @@ def set_location_timezone(timezone: Optional[str]) -> bool:
     try:
         LOCATION_TIMEZONE_FILE.parent.mkdir(parents=True, exist_ok=True)
         if timezone:
-            LOCATION_TIMEZONE_FILE.write_text(timezone.strip())
+            safe_write_text(LOCATION_TIMEZONE_FILE, timezone.strip())
             logger.info(f"Location timezone set to: {timezone}")
         else:
             # Clear the file if timezone is None
@@ -524,11 +526,11 @@ def set_display_orientation(orientation: Optional[str]) -> bool:
     try:
         DISPLAY_ORIENTATION_FILE.parent.mkdir(parents=True, exist_ok=True)
         if orientation:
-            DISPLAY_ORIENTATION_FILE.write_text(orientation.strip())
+            safe_write_text(DISPLAY_ORIENTATION_FILE, orientation.strip())
             logger.info(f"Display orientation set to: {orientation}")
         else:
             # Write default if orientation is None
-            DISPLAY_ORIENTATION_FILE.write_text('LANDSCAPE')
+            safe_write_text(DISPLAY_ORIENTATION_FILE, 'LANDSCAPE')
             logger.info("Display orientation set to default: LANDSCAPE")
         return True
     except Exception as e:

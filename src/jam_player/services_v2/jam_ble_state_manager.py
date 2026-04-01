@@ -67,7 +67,7 @@ from gi.repository import GLib
 from common.system import manage_service
 from common.network import InternetConnectivityMonitor, check_internet_connectivity
 from common.credentials import is_device_registered
-from common.paths import INTERNET_VERIFIED_FLAG
+from common.paths import INTERNET_VERIFIED_FLAG, safe_touch
 
 # ============================================================================
 # Logging Configuration
@@ -519,7 +519,7 @@ class BLEStateManager:
         # This allows fast BLE reads without doing slow connectivity checks
         if is_online:
             try:
-                INTERNET_VERIFIED_FLAG.touch()
+                safe_touch(INTERNET_VERIFIED_FLAG)
             except Exception as e:
                 logger.warning(f"Failed to create internet verified flag: {e}")
 

@@ -39,6 +39,7 @@ from common.paths import (
     API_SIGNING_PUBLIC_KEY_FILE,
     SSH_PRIVATE_KEY_FILE,
     SSH_PUBLIC_KEY_FILE,
+    safe_write_text,
 )
 
 logger = setup_service_logging('jam-first-boot')
@@ -138,13 +139,11 @@ def generate_api_signing_keys() -> bool:
 
         # Save private key (raw bytes, base64 encoded)
         private_key_b64 = signing_key.encode(encoder=Base64Encoder).decode('utf-8')
-        API_SIGNING_PRIVATE_KEY_FILE.write_text(private_key_b64)
-        os.chmod(API_SIGNING_PRIVATE_KEY_FILE, 0o600)  # Root read/write only
+        safe_write_text(API_SIGNING_PRIVATE_KEY_FILE, private_key_b64, 0o600)
 
         # Save public key (raw bytes, base64 encoded)
         public_key_b64 = verify_key.encode(encoder=Base64Encoder).decode('utf-8')
-        API_SIGNING_PUBLIC_KEY_FILE.write_text(public_key_b64)
-        os.chmod(API_SIGNING_PUBLIC_KEY_FILE, 0o644)  # World readable (it's public)
+        safe_write_text(API_SIGNING_PUBLIC_KEY_FILE, public_key_b64, 0o644)
 
         logger.info("Generated API signing key pair successfully")
         return True
@@ -191,8 +190,7 @@ def setup_ssh_authorized_keys() -> bool:
         os.chown(JAM_USER_SSH_DIR, jam_uid, jam_gid)
 
         # Write authorized_keys file with the device's own public key
-        JAM_USER_AUTHORIZED_KEYS.write_text(device_public_key + '\n')
-        os.chmod(JAM_USER_AUTHORIZED_KEYS, 0o600)
+        safe_write_text(JAM_USER_AUTHORIZED_KEYS, device_public_key + '\n', 0o600)
         os.chown(JAM_USER_AUTHORIZED_KEYS, jam_uid, jam_gid)
 
         logger.info("Set up SSH authorized_keys with device's public key")
@@ -280,7 +278,7 @@ def already_completed() -> bool:
 
 def mark_complete():
     """Mark first boot as complete by creating flag file."""
-    FIRST_BOOT_COMPLETE_FLAG.touch()
+    safe_write_text(FIRST_BOOT_COMPLETE_FLAG, '', 0o644)
     logger.info(f"Created completion flag: {FIRST_BOOT_COMPLETE_FLAG}")
 
 
@@ -307,8 +305,7 @@ def run_first_boot() -> bool:
     if not DEVICE_UUID_FILE.exists():
         logger.info("Generating device UUID (v7)...")
         device_uuid = generate_device_uuid()
-        DEVICE_UUID_FILE.write_text(device_uuid)
-        os.chmod(DEVICE_UUID_FILE, 0o644)  # World readable (not a secret)
+        safe_write_text(DEVICE_UUID_FILE, device_uuid, 0o644)
         logger.info(f"Device UUID: {device_uuid}")
     else:
         device_uuid = DEVICE_UUID_FILE.read_text().strip()
@@ -359,6 +356,10 @@ def run_first_boot() -> bool:
 
     # Mark complete only if all tasks succeeded
     if all_success:
+        # Final sync to ensure ALL writes are on disk before marking complete
+        # Belt-and-suspenders with safe_write_text() for manufacturing reliability
+        logger.info("Syncing filesystem to ensure all credentials are persisted...")
+        subprocess.run(['sync'], check=True)
         mark_complete()
         logger.info("=" * 60)
         logger.info("JAM First Boot Service Completed Successfully")

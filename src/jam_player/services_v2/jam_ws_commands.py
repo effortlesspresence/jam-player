@@ -40,7 +40,7 @@ except ImportError:
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import get_device_uuid, is_device_announced, update_screen_id_if_changed
-from common.paths import DISPLAY_ORIENTATION_FILE, ENVIRONMENT_FILE
+from common.paths import DISPLAY_ORIENTATION_FILE, ENVIRONMENT_FILE, safe_write_text
 from common.api import api_request
 
 logger = setup_service_logging('jam-ws-commands')
@@ -143,7 +143,7 @@ def handle_set_orientation(payload: dict, command_id: str) -> bool:
             current_orientation = DISPLAY_ORIENTATION_FILE.read_text().strip()
 
         # Write new orientation
-        DISPLAY_ORIENTATION_FILE.write_text(orientation)
+        safe_write_text(DISPLAY_ORIENTATION_FILE, orientation)
         logger.info(f"[{command_id}] Display orientation saved to {DISPLAY_ORIENTATION_FILE}")
 
         # If orientation changed, restart jam-player-display.service to apply it

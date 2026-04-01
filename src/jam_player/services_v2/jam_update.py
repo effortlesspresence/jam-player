@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.api import report_error as api_report_error, ErrorSeverity, SystemService
-from common.paths import ENVIRONMENT_FILE
+from common.paths import ENVIRONMENT_FILE, safe_write_text
 
 # Try to import PIL for update screen display
 try:
@@ -894,7 +894,7 @@ def update_version_file(version: str) -> bool:
     """Update the version file."""
     try:
         VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        VERSION_FILE.write_text(version)
+        safe_write_text(VERSION_FILE, version)
         logger.info(f"Version updated to: {version[:12]}...")
         return True
     except Exception as e:
