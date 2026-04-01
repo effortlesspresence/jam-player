@@ -8,7 +8,10 @@ service infrastructure (signal handlers, watchdog).
 import subprocess
 import signal
 import logging
+from pathlib import Path
 from typing import Tuple, List, Optional, Callable
+
+from .paths import safe_write_text
 
 import sdnotify
 
@@ -507,3 +510,99 @@ def clear_network_impairments() -> bool:
             logger.warning(f"Error clearing network impairments from {iface}: {e}")
 
     return True  # Always return True - failure to clear shouldn't block boot
+
+
+def get_unique_hostname(device_uuid: str) -> str:
+    """
+    Generate a unique hostname from the device UUID.
+
+    Uses the last 5 characters of the UUID (without hyphens) to create
+    a hostname like 'jam-player-a1b2c'. This matches the BLE device naming
+    convention (JAM-PLAYER-XXXXX).
+
+    Args:
+        device_uuid: The device's UUID string
+
+    Returns:
+        Hostname string like 'jam-player-a1b2c'
+    """
+    # Remove hyphens and get last 5 chars, lowercase for hostname
+    clean_uuid = device_uuid.replace('-', '')
+    suffix = clean_uuid[-5:].lower()
+    return f"jam-player-{suffix}"
+
+
+def set_unique_hostname(device_uuid: str) -> bool:
+    """
+    Set a unique hostname for this device based on its UUID.
+
+    This fixes the iOS BLE pairing cache issue where all JAM Players had
+    the same hostname (comitup-307), causing iOS to confuse devices and
+    show "Peer removed pairing information" errors.
+
+    The hostname is set to 'jam-player-XXXXX' where XXXXX is derived from
+    the device UUID (same suffix used in BLE advertising name).
+
+    Args:
+        device_uuid: The device's UUID string
+
+    Returns:
+        True if hostname was set successfully or already correct
+    """
+    new_hostname = get_unique_hostname(device_uuid)
+
+    try:
+        # Check current hostname
+        result = subprocess.run(
+            ['hostname'],
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_COMMAND_TIMEOUT
+        )
+        current_hostname = result.stdout.strip()
+
+        if current_hostname == new_hostname:
+            logger.info(f"Hostname already set to: {new_hostname}")
+            return True
+
+        logger.info(f"Setting hostname from '{current_hostname}' to '{new_hostname}'")
+
+        # Use hostnamectl to set hostname (handles /etc/hostname and systemd)
+        result = subprocess.run(
+            ['hostnamectl', 'set-hostname', new_hostname],
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_COMMAND_TIMEOUT
+        )
+
+        if result.returncode != 0:
+            logger.error(f"hostnamectl failed: {result.stderr}")
+            return False
+
+        # Update /etc/hosts to replace old hostname with new one
+        hosts_file = Path('/etc/hosts')
+        if hosts_file.exists():
+            hosts_content = hosts_file.read_text()
+
+            # Replace old hostname with new one in the 127.0.1.1 line
+            lines = hosts_content.split('\n')
+            new_lines = []
+            for line in lines:
+                if '127.0.1.1' in line:
+                    # Replace any existing hostname on this line
+                    new_lines.append(f"127.0.1.1\t{new_hostname}")
+                else:
+                    new_lines.append(line)
+
+            safe_write_text(hosts_file, '\n'.join(new_lines), 0o644)
+            logger.info("Updated /etc/hosts with new hostname")
+
+        logger.info(f"Hostname set to: {new_hostname}")
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout setting hostname")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to set hostname: {e}")
+        return False

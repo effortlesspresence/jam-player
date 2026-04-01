@@ -41,6 +41,7 @@ from common.paths import (
     SSH_PUBLIC_KEY_FILE,
     safe_write_text,
 )
+from common.system import set_unique_hostname
 
 logger = setup_service_logging('jam-first-boot')
 
@@ -311,7 +312,13 @@ def run_first_boot() -> bool:
         device_uuid = DEVICE_UUID_FILE.read_text().strip()
         logger.info(f"Device UUID already exists: {device_uuid}")
 
-    # 2. Generate API signing key pair
+    # 2. Set unique hostname based on device UUID
+    # This fixes iOS BLE pairing cache issues (all devices had same hostname)
+    if not set_unique_hostname(device_uuid):
+        logger.warning("Failed to set unique hostname (non-fatal)")
+        # Don't fail the whole first boot for this - it's not critical
+
+    # 3. Generate API signing key pair
     if not API_SIGNING_PRIVATE_KEY_FILE.exists() or not API_SIGNING_PUBLIC_KEY_FILE.exists():
         logger.info("Generating API signing key pair...")
         if not generate_api_signing_keys():
@@ -320,7 +327,7 @@ def run_first_boot() -> bool:
     else:
         logger.info("API signing keys already exist")
 
-    # 3. Generate SSH key pair (for host key verification)
+    # 4. Generate SSH key pair (for host key verification)
     ssh_keys_regenerated = False
     if not SSH_PRIVATE_KEY_FILE.exists() or not SSH_PUBLIC_KEY_FILE.exists():
         logger.info("Generating SSH host key pair...")
@@ -332,12 +339,12 @@ def run_first_boot() -> bool:
     else:
         logger.info("SSH host keys already exist")
 
-    # 4. Ensure jam user exists (for SSH key auth)
+    # 5. Ensure jam user exists (for SSH key auth)
     if not ensure_jam_user_exists():
         logger.error("Failed to ensure jam user exists")
         all_success = False
 
-    # 5. Set up SSH authorized_keys (using device's own public key)
+    # 6. Set up SSH authorized_keys (using device's own public key)
     # IMPORTANT: If keys were regenerated, we MUST update authorized_keys to match!
     if ssh_keys_regenerated and JAM_USER_AUTHORIZED_KEYS.exists():
         logger.info("SSH keys were regenerated - removing old authorized_keys to force update")

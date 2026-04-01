@@ -137,12 +137,18 @@ def main():
             logger.info(f"Created {ANNOUNCED_FLAG}")
             logger.info("Announcement complete!")
 
-            # Start jam-tailscale.service now that we're announced
-            # On first boot, jam-tailscale.service may have already run and exited
-            # because the device wasn't announced yet. Now that we're announced,
-            # we can set up Tailscale for remote access.
+            # Start services that depend on .announced flag
+            # These services have ConditionPathExists=/etc/jam/device_data/.announced
+            # and may have been skipped at boot before we created the flag.
+
+            # Start jam-heartbeat.service - critical for getting screen_id from backend
+            # This is especially important during JAM 1.0 -> 2.0 migration where the
+            # device is already registered but jam-heartbeat hasn't run yet.
+            if not start_service('jam-heartbeat.service'):
+                logger.warning("jam-heartbeat.service did not start - will retry on next boot")
+
+            # Start jam-tailscale.service for remote access
             if not start_service('jam-tailscale.service'):
-                # Not fatal - Tailscale can be set up on next boot
                 logger.warning("jam-tailscale.service did not start - will retry on next boot")
 
             sys.exit(0)

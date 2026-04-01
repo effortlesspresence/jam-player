@@ -36,7 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.api import report_error as api_report_error, ErrorSeverity, SystemService
-from common.paths import ENVIRONMENT_FILE, safe_write_text
+from common.paths import ENVIRONMENT_FILE, DEVICE_UUID_FILE, safe_write_text
+from common.system import set_unique_hostname
 
 # Try to import PIL for update screen display
 try:
@@ -1370,6 +1371,39 @@ def install_lightdm_cursor_config():
         logger.warning(f"  Failed to install lightdm cursor config: {e}")
 
 
+def install_unique_hostname():
+    """
+    Set a unique hostname for this device based on its UUID.
+
+    This fixes the iOS BLE pairing cache issue where all JAM Players had
+    the same hostname (comitup-307), causing iOS to confuse devices and
+    show "Peer removed pairing information" errors.
+
+    Uses the shared set_unique_hostname() from common.system.
+    """
+    logger.info("Checking hostname configuration...")
+
+    # Read device UUID
+    if not DEVICE_UUID_FILE.exists():
+        logger.warning("  Device UUID file not found - skipping hostname config")
+        return
+
+    try:
+        device_uuid = DEVICE_UUID_FILE.read_text().strip()
+        if not device_uuid:
+            logger.warning("  Device UUID is empty - skipping hostname config")
+            return
+
+        # Use shared hostname function
+        if set_unique_hostname(device_uuid):
+            logger.info("  NOTE: Reboot required for hostname change to fully take effect")
+        else:
+            logger.warning("  Failed to set unique hostname")
+
+    except Exception as e:
+        logger.warning(f"  Failed to set unique hostname: {e}")
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
@@ -1591,6 +1625,9 @@ def main():
 
     # Configure lightdm to hide cursor on desktop
     install_lightdm_cursor_config()
+
+    # Set unique hostname (fixes iOS BLE pairing cache issue)
+    install_unique_hostname()
 
     # Restart services to pick up changes
     restart_services()
