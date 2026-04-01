@@ -1288,6 +1288,88 @@ def install_ble_configs():
         logger.debug(f"  BlueZ config not found: {bluetooth_config_src}")
 
 
+def install_lightdm_cursor_config():
+    """
+    Configure lightdm to hide the X11 cursor.
+
+    This prevents the cursor from showing on the desktop background during
+    boot and between display transitions. The -nocursor flag tells X11 to
+    not render any cursor at all.
+
+    Modifies /etc/lightdm/lightdm.conf to add xserver-command=X -nocursor
+    under the [Seat:*] section.
+    """
+    logger.info("Checking lightdm config for cursor hiding...")
+
+    lightdm_conf = Path('/etc/lightdm/lightdm.conf')
+
+    if not lightdm_conf.exists():
+        logger.warning(f"lightdm.conf not found at {lightdm_conf} - skipping cursor config")
+        return
+
+    try:
+        content = lightdm_conf.read_text()
+
+        # Check if -nocursor is already configured
+        if '-nocursor' in content:
+            logger.info("  lightdm already configured with -nocursor")
+            return
+
+        # Check if there's an existing xserver-command line we need to modify
+        lines = content.split('\n')
+        new_lines = []
+        modified = False
+        in_seat_section = False
+
+        for line in lines:
+            # Track if we're in the [Seat:*] section
+            if line.strip().startswith('['):
+                in_seat_section = line.strip() == '[Seat:*]'
+
+            # If we find an existing xserver-command, add -nocursor to it
+            if in_seat_section and line.strip().startswith('xserver-command='):
+                if '-nocursor' not in line:
+                    # Append -nocursor to existing command
+                    line = line.rstrip() + ' -nocursor'
+                    modified = True
+                    logger.info("  Added -nocursor to existing xserver-command")
+
+            new_lines.append(line)
+
+        # If no xserver-command was found, add it under [Seat:*]
+        if not modified:
+            final_lines = []
+            added = False
+            for line in new_lines:
+                final_lines.append(line)
+                if line.strip() == '[Seat:*]' and not added:
+                    final_lines.append('xserver-command=X -nocursor')
+                    added = True
+                    modified = True
+                    logger.info("  Added xserver-command=X -nocursor under [Seat:*]")
+
+            # If [Seat:*] section doesn't exist, append it
+            if not added:
+                final_lines.append('')
+                final_lines.append('[Seat:*]')
+                final_lines.append('xserver-command=X -nocursor')
+                modified = True
+                logger.info("  Added [Seat:*] section with xserver-command=X -nocursor")
+
+            new_lines = final_lines
+
+        if modified:
+            # Write the modified config
+            lightdm_conf.write_text('\n'.join(new_lines))
+            logger.info(f"  Updated {lightdm_conf}")
+            logger.info("  NOTE: Reboot required for lightdm changes to take effect")
+        else:
+            logger.info("  No changes needed to lightdm config")
+
+    except Exception as e:
+        logger.warning(f"  Failed to install lightdm cursor config: {e}")
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
@@ -1506,6 +1588,9 @@ def main():
 
     # Install BLE configuration (D-Bus and BlueZ) for pairing-free provisioning
     install_ble_configs()
+
+    # Configure lightdm to hide cursor on desktop
+    install_lightdm_cursor_config()
 
     # Restart services to pick up changes
     restart_services()
