@@ -543,23 +543,28 @@ def update_orientation_if_changed(new_orientation: Optional[str]) -> bool:
     Update the local display_orientation.txt if the value has changed.
 
     Compares new_orientation against the current file contents and updates
-    only if different.
+    only if different. If no file exists, treats current as LANDSCAPE (the
+    default that jam-player-display uses when no file exists).
 
     Args:
         new_orientation: The orientation from the backend
 
     Returns:
-        True if the orientation was changed, False if unchanged
+        True if the orientation was changed (restart needed), False otherwise
     """
     current_orientation = get_display_orientation()
 
-    # Treat None from backend as LANDSCAPE (the default)
+    # Treat missing file as LANDSCAPE (what jam-player-display defaults to)
+    effective_current = current_orientation if current_orientation else 'LANDSCAPE'
     effective_new = new_orientation if new_orientation else 'LANDSCAPE'
 
-    if effective_new == current_orientation:
+    if effective_new == effective_current:
+        # Still write the file if it doesn't exist (for future comparisons)
+        if current_orientation is None:
+            set_display_orientation(effective_new)
         return False
 
-    logger.info(f"Display orientation changed: {current_orientation} -> {effective_new}")
+    logger.info(f"Display orientation changed: {effective_current} -> {effective_new}")
 
     if set_display_orientation(effective_new):
         logger.info("Display orientation file updated successfully")
