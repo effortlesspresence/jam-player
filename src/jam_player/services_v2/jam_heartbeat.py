@@ -51,7 +51,7 @@ logger = setup_service_logging('jam-heartbeat')
 HEARTBEAT_INTERVAL_MINUTES = 1
 HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_INTERVAL_MINUTES * 60
 
-# After this many consecutive failures, reduce logging verbosity
+# After this many consecutive failures, reduce logging verbosity.
 FAILURE_LOG_THRESHOLD = 3
 
 # How long to wait before retrying after failure (starts at 30s, backs off)
