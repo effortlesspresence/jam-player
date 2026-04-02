@@ -33,6 +33,7 @@ from common.network import (
 from common.api import (
     check_api_availability,
 )
+import subprocess
 from common.system import (
     check_chrony_sync,
     check_required_services,
@@ -41,6 +42,68 @@ from common.system import (
 )
 
 logger = setup_service_logging('jam-boot-check')
+
+
+def ensure_system_dependencies() -> bool:
+    """
+    Ensure required system packages are installed.
+
+    This handles the case where JAM 1.0 first-batch devices (JPB_3_14_24)
+    migrated to 2.0 but the initial package installation failed.
+
+    Returns True if all dependencies are satisfied.
+    """
+    all_installed = True
+
+    # Check MPV (required for video playback)
+    result = subprocess.run(['which', 'mpv'], capture_output=True)
+    if result.returncode != 0:
+        logger.info("MPV not installed, installing...")
+        try:
+            # Update apt cache first
+            subprocess.run(['sudo', 'apt-get', 'update'], timeout=120, check=False)
+            result = subprocess.run(
+                ['sudo', 'apt-get', 'install', '-y', 'mpv'],
+                timeout=300,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                logger.info("MPV installed successfully")
+            else:
+                logger.error(f"Failed to install MPV: {result.stderr}")
+                all_installed = False
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout installing MPV")
+            all_installed = False
+        except Exception as e:
+            logger.error(f"Error installing MPV: {e}")
+            all_installed = False
+
+    # Check Tailscale (required for remote access)
+    result = subprocess.run(['which', 'tailscale'], capture_output=True)
+    if result.returncode != 0:
+        logger.info("Tailscale not installed, installing...")
+        try:
+            result = subprocess.run(
+                ['sh', '-c', 'curl -fsSL https://tailscale.com/install.sh | sh'],
+                timeout=300,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                logger.info("Tailscale installed successfully")
+            else:
+                logger.error(f"Failed to install Tailscale: {result.stderr}")
+                all_installed = False
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout installing Tailscale")
+            all_installed = False
+        except Exception as e:
+            logger.error(f"Error installing Tailscale: {e}")
+            all_installed = False
+
+    return all_installed
 
 # systemd notify
 sd_notifier = sdnotify.SystemdNotifier()
@@ -78,6 +141,14 @@ def run_boot_check() -> bool:
     # 1. Wait briefly for network connectivity
     sd_notifier.notify("STATUS=Checking network connectivity...")
     network_connected, conn_type = wait_for_network(timeout_seconds=NETWORK_WAIT_TIMEOUT_SECONDS)
+
+    # 1b. Ensure system dependencies are installed (requires network)
+    # This handles first-batch JAM 1.0 devices that migrated without MPV/Tailscale
+    if network_connected:
+        sd_notifier.notify("STATUS=Checking system dependencies...")
+        deps_ok = ensure_system_dependencies()
+        if not deps_ok:
+            logger.warning("Some system dependencies could not be installed - will retry on next boot")
 
     # 2. Manage BLE provisioning service based on network state
     sd_notifier.notify("STATUS=Managing BLE provisioning...")
