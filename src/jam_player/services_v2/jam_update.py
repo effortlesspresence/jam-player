@@ -380,6 +380,16 @@ def check_and_reexec_if_updated() -> bool:
         shutil.copy2(repo_script, installed_script)
         logger.info(f"Copied new jam_update.py to {installed_script}")
 
+        # Also copy the common/ directory to prevent import errors
+        # (new jam_update.py may depend on new imports from common/)
+        repo_common = SERVICES_V2_SRC / 'common'
+        installed_common = SERVICES_DEST / 'common'
+        if repo_common.exists():
+            if installed_common.exists():
+                shutil.rmtree(installed_common)
+            shutil.copytree(repo_common, installed_common)
+            logger.info(f"Copied common/ to {installed_common}")
+
         # Set environment variable to prevent infinite loop
         os.environ[REEXEC_ENV_VAR] = '1'
 
