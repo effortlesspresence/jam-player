@@ -1060,6 +1060,12 @@ class JamPlayerDisplayManager:
         self.mpv: Optional[MpvIpcClient] = None
         self.is_playing: bool = False
 
+        # MPV crash tracking for self-healing
+        # If MPV crashes too many times in a short period, restart lightdm
+        self._mpv_crash_times: list = []
+        self._mpv_crash_threshold = 5  # Number of crashes
+        self._mpv_crash_window_seconds = 30  # Time window to track crashes
+
         # Get screen dimensions
         self.screen_width, self.screen_height = get_fb_size()
         logger.info(f"Screen dimensions: {self.screen_width}x{self.screen_height}")
@@ -1648,6 +1654,36 @@ class JamPlayerDisplayManager:
             # Check if MPV died and needs restart
             if self.mpv and not self.mpv.is_running():
                 logger.warning("MPV process died, restarting...")
+
+                # Track this crash for self-healing detection
+                current_time = time.time()
+                self._mpv_crash_times.append(current_time)
+
+                # Remove old crash times outside the window
+                self._mpv_crash_times = [
+                    t for t in self._mpv_crash_times
+                    if current_time - t < self._mpv_crash_window_seconds
+                ]
+
+                # Check if we've hit the crash threshold - indicates display subsystem issue
+                if len(self._mpv_crash_times) >= self._mpv_crash_threshold:
+                    logger.error(
+                        f"MPV crashed {len(self._mpv_crash_times)} times in "
+                        f"{self._mpv_crash_window_seconds} seconds - restarting lightdm to fix display"
+                    )
+                    self._mpv_crash_times.clear()  # Reset counter
+                    try:
+                        # Restart lightdm to reinitialize Xwayland
+                        subprocess.run(
+                            ['systemctl', 'restart', 'lightdm'],
+                            timeout=30,
+                            capture_output=True
+                        )
+                        logger.info("lightdm restart triggered, waiting for display to reinitialize...")
+                        time.sleep(5)  # Give lightdm time to restart
+                    except Exception as e:
+                        logger.error(f"Failed to restart lightdm: {e}")
+
                 # Clean up the dead MPV first
                 try:
                     self.mpv.stop_mpv()
