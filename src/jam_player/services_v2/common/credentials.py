@@ -241,9 +241,11 @@ def is_device_announced() -> bool:
     the announce-jp API endpoint.
 
     Returns:
-        True if .announced flag file exists.
+        True if .announced flag file exists, OR if .registered flag exists
+        (since registered implies announced - handles JAM 1.0 migrations
+        that created .registered without .announced).
     """
-    return ANNOUNCED_FLAG.exists()
+    return ANNOUNCED_FLAG.exists() or REGISTERED_FLAG.exists()
 
 
 def is_device_registered() -> bool:

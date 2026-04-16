@@ -508,6 +508,12 @@ def main():
         # Report IP to backend (even if already connected - ensures backend has current IP)
         ip = get_tailscale_ip()
         if ip:
+            # Ensure device is announced before trying to report IP
+            # (JAM 1.0 devices may have Tailscale connected but not be announced in 2.0 yet)
+            if not is_device_announced():
+                logger.info("Device not announced yet - attempting to announce...")
+                if not try_announce():
+                    logger.warning("Could not announce device - IP reporting may fail")
             report_tailscale_ip_to_backend(ip)
         sys.exit(0)
 

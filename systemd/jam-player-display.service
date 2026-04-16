@@ -26,6 +26,10 @@ Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/comitup/.Xauthority
 Environment=PYTHONUNBUFFERED=1
 
+# Wait for X display to be ready (fixes race condition where service starts before Xwayland)
+# Tries up to 30 times with 1 second delay (30 seconds total)
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do xdpyinfo -display :0 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "Display not ready after 30s"; exit 1'
+
 # Run the unified display manager (handles all 4 display modes)
 ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_player_display.py
 

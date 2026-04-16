@@ -583,16 +583,38 @@ def set_unique_hostname(device_uuid: str) -> bool:
         hosts_file = Path('/etc/hosts')
         if hosts_file.exists():
             hosts_content = hosts_file.read_text()
-
-            # Replace old hostname with new one in the 127.0.1.1 line
             lines = hosts_content.split('\n')
             new_lines = []
+            found_127_0_1_1 = False
+
             for line in lines:
                 if '127.0.1.1' in line:
-                    # Replace any existing hostname on this line
+                    # Replace the 127.0.1.1 line with new hostname
                     new_lines.append(f"127.0.1.1\t{new_hostname}")
+                    found_127_0_1_1 = True
+                elif '127.0.0.1' in line:
+                    # Remove old hostname from 127.0.0.1 line (comitup puts it here)
+                    # Keep localhost and any other entries, but remove comitup-XXX or old jam-player-XXX
+                    parts = line.split()
+                    # Keep 127.0.0.1 and filter out old hostnames
+                    filtered_parts = [parts[0]]  # Keep the IP
+                    for part in parts[1:]:
+                        if not part.startswith('comitup-') and not part.startswith('jam-player-'):
+                            filtered_parts.append(part)
+                    new_lines.append('\t'.join(filtered_parts) if len(filtered_parts) > 1 else parts[0] + '\tlocalhost')
                 else:
                     new_lines.append(line)
+
+            # If there was no 127.0.1.1 line, add one for the hostname
+            if not found_127_0_1_1:
+                # Insert after the 127.0.0.1 line
+                for i, line in enumerate(new_lines):
+                    if '127.0.0.1' in line:
+                        new_lines.insert(i + 1, f"127.0.1.1\t{new_hostname}")
+                        break
+                else:
+                    # No 127.0.0.1 line found, just append
+                    new_lines.append(f"127.0.1.1\t{new_hostname}")
 
             safe_write_text(hosts_file, '\n'.join(new_lines), 0o644)
             logger.info("Updated /etc/hosts with new hostname")
