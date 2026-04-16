@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.api import report_error as api_report_error, ErrorSeverity, SystemService
-from common.paths import ENVIRONMENT_FILE, DEVICE_UUID_FILE, safe_write_text
+from common.paths import ENVIRONMENT_FILE, DEVICE_UUID_FILE
 from common.system import set_unique_hostname
 
 # Try to import PIL for update screen display
@@ -894,6 +894,9 @@ def install_systemd_units() -> bool:
 def update_version_file(version: str) -> bool:
     """Update the version file."""
     try:
+        # Import locally to avoid import errors during re-execution
+        # (new jam_update.py may run before new paths.py is copied)
+        from common.paths import safe_write_text
         VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         safe_write_text(VERSION_FILE, version)
         logger.info(f"Version updated to: {version[:12]}...")
