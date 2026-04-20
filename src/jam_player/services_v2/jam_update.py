@@ -1145,6 +1145,44 @@ def install_chrony_peering_config():
         logger.warning(f"  Failed to install chrony peering config: {e}")
 
 
+def install_journald_config():
+    """
+    Install the systemd-journald drop-in that caps journal disk usage.
+
+    Without an explicit cap, journald defaults to ~10% of the filesystem
+    (up to 4 GB), which on our 16 GB SD cards is large enough that
+    runaway logging can crowd out the migration script's temporary disk
+    headroom and block updates -- we hit exactly this during the JAM 1.0
+    to 2.0 migration wave. The drop-in caps persistent journal size at
+    1 GB and vacuums aggressively when free disk falls below 500 MB.
+
+    systemd automatically loads /etc/systemd/journald.conf.d/*.conf on
+    journald startup; no manual wiring required. We do NOT restart
+    systemd-journald here because (a) a restart briefly detaches every
+    service's stdout/stderr and (b) the config takes effect naturally on
+    the device's nightly 3 AM reboot anyway. Not worth the disruption
+    for a non-urgent change.
+    """
+    logger.info("Installing systemd-journald config...")
+
+    journald_src = ETC_SRC / 'systemd' / 'journald.conf.d' / 'jam.conf'
+    journald_dest = Path('/etc/systemd/journald.conf.d/jam.conf')
+
+    if not journald_src.exists():
+        logger.warning(f"journald config source not found: {journald_src}")
+        return
+
+    try:
+        journald_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(journald_src, journald_dest)
+        os.chown(journald_dest, 0, 0)  # root:root
+        os.chmod(journald_dest, 0o644)
+        logger.info(f"  Installed {journald_dest}")
+        logger.info("  NOTE: journald config takes effect on next reboot")
+    except Exception as e:
+        logger.warning(f"  Failed to install journald config: {e}")
+
+
 def install_boot_config():
     """
     Install/update HDMI and display settings in the Raspberry Pi boot config.
@@ -1626,6 +1664,9 @@ def main():
 
     # Install chrony peering config for offline clock sync
     install_chrony_peering_config()
+
+    # Cap systemd journal at 1 GB so runaway logging can't fill the SD card
+    install_journald_config()
 
     # Install boot config for proper 4K/HDMI output
     install_boot_config()
