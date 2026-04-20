@@ -235,17 +235,93 @@ def is_first_boot_complete() -> bool:
 
 def is_device_announced() -> bool:
     """
-    Check if the device has announced itself to the JAM backend.
+    Check if this device has announced itself to the JAM 2.0 backend.
 
-    A device is ANNOUNCED when jam-announce.service successfully calls
-    the announce-jp API endpoint.
+    "Announced" means jam-announce.service has successfully called
+    POST /jam-players/announce, which uploads the device's Ed25519 API
+    signing key and SSH keys to the backend. Every signed API call the
+    device makes after that point depends on the backend having those
+    keys on file. In other words: .announced being True is what
+    authorizes the device to talk to the 2.0 backend at all.
+
+    This MUST check .announced only -- never .registered. Do not "help"
+    this function by treating .registered as implying .announced. The
+    two flags describe different facts, and a previous permissive
+    version of this check caused a production-wide migration outage.
+    See the scenarios below.
+
+    === Scenarios the strict check handles correctly ===
+
+    (1) Fresh 2.0 device, first boot (never ran 1.0):
+        - No flags exist yet.
+        - jam-announce runs, creates the record in the backend with
+          status ANNOUNCED, writes .announced locally.
+        - User later registers the device via the mobile app setup
+          flow; backend transitions ANNOUNCED -> REGISTERED;
+          jam-registration-poller notices and writes .registered
+          locally (via set_device_registered, which also ensures
+          .announced is present).
+
+    (2) JAM 1.0 Flow 1A device migrating to 2.0 (deployed device,
+        pre-created 2.0 record with a locationId, ready_for_migration
+        flagged in Bubble):
+        - The 1.0 install script (install_jam_player.sh in ~/jam)
+          writes .registered via a raw `touch` BEFORE 2.0 ever boots.
+          This is a speculative write: it asserts what the backend
+          state WILL be after the device successfully announces, not
+          what it is right now. At this moment the backend record is
+          still PENDING_MIGRATION.
+        - On first 2.0 boot, jam-announce calls POST /jam-players/
+          announce. The backend sees PENDING_MIGRATION with a
+          locationId and transitions the record straight to REGISTERED
+          in a single call (infrastructure/services/jam-players/
+          endpoints/announce/post/index.ts). jam-announce writes
+          .announced, and reality catches up with the speculation.
+
+    (3) JAM 1.0 Flow 2A device migrating to 2.0 (warehouse device, no
+        J1 record, no pre-created J2 record):
+        - 1.0 install script intentionally does NOT touch .registered.
+        - On first 2.0 boot, jam-announce calls the backend; the
+          backend creates a fresh record with status ANNOUNCED and
+          jam-announce writes .announced. From there, the flow is
+          identical to scenario (1).
+
+    === Why the permissive check broke scenario (2) ===
+
+    A previous revision returned True if EITHER flag existed, on the
+    theory that "registered implies announced." For Flow 1A devices
+    that theory is backwards: .registered is written speculatively
+    BEFORE the backend knows the device exists in 2.0. With the
+    permissive check, jam-announce on first 2.0 boot saw .registered,
+    concluded the device was already announced, exited without calling
+    the backend, and the 2.0 record stayed stuck at PENDING_MIGRATION
+    forever. ~175 prior Flow 1A migrations under the strict check
+    worked correctly; a batch of devices under the permissive check
+    all broke in exactly this way.
+
+    === Why the strict check is safe for all other callers ===
+
+    The "registered implies announced" invariant is enforced at WRITE
+    time by set_device_registered(), which calls set_device_announced()
+    first. Every non-legacy code path that creates .registered goes
+    through that helper (jam-registration-poller,
+    jam-ble-provisioning). The 1.0 install script's raw `touch
+    .registered` is the sole exception, and the Flow 1A bootstrap state
+    it produces (.registered without .announced) is valid and
+    transient -- jam-announce resolves it on first 2.0 boot.
+
+    For services that run before jam-announce has completed on a given
+    boot (jam-ws-commands, jam-tailscale, jam-ble-provisioning), the
+    correct handling is already in place: jam-ws-commands-announced.
+    path triggers a restart when .announced appears, jam-tailscale has
+    its own try_announce() fallback, and all signed API helpers
+    (common/api.py) gate on this strict check so they don't attempt
+    auth against a backend that doesn't have our keys yet.
 
     Returns:
-        True if .announced flag file exists, OR if .registered flag exists
-        (since registered implies announced - handles JAM 1.0 migrations
-        that created .registered without .announced).
+        True if the .announced flag file exists.
     """
-    return ANNOUNCED_FLAG.exists() or REGISTERED_FLAG.exists()
+    return ANNOUNCED_FLAG.exists()
 
 
 def is_device_registered() -> bool:
