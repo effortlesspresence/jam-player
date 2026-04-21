@@ -5,21 +5,41 @@ JAM Player Display Service - Unified Display Manager
 This service handles all display states for the JAM Player with modern,
 premium gradient-based UI design.
 
-Display Modes:
+Display Modes (in order of setup progress):
 
-1. UNREGISTERED (not registered OR registered but not linked to screen)
-   - Display: Premium setup screen with JAM logo, QR code, and "Get ready to JAM."
-   - Modern dark gradient background with subtle orange glow
-   - Guides user to download JAM Player Setup app
+1. AWAITING_NETWORK (.internet_verified flag does not exist)
+   - Device has no verified internet connection. Covers "no WiFi configured",
+     "WiFi configured but not connected", and "WiFi connected but no real
+     internet reachable" -- all three cases require the same user action
+     (re-run WiFi setup via the mobile app over BLE).
+   - Display: setup screen with JAM logo, QR code, "Set up your JAM Player"
 
-2. LINKED_WAITING_FOR_CONTENT (linked to screen, content downloading)
-   - Display: "Waiting for content..." with animated-style loading indicator
-   - Shows progress while content is being downloaded
+2. AWAITING_SCREEN_LINK (internet verified, but no screen_id on disk)
+   - Device is online but the user hasn't linked it to a Screen yet.
+   - Display: "Connected! Next, link this JAM Player to a screen..."
 
-3. PLAYING_CONTENT (linked and content available)
+3. DOWNLOADING_CONTENT (screen_id exists, scenes.json missing OR has scenes
+   with media files not yet on disk)
+   - Content fetch/download is in progress.
+   - Display: "Waiting for content..." with animated dots
+
+4. NO_ACTIVE_SCENES (screen_id exists, scenes.json exists but is an empty list)
+   - The linked Screen has no active scenes configured right now. This is
+     distinct from DOWNLOADING_CONTENT: there is nothing to download, the
+     backend deliberately returned no scenes.
+   - Display: "This screen has no active scenes..."
+
+5. PLAYING_CONTENT (scenes.json has scenes and at least one media file exists)
    - Display: Plays scenes sequentially from scenes.json
    - Wall clock synchronized playback for multi-display setups
    - Automatically reloads when content is updated
+
+IMPORTANT: PLAYING_CONTENT is evaluated FIRST in determine_display_mode(),
+before any network/setup-state checks. This preserves offline playback:
+a previously-configured device that loses internet (restaurant WiFi drops,
+deployment in a venue with no WiFi, etc.) keeps playing its cached content
+instead of reverting to a setup screen. See determine_display_mode() for
+the full spec.
 
 This service monitors state changes and transitions between display modes automatically.
 """
@@ -53,6 +73,7 @@ from common.system import get_systemd_notifier, setup_signal_handlers
 from common.paths import (
     SCREEN_ID_FILE,
     REGISTERED_FLAG,
+    INTERNET_VERIFIED_FLAG,
 )
 from jam_player import constants
 
@@ -147,10 +168,20 @@ SPEED_AGGRESSIVE_SLOW = 0.95
 
 
 class DisplayMode(Enum):
-    """The 3 display modes for JAM Player."""
-    UNREGISTERED = "unregistered"  # Not registered OR registered but not linked
-    LINKED_WAITING_FOR_CONTENT = "linked_waiting_for_content"
-    PLAYING_CONTENT = "playing_content"
+    """
+    Display modes for JAM Player.
+
+    Values listed below in logical setup-progress order (which also
+    matches the order the ladder in determine_display_mode() falls
+    through). Note that determine_display_mode() checks PLAYING_CONTENT
+    FIRST (before the ladder), so an offline device with cached content
+    keeps playing -- see that function's docstring for the full spec.
+    """
+    AWAITING_NETWORK = "awaiting_network"  # .internet_verified flag missing
+    AWAITING_SCREEN_LINK = "awaiting_screen_link"  # online, but no screen_id
+    DOWNLOADING_CONTENT = "downloading_content"  # screen linked, content not yet on disk
+    NO_ACTIVE_SCENES = "no_active_scenes"  # screen linked, backend returned empty scenes list
+    PLAYING_CONTENT = "playing_content"  # scenes + media present
 
 
 # =============================================================================
@@ -513,7 +544,7 @@ def generate_qr_code(url: str, size: int = 300) -> Optional[Image.Image]:
 
 def create_unregistered_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
     """
-    Create the setup screen for UNREGISTERED mode.
+    Create the setup screen for AWAITING_NETWORK mode.
 
     Modern gradient design with:
     - JAM Player logo
@@ -648,7 +679,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
 
 def create_waiting_for_content_screen(width: int, height: int, screen_id: str = None) -> Image.Image:
     """
-    Create the screen for LINKED_WAITING_FOR_CONTENT mode.
+    Create the screen for DOWNLOADING_CONTENT mode.
 
     Modern gradient design showing content download progress message.
     """
@@ -726,6 +757,217 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
         )
 
     # Version indicator
+    version_font = get_font(14, bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),
+        anchor="mm"
+    )
+
+    return img
+
+
+def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
+    """
+    Create the screen for AWAITING_SCREEN_LINK mode.
+
+    Shown when the device has verified internet connectivity but has not
+    been linked to a Screen yet. Communicates that setup is partially
+    complete and directs the user to the mobile or web app to finish.
+
+    Visually distinct from the AWAITING_NETWORK setup screen: a cool-
+    themed gradient (matches DOWNLOADING_CONTENT's family) emphasizes
+    "you're past the WiFi step"; no primary QR code (the user already
+    has the app open), just device UUID for reference.
+    """
+    if not HAS_PIL:
+        logger.error("PIL not available for creating display images")
+        return None
+
+    img = create_mesh_gradient_background(width, height, theme="cool")
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(FONT_SIZE_TITLE)
+    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
+    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
+    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+
+    center_x = width // 2
+
+    # Logo
+    logo_height = min(120, height // 8)
+    y = int(height * 0.12)
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
+        y += logo.height + 40
+    else:
+        y += 40
+
+    # Primary heading: "Connected!"
+    heading = "Connected!"
+    draw.text(
+        (center_x, y),
+        heading,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), heading, font=title_font)
+    y += bbox[3] + 30
+
+    # Secondary line: "Almost there."
+    sub = "Almost there."
+    draw.text(
+        (center_x, y),
+        sub,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), sub, font=subtitle_font)
+    y += bbox[3] + 50
+
+    # Instruction: link this JAM Player
+    line1 = "Link this JAM Player to a screen"
+    draw.text(
+        (center_x, y),
+        line1,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), line1, font=instructions_font)
+    y += bbox[3] + 12
+
+    line2 = "using the JAM Player Setup app or the web app."
+    draw.text(
+        (center_x, y),
+        line2,
+        font=instructions_font,
+        fill=SECONDARY_COLOR,
+        anchor="mt"
+    )
+
+    # Device UUID at the bottom so support / users can identify this JP
+    # in the app / web UI when linking.
+    if device_uuid:
+        device_text = f"Device: {device_uuid}"
+        draw.text(
+            (center_x, height - 50),
+            device_text,
+            font=device_font,
+            fill=SECONDARY_COLOR,
+            anchor="mm"
+        )
+
+    version_font = get_font(14, bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),
+        anchor="mm"
+    )
+
+    return img
+
+
+def create_no_active_scenes_screen(width: int, height: int, screen_id: str = None) -> Image.Image:
+    """
+    Create the screen for NO_ACTIVE_SCENES mode.
+
+    Shown when the device is fully set up (online, linked to a Screen),
+    but the Screen currently has no active scenes configured. This is a
+    deliberate state surfaced by the backend, not a download-in-progress
+    state -- the user needs to go configure scenes in the web app.
+
+    Visually distinct from DOWNLOADING_CONTENT (no animated dots, no
+    "please wait" messaging) so the user understands the device isn't
+    busy -- it's waiting on them to take action.
+    """
+    if not HAS_PIL:
+        logger.error("PIL not available for creating display images")
+        return None
+
+    img = create_mesh_gradient_background(width, height, theme="vibrant")
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(FONT_SIZE_TITLE)
+    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
+    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
+    screen_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+
+    center_x = width // 2
+
+    logo_height = min(120, height // 8)
+    y = int(height * 0.12)
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
+        y += logo.height + 40
+    else:
+        y += 40
+
+    # Heading: make clear this is not a download problem
+    heading = "No active scenes"
+    draw.text(
+        (center_x, y),
+        heading,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), heading, font=title_font)
+    y += bbox[3] + 30
+
+    sub = "This screen has nothing scheduled right now."
+    draw.text(
+        (center_x, y),
+        sub,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), sub, font=subtitle_font)
+    y += bbox[3] + 50
+
+    line1 = "Add scenes to this screen in the web app"
+    draw.text(
+        (center_x, y),
+        line1,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), line1, font=instructions_font)
+    y += bbox[3] + 12
+
+    line2 = "to display content here."
+    draw.text(
+        (center_x, y),
+        line2,
+        font=instructions_font,
+        fill=SECONDARY_COLOR,
+        anchor="mt"
+    )
+
+    # Show the linked Screen ID so support / users can verify they're
+    # configuring the right Screen.
+    if screen_id:
+        screen_text = f"Screen: {screen_id}"
+        draw.text(
+            (center_x, height - 50),
+            screen_text,
+            font=screen_font,
+            fill=SECONDARY_COLOR,
+            anchor="mm"
+        )
+
     version_font = get_font(14, bold=False)
     draw.text(
         (width - 30, height - 25),
@@ -1099,56 +1341,105 @@ class JamPlayerDisplayManager:
             self.mpv = None
 
     def determine_display_mode(self) -> DisplayMode:
-        """Determine which display mode we should be in based on current state."""
-
-        # Check registration status - if not registered OR not linked to a screen,
-        # show the setup/unregistered screen
-        if not is_device_registered():
-            return DisplayMode.UNREGISTERED
-
-        # Check if linked to a screen - if not linked, still show setup screen
-        screen_id = get_screen_id()
-        if not screen_id:
-            return DisplayMode.UNREGISTERED
-
-        # Check if content is available
-        if not self._has_content():
-            return DisplayMode.LINKED_WAITING_FOR_CONTENT
-
-        return DisplayMode.PLAYING_CONTENT
-
-    def _has_content(self) -> bool:
         """
-        Check if we have content to display.
+        Determine which display mode we should be in based on current state.
 
-        Returns True only if:
-        1. scenes.json exists
-        2. At least one scene has a media file that exists
+        CRITICAL: content availability is checked FIRST, before any
+        network/setup-state checks. JAM Players are required to support
+        offline playback -- a device that was previously set up and
+        downloaded content must keep playing that content even if its
+        internet later drops (restaurant WiFi hiccups, deployment
+        location has no WiFi, etc). Gating PLAYING_CONTENT on
+        .internet_verified would yank such a device back to a setup
+        screen, which is a regression we explicitly prevent here.
+
+        Order of checks:
+          1. Playable content on disk -> PLAYING_CONTENT (regardless of
+             network / screen link state).
+          2. Otherwise walk the setup ladder:
+             a. No .internet_verified -> AWAITING_NETWORK
+             b. No screen_id -> AWAITING_SCREEN_LINK
+             c. scenes.json exists but is empty -> NO_ACTIVE_SCENES
+             d. Otherwise (scenes present but media missing, or
+                scenes.json missing entirely with screen linked)
+                -> DOWNLOADING_CONTENT
+
+        See the module docstring for the full spec.
+        """
+        # 1. Content-first: if we have something playable, play it. This
+        # is what keeps offline / disconnected devices showing their
+        # content instead of setup screens when internet drops.
+        content_mode = self._get_content_display_mode()
+        if content_mode == DisplayMode.PLAYING_CONTENT:
+            return DisplayMode.PLAYING_CONTENT
+
+        # 2a. No playable content and no verified internet -> we can't
+        # make progress on setup until WiFi is (re)configured.
+        if not INTERNET_VERIFIED_FLAG.exists():
+            return DisplayMode.AWAITING_NETWORK
+
+        # 2b. Online but not linked to a Screen. Note we deliberately do
+        # NOT gate on is_device_registered() here: a device's registration
+        # state is internal plumbing; what the user actually cares about
+        # is whether a Screen is linked. Also covers the
+        # recently-unlinked-on-backend case (heartbeat / SET_SCREEN_ID
+        # deletes screen_id.txt on unlink).
+        if not get_screen_id():
+            return DisplayMode.AWAITING_SCREEN_LINK
+
+        # 2c / 2d. Screen linked, online, but content not playable yet.
+        # Fall back to whatever the content check said (NO_ACTIVE_SCENES
+        # vs DOWNLOADING_CONTENT).
+        return content_mode
+
+    def _get_content_display_mode(self) -> DisplayMode:
+        """
+        Resolve the content-related display mode from scenes.json + media
+        files on disk. Returns one of:
+          - DOWNLOADING_CONTENT: scenes.json missing, or has scenes
+            listed but no media files on disk yet, or unreadable.
+          - NO_ACTIVE_SCENES: scenes.json exists and is an empty list
+            (backend definitively told us there are no active scenes).
+          - PLAYING_CONTENT: scenes.json has scenes and at least one of
+            their media files is present on disk.
+
+        This function intentionally does NOT consult network, screen
+        link, or registration state -- callers layer that on top. That
+        keeps offline-playback behavior correct: a device with playable
+        content always reports PLAYING_CONTENT from here regardless of
+        whether it's currently online.
+
+        On any unexpected error reading scenes.json we fall back to
+        DOWNLOADING_CONTENT rather than NO_ACTIVE_SCENES, because showing
+        "no scenes configured" when we actually just failed to read the
+        file would be misleading.
         """
         scenes_file = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "scenes.json"
         if not scenes_file.exists():
-            return False
+            return DisplayMode.DOWNLOADING_CONTENT
 
         try:
             with open(scenes_file, 'r') as f:
                 scenes = json.load(f)
-
-            if not scenes:
-                return False
-
-            # Check if at least one media file exists
-            media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
-            for scene in scenes:
-                media_file = scene.get('media_file')
-                if media_file and (media_dir / media_file).exists():
-                    return True
-
-            # No valid media files found
-            return False
-
         except Exception as e:
-            logger.warning(f"Error checking content: {e}")
-            return False
+            logger.warning(f"Error reading scenes.json, treating as downloading: {e}")
+            return DisplayMode.DOWNLOADING_CONTENT
+
+        if not scenes:
+            # scenes.json exists and is an empty list. scenes_manager_service
+            # writes this when the backend returns zero active scenes for
+            # this device's Screen -- distinct from "still downloading".
+            return DisplayMode.NO_ACTIVE_SCENES
+
+        # Scenes are listed. If at least one media file is on disk, we
+        # can play. Otherwise, treat as still-downloading.
+        media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
+        for scene in scenes:
+            media_file = scene.get('media_file')
+            if media_file and (media_dir / media_file).exists():
+                return DisplayMode.PLAYING_CONTENT
+
+        return DisplayMode.DOWNLOADING_CONTENT
 
     def _load_scenes(self, apply_schedule_filter: bool = True) -> list:
         """
@@ -1208,36 +1499,75 @@ class JamPlayerDisplayManager:
         self.current_mode = new_mode
         device_uuid = get_device_uuid()
 
-        if new_mode == DisplayMode.UNREGISTERED:
-            logger.info("Showing UNREGISTERED screen (setup/QR code)")
+        if new_mode == DisplayMode.AWAITING_NETWORK:
+            logger.info("Showing AWAITING_NETWORK screen (setup/QR code)")
             img = create_unregistered_screen(
                 self.screen_width, self.screen_height, device_uuid
             )
             self.feh_process = display_image_with_feh(
-                img, "jam_display_unregistered",
+                img, "jam_display_awaiting_network",
                 fallback_message="JAM Player\n\nSet up with JAM Player Setup App\nScan QR code to begin"
             )
             if self.feh_process:
                 logger.info(f"feh process started: PID {self.feh_process.pid}")
             else:
-                logger.error("Failed to start feh for UNREGISTERED screen")
-            sd_notifier.notify("STATUS=Showing setup screen")
+                logger.error("Failed to start feh for AWAITING_NETWORK screen")
+            sd_notifier.notify("STATUS=Awaiting network (setup)")
 
-        elif new_mode == DisplayMode.LINKED_WAITING_FOR_CONTENT:
-            logger.info("Showing LINKED_WAITING_FOR_CONTENT screen")
+        elif new_mode == DisplayMode.AWAITING_SCREEN_LINK:
+            logger.info("Showing AWAITING_SCREEN_LINK screen")
+            img = create_awaiting_screen_link_screen(
+                self.screen_width, self.screen_height, device_uuid
+            )
+            self.feh_process = display_image_with_feh(
+                img, "jam_display_awaiting_screen_link",
+                fallback_message=(
+                    "Connected!\n\n"
+                    "Link this JAM Player to a screen\n"
+                    "using the mobile app or web app."
+                )
+            )
+            if self.feh_process:
+                logger.info(f"feh process started: PID {self.feh_process.pid}")
+            else:
+                logger.error("Failed to start feh for AWAITING_SCREEN_LINK screen")
+            sd_notifier.notify("STATUS=Online, awaiting screen link")
+
+        elif new_mode == DisplayMode.DOWNLOADING_CONTENT:
+            logger.info("Showing DOWNLOADING_CONTENT screen")
             screen_id = get_screen_id()
             img = create_waiting_for_content_screen(
                 self.screen_width, self.screen_height, screen_id
             )
             self.feh_process = display_image_with_feh(
-                img, "jam_display_waiting",
+                img, "jam_display_downloading",
                 fallback_message="Waiting for content...\n\nContent is being downloaded.\nThis may take a few minutes."
             )
             if self.feh_process:
                 logger.info(f"feh process started: PID {self.feh_process.pid}")
             else:
-                logger.error("Failed to start feh for LINKED_WAITING_FOR_CONTENT screen")
-            sd_notifier.notify("STATUS=Waiting for content download")
+                logger.error("Failed to start feh for DOWNLOADING_CONTENT screen")
+            sd_notifier.notify("STATUS=Downloading content")
+
+        elif new_mode == DisplayMode.NO_ACTIVE_SCENES:
+            logger.info("Showing NO_ACTIVE_SCENES screen")
+            screen_id = get_screen_id()
+            img = create_no_active_scenes_screen(
+                self.screen_width, self.screen_height, screen_id
+            )
+            self.feh_process = display_image_with_feh(
+                img, "jam_display_no_active_scenes",
+                fallback_message=(
+                    "No active scenes\n\n"
+                    "This screen has no active scenes.\n"
+                    "Add scenes in the web app to display content here."
+                )
+            )
+            if self.feh_process:
+                logger.info(f"feh process started: PID {self.feh_process.pid}")
+            else:
+                logger.error("Failed to start feh for NO_ACTIVE_SCENES screen")
+            sd_notifier.notify("STATUS=Screen linked but no active scenes")
 
         elif new_mode == DisplayMode.PLAYING_CONTENT:
             logger.info("Entering PLAYING_CONTENT mode")

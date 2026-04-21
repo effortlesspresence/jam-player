@@ -99,7 +99,7 @@ from common.network import (
     get_current_connection_info,
     trigger_wifi_scan,
 )
-from common.paths import INTERNET_VERIFIED_FLAG
+from common.paths import INTERNET_VERIFIED_FLAG, safe_touch
 from common.network import check_internet_connectivity
 
 # ============================================================================
@@ -888,6 +888,19 @@ def try_announce_after_wifi():
         connected, msg = check_internet_connectivity()
         if connected:
             logger.info(f"Internet connectivity verified: {msg}")
+            # Write the .internet_verified flag immediately so
+            # jam-player-display can transition out of AWAITING_NETWORK
+            # right away, rather than waiting up to ~10-60s for
+            # jam-ble-state-manager's next periodic check + hysteresis.
+            # jam-ble-state-manager remains the authoritative owner of
+            # this flag -- it will reconfirm on its next tick and clear
+            # the flag if connectivity actually drops. This is just a
+            # latency optimization for the "user just finished WiFi
+            # setup" moment, where perceived responsiveness matters.
+            try:
+                safe_touch(INTERNET_VERIFIED_FLAG)
+            except Exception as e:
+                logger.warning(f"Failed to write {INTERNET_VERIFIED_FLAG}: {e}")
             break
         logger.info(f"Waiting for internet (attempt {attempt + 1}/3)...")
         time.sleep(5)
