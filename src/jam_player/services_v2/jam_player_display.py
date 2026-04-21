@@ -1712,7 +1712,7 @@ class JamPlayerDisplayManager:
                     time.sleep(0.5)
                     continue
 
-                logger.info(f"Switching to scene {scene_index}: {scene.get('id')} ({media_type})")
+                logger.debug(f"Switching to scene {scene_index}: {scene.get('id')} ({media_type})")
                 self._current_scene_index = scene_index
 
                 # Just load and play - no seeking or sync logic for now
@@ -1723,7 +1723,7 @@ class JamPlayerDisplayManager:
                 # (loadfile replace can reset the loop property)
                 if len(scenes) == 1:
                     self.mpv.set_property('loop-file', 'inf')
-                    logger.info("Single scene - enabled loop-file=inf")
+                    logger.debug("Single scene - enabled loop-file=inf")
 
             # Notify systemd watchdog
             sd_notifier.notify("WATCHDOG=1")
@@ -1753,7 +1753,7 @@ class JamPlayerDisplayManager:
             logger.warning("Could not get video duration, using 30s fallback")
             duration = 30
 
-        logger.info(f"Video duration: {duration:.1f}s")
+        logger.debug(f"Video duration: {duration:.1f}s")
 
         start_time = time.time()
         last_content_check = start_time
@@ -1791,7 +1791,7 @@ class JamPlayerDisplayManager:
 
     def _wait_for_duration(self, duration_seconds: int) -> bool:
         """Wait for the specified duration. Returns False if interrupted."""
-        logger.info(f"Displaying image for {duration_seconds}s")
+        logger.debug(f"Displaying image for {duration_seconds}s")
 
         start_time = time.time()
         last_state_check = start_time

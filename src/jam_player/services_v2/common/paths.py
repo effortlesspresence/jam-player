@@ -41,6 +41,11 @@ DEVICE_DATA_DIR = JAM_ETC_DIR / 'device_data'
 CREDENTIALS_DIR = JAM_ETC_DIR / 'credentials'
 CONFIG_DIR = JAM_ETC_DIR / 'config'
 
+# Optional log level override (e.g. "DEBUG" for troubleshooting). Read
+# once at service startup by common.logging_config.setup_service_logging.
+# Missing / empty / invalid -> INFO. Changes require service restart.
+LOG_LEVEL_FILE = CONFIG_DIR / 'log_level'
+
 # Device identification
 DEVICE_UUID_FILE = DEVICE_DATA_DIR / 'device_uuid.txt'
 JP_IMAGE_ID_FILE = DEVICE_DATA_DIR / 'jp_image_id.txt'  # Baked in during manufacturing

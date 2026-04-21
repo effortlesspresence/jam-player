@@ -192,16 +192,16 @@ def api_request(
     body_str = json.dumps(body) if body else ""
 
     if signed:
-        logger.info(f"Signing request: {method} {path}")
+        logger.debug(f"Signing request: {method} {path}")
         sign_headers = sign_request(method, path, body_str)
         if not sign_headers:
             logger.error("Failed to sign request - check device UUID and API signing private key")
             return None
         headers.update(sign_headers)
-        logger.info(f"Request signed with device ID: {sign_headers.get('X-Device-ID', 'unknown')}")
+        logger.debug(f"Request signed with device ID: {sign_headers.get('X-Device-ID', 'unknown')}")
 
     try:
-        logger.info(f"Making API request: {method} {url}")
+        logger.debug(f"Making API request: {method} {url}")
 
         if method.upper() == 'GET':
             response = requests.get(url, headers=headers, timeout=timeout)
@@ -215,7 +215,12 @@ def api_request(
             logger.error(f"Unsupported HTTP method: {method}")
             return None
 
-        logger.info(f"API response: {response.status_code}")
+        # Log response: successes are debug (expected, noisy), client/server
+        # errors are warning (actionable signal during incidents).
+        if response.status_code >= 400:
+            logger.warning(f"API response: {response.status_code} for {method} {path}")
+        else:
+            logger.debug(f"API response: {response.status_code}")
         return response
 
     except requests.exceptions.Timeout:
