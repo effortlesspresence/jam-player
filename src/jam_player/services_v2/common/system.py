@@ -619,6 +619,35 @@ def set_unique_hostname(device_uuid: str) -> bool:
             safe_write_text(hosts_file, '\n'.join(new_lines), 0o644)
             logger.info("Updated /etc/hosts with new hostname")
 
+        # Also try to set the BlueZ adapter Alias so iOS/Android system
+        # Bluetooth UI shows the per-device name (not the stale
+        # "comitup-307" bluetoothd inferred from hostname at its own
+        # startup). This is best-effort: bluetoothd may not be running
+        # yet during jam-first-boot, in which case jam-ble-provisioning
+        # will set the Alias via D-Bus when it later starts up.
+        try:
+            alias_result = subprocess.run(
+                ['bluetoothctl', 'system-alias', new_hostname],
+                capture_output=True,
+                text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT,
+            )
+            if alias_result.returncode == 0:
+                logger.info(f"Bluetooth adapter alias set to: {new_hostname}")
+            else:
+                # Log at debug -- expected early in boot before bluetoothd is up
+                logger.debug(
+                    f"bluetoothctl system-alias non-zero "
+                    f"(will be set later by jam-ble-provisioning): "
+                    f"{alias_result.stderr.strip() or alias_result.stdout.strip()}"
+                )
+        except FileNotFoundError:
+            logger.debug("bluetoothctl not installed -- skipping alias set")
+        except subprocess.TimeoutExpired:
+            logger.debug("bluetoothctl timed out -- will be set later by jam-ble-provisioning")
+        except Exception as e:
+            logger.debug(f"Could not set bluetooth alias via bluetoothctl: {e}")
+
         logger.info(f"Hostname set to: {new_hostname}")
         return True
 

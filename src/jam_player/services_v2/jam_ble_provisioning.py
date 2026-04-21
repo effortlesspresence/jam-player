@@ -114,7 +114,14 @@ logger = setup_service_logging('jam-ble-provisioning')
 # systemd Integration
 # ============================================================================
 
-from common.system import get_systemd_notifier, setup_signal_handlers, setup_glib_watchdog, manage_service, restart_service
+from common.system import (
+    get_systemd_notifier,
+    setup_signal_handlers,
+    setup_glib_watchdog,
+    manage_service,
+    restart_service,
+    get_unique_hostname,
+)
 
 # SystemdNotifier lets us tell systemd:
 # - READY=1: Service has started successfully
@@ -1568,13 +1575,29 @@ def reset_bluetooth_adapter(adapter_path: str):
         logger.warning(f"Could not reset adapter (non-fatal): {e}")
 
 
-def configure_adapter(bus, adapter_path: str):
+def configure_adapter(bus, adapter_path: str, alias: Optional[str] = None):
     """
     Configure the Bluetooth adapter for our use case.
 
     - Disable pairing requirement (no iOS pairing popup)
     - Make adapter discoverable
     - Set appropriate power state
+    - Set the adapter Alias to a per-device name (see below)
+
+    The Adapter Alias is a BlueZ property separate from our GATT
+    advertisement's LocalName. iOS and Android's system Bluetooth
+    settings UI read the Alias (not the LocalName), so if we leave it at
+    the BlueZ default -- which is the system hostname at bluetoothd's
+    startup time -- multiple JAM Players can all show up as
+    "comitup-307" in Settings even though our scan-list LocalName is
+    correctly "JAM-PLAYER-XXXXX". Setting it explicitly here closes
+    that gap. bluetoothd does not auto-update Alias when hostname
+    changes, so relying on hostnamectl alone isn't enough.
+
+    Args:
+        alias: Optional per-device alias (e.g. "jam-player-abcde"). If
+            provided and non-empty, overrides whatever bluetoothd
+            inferred from hostname.
     """
     try:
         adapter = dbus.Interface(
@@ -1597,6 +1620,16 @@ def configure_adapter(bus, adapter_path: str):
         # Make discoverable (for scanning)
         adapter.Set(adapter_iface, 'Discoverable', dbus.Boolean(True))
         logger.info("Adapter set to discoverable")
+
+        # Set a per-device alias so iOS/Android system Bluetooth UI
+        # shows the same identity users see in the scan list of the
+        # setup app (otherwise they all show up as "comitup-307").
+        if alias:
+            try:
+                adapter.Set(adapter_iface, 'Alias', dbus.String(alias))
+                logger.info(f"Adapter Alias set to: {alias}")
+            except Exception as e:
+                logger.warning(f"Could not set adapter Alias (non-fatal): {e}")
 
     except Exception as e:
         logger.warning(f"Could not configure adapter (non-fatal): {e}")
@@ -1683,8 +1716,16 @@ def main():
     # Reset adapter to clear any stale state from previous SD card
     reset_bluetooth_adapter(adapter_path)
 
-    # Configure adapter (disable pairing popup, etc.)
-    configure_adapter(bus, adapter_path)
+    # Compute the per-device adapter Alias from the UUID. Matches what
+    # set_unique_hostname() set as the system hostname -- we want
+    # iOS/Android system Bluetooth UI, the device's network hostname,
+    # and our BLE scan-list LocalName to all agree on the same
+    # per-device identity.
+    device_uuid = get_device_uuid()
+    adapter_alias = get_unique_hostname(device_uuid) if device_uuid else None
+
+    # Configure adapter (disable pairing popup, set per-device alias, etc.)
+    configure_adapter(bus, adapter_path, alias=adapter_alias)
 
     # Register NoInputNoOutput agent to prevent pairing popups
     # This must be done BEFORE accepting any connections
