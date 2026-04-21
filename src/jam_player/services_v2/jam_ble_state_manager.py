@@ -170,6 +170,16 @@ class BLEStateManager:
         self._last_connected_state = None  # Track state to avoid redundant actions
         self._internet_check_timer = None  # GLib timeout for periodic checks
 
+        # One-shot gate: trigger jam-update.service the first time a
+        # never-registered device sees internet connectivity, so warehouse
+        # devices that sit on the shelf for months auto-update before
+        # attempting setup. See _maybe_trigger_first_connect_update().
+        # In-memory only: resets if this service restarts, which is fine
+        # -- on a normal boot where WiFi is already configured,
+        # jam-update has already run via systemd's network-online.target
+        # gating, so triggering again at worst costs one extra git fetch.
+        self._first_connect_update_triggered = False
+
         # Initialize internet connectivity monitor with conservative settings
         # for flaky restaurant WiFi environments
         self._connectivity_monitor = InternetConnectivityMonitor(
@@ -502,6 +512,65 @@ class BLEStateManager:
             except Exception as e:
                 logger.warning(f"Error restarting {service}: {e}")
 
+    def _maybe_trigger_first_connect_update(self):
+        """
+        If this is the first time this never-registered device has seen
+        internet connectivity, trigger jam-update.service so warehouse
+        devices auto-update to latest code before they attempt setup.
+
+        Gated by:
+          1. Device is not yet .registered (avoids racing active setup
+             on deployed devices that just lost and regained WiFi --
+             those already picked up updates via their previous boot's
+             jam-update).
+          2. We have not already fired this trigger in this process
+             lifetime (avoids re-firing on every online-transition).
+
+        jam-update.service is Type=oneshot and idempotent (does nothing
+        if /etc/jam/version.txt already matches origin/main), so even
+        redundant invocations are safe -- but the gate spares us a git
+        fetch on every WiFi hiccup.
+
+        Uses `systemctl start` (not `restart`) so systemd treats an
+        already-running or already-finished jam-update as a no-op
+        rather than kicking off a second run.
+        """
+        if self._first_connect_update_triggered:
+            return
+
+        if is_device_registered():
+            # Deployed device -- updates come via the nightly 3 AM
+            # reboot cycle. Triggering jam-update here could race an
+            # in-flight setup / WebSocket session / content fetch.
+            return
+
+        self._first_connect_update_triggered = True
+
+        import subprocess
+        logger.info(
+            "First internet connection on an unregistered device -- "
+            "triggering jam-update.service so warehouse devices catch "
+            "up to latest code before setup"
+        )
+        try:
+            result = subprocess.run(
+                ['systemctl', 'start', 'jam-update.service'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                logger.info("jam-update.service start triggered")
+            else:
+                logger.warning(
+                    f"systemctl start jam-update returned non-zero: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+        except subprocess.TimeoutExpired:
+            logger.warning("systemctl start jam-update timed out")
+        except Exception as e:
+            logger.warning(f"Failed to trigger jam-update: {e}")
+
     def _apply_ble_state(self, is_online: bool, method: str = "unknown"):
         """
         Apply the correct BLE state based on connectivity and registration.
@@ -522,6 +591,13 @@ class BLEStateManager:
                 safe_touch(INTERNET_VERIFIED_FLAG)
             except Exception as e:
                 logger.warning(f"Failed to create internet verified flag: {e}")
+
+            # Warehouse-device auto-update: on the first time this
+            # never-registered device has internet, kick jam-update so
+            # it catches up to latest code before attempting setup.
+            # Self-gated to fire at most once per process lifetime and
+            # only while .registered is absent.
+            self._maybe_trigger_first_connect_update()
 
             if should_run:
                 logger.info(
