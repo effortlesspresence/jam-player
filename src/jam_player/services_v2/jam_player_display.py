@@ -14,22 +14,35 @@ Display Modes (in order of setup progress):
      (re-run WiFi setup via the mobile app over BLE).
    - Display: setup screen with JAM logo, QR code, "Set up your JAM Player"
 
-2. AWAITING_SCREEN_LINK (internet verified, but no screen_id on disk)
-   - Device is online but the user hasn't linked it to a Screen yet.
-   - Display: "Connected! Next, link this JAM Player to a screen..."
+2. AWAITING_REGISTRATION (internet verified, but .registered flag is missing)
+   - Device is online but has not yet been registered to a Location via
+     the mobile app. Registration is a mobile-app-only flow (the web app
+     cannot register devices because registration depends on the BLE
+     session the mobile app already has open). Internally, the device
+     may or may not be .announced at this point -- announce is plumbing
+     and doesn't gate anything the user sees.
+   - Display: "Almost there. Set up this JAM Player in the JAM Player
+     Setup app on your phone." + mobile-app QR.
 
-3. DOWNLOADING_CONTENT (screen_id exists, scenes.json missing OR has scenes
+3. AWAITING_SCREEN_LINK (registered, but no screen_id on disk)
+   - Device is registered to a Location but the user hasn't linked it
+     to a specific Screen yet. Linking can happen from the mobile app
+     OR the web app.
+   - Display: "Connected! Link this JAM Player to a screen using the
+     JAM Player Setup app or the web app."
+
+4. DOWNLOADING_CONTENT (screen_id exists, scenes.json missing OR has scenes
    with media files not yet on disk)
    - Content fetch/download is in progress.
    - Display: "Waiting for content..." with animated dots
 
-4. NO_ACTIVE_SCENES (screen_id exists, scenes.json exists but is an empty list)
+5. NO_ACTIVE_SCENES (screen_id exists, scenes.json exists but is an empty list)
    - The linked Screen has no active scenes configured right now. This is
      distinct from DOWNLOADING_CONTENT: there is nothing to download, the
      backend deliberately returned no scenes.
    - Display: "This screen has no active scenes..."
 
-5. PLAYING_CONTENT (scenes.json has scenes and at least one media file exists)
+6. PLAYING_CONTENT (scenes.json has scenes and at least one media file exists)
    - Display: Plays scenes sequentially from scenes.json
    - Wall clock synchronized playback for multi-display setups
    - Automatically reloads when content is updated
@@ -178,7 +191,8 @@ class DisplayMode(Enum):
     keeps playing -- see that function's docstring for the full spec.
     """
     AWAITING_NETWORK = "awaiting_network"  # .internet_verified flag missing
-    AWAITING_SCREEN_LINK = "awaiting_screen_link"  # online, but no screen_id
+    AWAITING_REGISTRATION = "awaiting_registration"  # online, but not yet registered to a Location (.registered missing)
+    AWAITING_SCREEN_LINK = "awaiting_screen_link"  # registered, but no screen_id
     DOWNLOADING_CONTENT = "downloading_content"  # screen linked, content not yet on disk
     NO_ACTIVE_SCENES = "no_active_scenes"  # screen linked, backend returned empty scenes list
     PLAYING_CONTENT = "playing_content"  # scenes + media present
@@ -618,7 +632,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         (center_x, y),
         scan_text,
         font=instructions_font,
-        fill=SECONDARY_COLOR,
+        fill=TEXT_COLOR,
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), scan_text, font=instructions_font)
@@ -660,7 +674,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
             (center_x, height - 50),
             device_text,
             font=device_font,
-            fill=SECONDARY_COLOR,
+            fill=TEXT_COLOR,
             anchor="mm"
         )
 
@@ -760,7 +774,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
             (center_x, height - 50),
             device_text,
             font=device_font,
-            fill=SECONDARY_COLOR,
+            fill=TEXT_COLOR,
             anchor="mm"
         )
 
@@ -856,7 +870,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
         (center_x, y),
         line2,
         font=instructions_font,
-        fill=SECONDARY_COLOR,
+        fill=TEXT_COLOR,
         anchor="mt"
     )
 
@@ -868,10 +882,143 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
             (center_x, height - 50),
             device_text,
             font=device_font,
-            fill=SECONDARY_COLOR,
+            fill=TEXT_COLOR,
             anchor="mm"
         )
 
+    version_font = get_font(14, bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),
+        anchor="mm"
+    )
+
+    return img
+
+
+def create_awaiting_registration_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
+    """
+    Create the screen for AWAITING_REGISTRATION mode.
+
+    Shown when the device has verified internet connectivity but has not
+    been registered to a Location yet. Registration is mobile-app-only
+    (the web app cannot register devices because registration depends
+    on the BLE session the mobile app has open), so this screen directs
+    the user specifically to the mobile app and includes a QR code to
+    the app download / setup landing page.
+
+    Distinct from AWAITING_SCREEN_LINK, which is shown after the device
+    is registered but not yet linked to a specific Screen; that screen
+    directs the user to either the mobile app or the web app and has no
+    QR code.
+    """
+    if not HAS_PIL:
+        logger.error("PIL not available for creating display images")
+        return None
+
+    img = create_mesh_gradient_background(width, height, theme="cool")
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(FONT_SIZE_TITLE)
+    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
+    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
+    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+
+    center_x = width // 2
+
+    # Layout proportions mirror create_unregistered_screen so the user
+    # doesn't experience a jarring layout shift when transitioning from
+    # AWAITING_NETWORK to AWAITING_REGISTRATION.
+    logo_height = min(120, height // 8)
+    qr_size = min(320, height // 4)
+
+    y = int(height * 0.08)
+
+    # Logo
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
+        y += logo.height + 30
+    else:
+        y += 40
+
+    # Primary heading: "Almost there."
+    heading = "Almost there."
+    draw.text(
+        (center_x, y),
+        heading,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), heading, font=title_font)
+    y += bbox[3] + 40
+
+    # Instruction line 1
+    line1 = "Set up this JAM Player in the"
+    draw.text(
+        (center_x, y),
+        line1,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), line1, font=instructions_font)
+    y += bbox[3] + 12
+
+    line2 = "JAM Player Setup app on your phone."
+    draw.text(
+        (center_x, y),
+        line2,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), line2, font=instructions_font)
+    y += bbox[3] + 30
+
+    # "Scan the QR code to begin."
+    scan_text = "Scan the QR code to begin."
+    draw.text(
+        (center_x, y),
+        scan_text,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), scan_text, font=instructions_font)
+    y += bbox[3] + 30
+
+    # QR Code pointing at the mobile-app setup landing page.
+    qr_img = generate_qr_code(UNIVERSAL_SETUP_URL, qr_size)
+    if qr_img:
+        qr_x = center_x - qr_size // 2
+        qr_y = y
+
+        border_padding = 8
+        draw.rectangle(
+            [qr_x - border_padding, qr_y - border_padding,
+             qr_x + qr_size + border_padding, qr_y + qr_size + border_padding],
+            outline=JAM_ORANGE_PRIMARY,
+            width=3
+        )
+        img.paste(qr_img, (qr_x, qr_y))
+
+    # Device UUID at the bottom
+    if device_uuid:
+        device_text = f"Device: {device_uuid}"
+        draw.text(
+            (center_x, height - 50),
+            device_text,
+            font=device_font,
+            fill=TEXT_COLOR,
+            anchor="mm"
+        )
+
+    # Version indicator
     version_font = get_font(14, bold=False)
     draw.text(
         (width - 30, height - 25),
@@ -966,7 +1113,7 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
         (center_x, y),
         line2,
         font=instructions_font,
-        fill=SECONDARY_COLOR,
+        fill=TEXT_COLOR,
         anchor="mt"
     )
 
@@ -979,7 +1126,7 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
             (center_x, height - 50),
             device_text,
             font=device_font,
-            fill=SECONDARY_COLOR,
+            fill=TEXT_COLOR,
             anchor="mm"
         )
 
@@ -1370,14 +1517,13 @@ class JamPlayerDisplayManager:
 
         Order of checks:
           1. Playable content on disk -> PLAYING_CONTENT (regardless of
-             network / screen link state).
+             network / registration / screen link state).
           2. Otherwise walk the setup ladder:
              a. No .internet_verified -> AWAITING_NETWORK
-             b. No screen_id -> AWAITING_SCREEN_LINK
-             c. scenes.json exists but is empty -> NO_ACTIVE_SCENES
-             d. Otherwise (scenes present but media missing, or
-                scenes.json missing entirely with screen linked)
-                -> DOWNLOADING_CONTENT
+             b. No .registered        -> AWAITING_REGISTRATION
+             c. No screen_id          -> AWAITING_SCREEN_LINK
+             d. scenes.json is empty  -> NO_ACTIVE_SCENES
+             e. Otherwise             -> DOWNLOADING_CONTENT
 
         See the module docstring for the full spec.
         """
@@ -1393,18 +1539,27 @@ class JamPlayerDisplayManager:
         if not INTERNET_VERIFIED_FLAG.exists():
             return DisplayMode.AWAITING_NETWORK
 
-        # 2b. Online but not linked to a Screen. Note we deliberately do
-        # NOT gate on is_device_registered() here: a device's registration
-        # state is internal plumbing; what the user actually cares about
-        # is whether a Screen is linked. Also covers the
-        # recently-unlinked-on-backend case (heartbeat / SET_SCREEN_ID
-        # deletes screen_id.txt on unlink).
+        # 2b. Online but not yet registered to a Location. Registration
+        # is a mobile-app-only flow (the web app can't register a
+        # device). Note we deliberately do NOT consider .announced here:
+        # announce is internal plumbing. An unannounced device can still
+        # be registered by the mobile app in a single call (the backend
+        # transitions new -> REGISTERED directly when appropriate), so
+        # the correct user-facing state is still "go to the mobile app"
+        # regardless of announce status.
+        if not is_device_registered():
+            return DisplayMode.AWAITING_REGISTRATION
+
+        # 2c. Registered but not linked to a specific Screen. Screen
+        # linking can happen from the mobile app OR the web app. This
+        # also covers the recently-unlinked case (heartbeat /
+        # SET_SCREEN_ID deletes screen_id.txt on unlink).
         if not get_screen_id():
             return DisplayMode.AWAITING_SCREEN_LINK
 
-        # 2c / 2d. Screen linked, online, but content not playable yet.
-        # Fall back to whatever the content check said (NO_ACTIVE_SCENES
-        # vs DOWNLOADING_CONTENT).
+        # 2d / 2e. Screen linked but content not playable yet. Fall back
+        # to whatever the content check said (NO_ACTIVE_SCENES vs
+        # DOWNLOADING_CONTENT).
         return content_mode
 
     def _get_content_display_mode(self) -> DisplayMode:
@@ -1529,6 +1684,26 @@ class JamPlayerDisplayManager:
                 logger.error("Failed to start feh for AWAITING_NETWORK screen")
             sd_notifier.notify("STATUS=Awaiting network (setup)")
 
+        elif new_mode == DisplayMode.AWAITING_REGISTRATION:
+            logger.info("Showing AWAITING_REGISTRATION screen")
+            img = create_awaiting_registration_screen(
+                self.screen_width, self.screen_height, device_uuid
+            )
+            self.feh_process = display_image_with_feh(
+                img, "jam_display_awaiting_registration",
+                fallback_message=(
+                    "Almost there.\n\n"
+                    "Set up this JAM Player in the\n"
+                    "JAM Player Setup app on your phone.\n\n"
+                    "Scan the QR code to begin."
+                )
+            )
+            if self.feh_process:
+                logger.info(f"feh process started: PID {self.feh_process.pid}")
+            else:
+                logger.error("Failed to start feh for AWAITING_REGISTRATION screen")
+            sd_notifier.notify("STATUS=Online, awaiting registration")
+
         elif new_mode == DisplayMode.AWAITING_SCREEN_LINK:
             logger.info("Showing AWAITING_SCREEN_LINK screen")
             img = create_awaiting_screen_link_screen(
@@ -1546,7 +1721,7 @@ class JamPlayerDisplayManager:
                 logger.info(f"feh process started: PID {self.feh_process.pid}")
             else:
                 logger.error("Failed to start feh for AWAITING_SCREEN_LINK screen")
-            sd_notifier.notify("STATUS=Online, awaiting screen link")
+            sd_notifier.notify("STATUS=Registered, awaiting screen link")
 
         elif new_mode == DisplayMode.DOWNLOADING_CONTENT:
             logger.info("Showing DOWNLOADING_CONTENT screen")
