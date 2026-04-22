@@ -677,11 +677,17 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     return img
 
 
-def create_waiting_for_content_screen(width: int, height: int, screen_id: str = None) -> Image.Image:
+def create_waiting_for_content_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
     """
     Create the screen for DOWNLOADING_CONTENT mode.
 
     Modern gradient design showing content download progress message.
+
+    Footer shows the device UUID (not the screen ID) because any screen
+    that isn't real content should identify the physical JAM Player for
+    support purposes. The screen ID is only meaningful inside the web
+    app; the device UUID is what uniquely identifies the hardware a
+    technician is looking at.
     """
     if not HAS_PIL:
         logger.error("PIL not available for creating display images")
@@ -694,7 +700,7 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
     # Fonts
     title_font = get_font(FONT_SIZE_TITLE)
     subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
-    screen_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
 
     center_x = width // 2
     center_y = height // 2
@@ -745,13 +751,15 @@ def create_waiting_for_content_screen(width: int, height: int, screen_id: str = 
             fill=dot_color
         )
 
-    # Screen ID at bottom if available
-    if screen_id:
-        screen_text = f"Screen: {screen_id}"
+    # Device UUID at bottom (every non-content screen shows device UUID
+    # so support can identify the physical JAM Player regardless of
+    # setup state).
+    if device_uuid:
+        device_text = f"Device: {device_uuid}"
         draw.text(
             (center_x, height - 50),
-            screen_text,
-            font=screen_font,
+            device_text,
+            font=device_font,
             fill=SECONDARY_COLOR,
             anchor="mm"
         )
@@ -876,7 +884,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
     return img
 
 
-def create_no_active_scenes_screen(width: int, height: int, screen_id: str = None) -> Image.Image:
+def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
     """
     Create the screen for NO_ACTIVE_SCENES mode.
 
@@ -888,6 +896,12 @@ def create_no_active_scenes_screen(width: int, height: int, screen_id: str = Non
     Visually distinct from DOWNLOADING_CONTENT (no animated dots, no
     "please wait" messaging) so the user understands the device isn't
     busy -- it's waiting on them to take action.
+
+    Footer shows the device UUID (not the screen ID) because any screen
+    that isn't real content should identify the physical JAM Player for
+    support purposes. The screen ID is only meaningful inside the web
+    app; the device UUID is what uniquely identifies the hardware a
+    technician is looking at.
     """
     if not HAS_PIL:
         logger.error("PIL not available for creating display images")
@@ -899,7 +913,7 @@ def create_no_active_scenes_screen(width: int, height: int, screen_id: str = Non
     title_font = get_font(FONT_SIZE_TITLE)
     subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
     instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
-    screen_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
 
     center_x = width // 2
 
@@ -956,14 +970,15 @@ def create_no_active_scenes_screen(width: int, height: int, screen_id: str = Non
         anchor="mt"
     )
 
-    # Show the linked Screen ID so support / users can verify they're
-    # configuring the right Screen.
-    if screen_id:
-        screen_text = f"Screen: {screen_id}"
+    # Device UUID at bottom (every non-content screen shows device UUID
+    # so support can identify the physical JAM Player regardless of
+    # setup state).
+    if device_uuid:
+        device_text = f"Device: {device_uuid}"
         draw.text(
             (center_x, height - 50),
-            screen_text,
-            font=screen_font,
+            device_text,
+            font=device_font,
             fill=SECONDARY_COLOR,
             anchor="mm"
         )
@@ -1535,9 +1550,8 @@ class JamPlayerDisplayManager:
 
         elif new_mode == DisplayMode.DOWNLOADING_CONTENT:
             logger.info("Showing DOWNLOADING_CONTENT screen")
-            screen_id = get_screen_id()
             img = create_waiting_for_content_screen(
-                self.screen_width, self.screen_height, screen_id
+                self.screen_width, self.screen_height, device_uuid
             )
             self.feh_process = display_image_with_feh(
                 img, "jam_display_downloading",
@@ -1551,9 +1565,8 @@ class JamPlayerDisplayManager:
 
         elif new_mode == DisplayMode.NO_ACTIVE_SCENES:
             logger.info("Showing NO_ACTIVE_SCENES screen")
-            screen_id = get_screen_id()
             img = create_no_active_scenes_screen(
-                self.screen_width, self.screen_height, screen_id
+                self.screen_width, self.screen_height, device_uuid
             )
             self.feh_process = display_image_with_feh(
                 img, "jam_display_no_active_scenes",
