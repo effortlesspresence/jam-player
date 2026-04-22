@@ -955,7 +955,23 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), heading, font=title_font)
-    y += bbox[3] + 40
+    y += bbox[3] + 20
+
+    # Status confirmation: explicitly reassure the user that the device
+    # is online. AWAITING_REGISTRATION is only reached when
+    # .internet_verified exists, so this statement is always accurate
+    # here. Helps users understand that the "go to the mobile app" step
+    # is the one remaining action, not a connectivity problem.
+    status_line = "Your JAM Player is connected to the internet."
+    draw.text(
+        (center_x, y),
+        status_line,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), status_line, font=subtitle_font)
+    y += bbox[3] + 30
 
     # Instruction line 1
     line1 = "Set up this JAM Player in the"
@@ -1693,6 +1709,7 @@ class JamPlayerDisplayManager:
                 img, "jam_display_awaiting_registration",
                 fallback_message=(
                     "Almost there.\n\n"
+                    "Your JAM Player is connected to the internet.\n\n"
                     "Set up this JAM Player in the\n"
                     "JAM Player Setup app on your phone.\n\n"
                     "Scan the QR code to begin."
