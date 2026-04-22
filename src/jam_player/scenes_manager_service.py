@@ -369,6 +369,66 @@ def cleanup_unused_media(referenced_files: set) -> int:
     return deleted_count
 
 
+def _invalidate_stale_live_scenes_if_screen_changed() -> None:
+    """
+    Delete live_scenes/scenes.json if it's older than screen_id.txt.
+
+    A newer screen_id.txt means the device has been (re)linked to a
+    Screen since the current live scenes.json was written. That makes
+    the current scenes.json stale: it was written for the previous
+    screen (or for the "no screen linked" state, which produced `[]`).
+
+    Deleting it here -- at the very top of load_content(), before we
+    fetch new content -- is what keeps jam-player-display out of the
+    NO_ACTIVE_SCENES state during the fetch + download window. With
+    the stale file removed, _get_content_display_mode() sees no
+    scenes.json and returns DOWNLOADING_CONTENT, which is the
+    accurate user-facing state while we're pulling content.
+
+    We only delete scenes.json (not the whole directory) so that any
+    in-progress file operations in LIVE_SCENES_DIR from elsewhere
+    don't get disrupted. Individual scene JSONs in the same dir are
+    irrelevant to the display's state check, which only reads
+    scenes.json.
+
+    All errors are caught and logged -- this is a best-effort UX
+    improvement, not a correctness requirement.
+    """
+    live_scenes_json = LIVE_SCENES_DIR / "scenes.json"
+    if not live_scenes_json.exists():
+        # Nothing stale to invalidate.
+        return
+
+    if not SCREEN_ID_FILE.exists():
+        # No screen linked. Whatever is in live_scenes.json is either
+        # already `[]` (harmless) or content from a previous link we
+        # no longer care about. Clear it so the display shows the
+        # correct "awaiting screen link" state instead of stale content.
+        try:
+            live_scenes_json.unlink()
+            logger.info("Cleared live_scenes/scenes.json (screen_id.txt missing)")
+        except Exception as e:
+            logger.warning(f"Failed to clear stale live scenes.json: {e}")
+        return
+
+    try:
+        screen_id_mtime = SCREEN_ID_FILE.stat().st_mtime
+        live_scenes_mtime = live_scenes_json.stat().st_mtime
+    except Exception as e:
+        logger.warning(f"Failed to compare mtimes for stale-scenes check: {e}")
+        return
+
+    if screen_id_mtime > live_scenes_mtime:
+        try:
+            live_scenes_json.unlink()
+            logger.info(
+                "Cleared stale live_scenes/scenes.json "
+                "(screen_id.txt is newer -- device was recently re-linked)"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to clear stale live scenes.json: {e}")
+
+
 def load_content() -> bool:
     """
     Fetch content from API and download all media files.
@@ -379,6 +439,21 @@ def load_content() -> bool:
     Returns:
         True if successful, False otherwise.
     """
+    # If the linked screen has changed since the last successful content
+    # write, the current live_scenes/scenes.json is stale for this screen
+    # (it was written for the previous screen, or for the "no screen
+    # linked yet" state which produced `[]`). We invalidate it HERE --
+    # at the top of load_content(), before fetching -- so that during
+    # the ~30-90s fetch + media download window, jam-player-display
+    # sees "no scenes.json present" rather than a stale `[]`.
+    #
+    # Without this, a device that just got linked would stay in
+    # NO_ACTIVE_SCENES ("this screen has nothing scheduled") for the
+    # entire download window even though content is actively arriving.
+    # Once the atomic swap completes below, the correct scenes.json
+    # lands in place and the display transitions to PLAYING_CONTENT.
+    _invalidate_stale_live_scenes_if_screen_changed()
+
     # Fetch content from API
     scenes = fetch_content()
     if scenes is None:
