@@ -829,8 +829,12 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
     else:
         y += 40
 
-    # Primary heading: "Connected!"
-    heading = "Connected!"
+    # Primary heading: "Registered!" -- the user just completed the
+    # registration step in the mobile app, so this is the appropriate
+    # celebratory checkpoint. "Connected!" was too ambiguous given
+    # AWAITING_REGISTRATION also mentions the device being connected
+    # to the internet.
+    heading = "Registered!"
     draw.text(
         (center_x, y),
         heading,
@@ -839,7 +843,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), heading, font=title_font)
-    y += bbox[3] + 30
+    y += bbox[3] + 20
 
     # Secondary line: "Almost there."
     sub = "Almost there."
@@ -851,7 +855,22 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), sub, font=subtitle_font)
-    y += bbox[3] + 50
+    y += bbox[3] + 20
+
+    # Confirmation of the registration state: by the time we reach
+    # AWAITING_SCREEN_LINK we know the .registered flag exists, so this
+    # statement is always accurate here. Helps users understand that
+    # the "link to a screen" step is the only remaining action.
+    status_line = "Your JAM Player is registered to your outlet."
+    draw.text(
+        (center_x, y),
+        status_line,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mt"
+    )
+    bbox = draw.textbbox((0, 0), status_line, font=subtitle_font)
+    y += bbox[3] + 40
 
     # Instruction: link this JAM Player
     line1 = "Link this JAM Player to a screen"
@@ -1729,7 +1748,9 @@ class JamPlayerDisplayManager:
             self.feh_process = display_image_with_feh(
                 img, "jam_display_awaiting_screen_link",
                 fallback_message=(
-                    "Connected!\n\n"
+                    "Registered!\n\n"
+                    "Almost there.\n\n"
+                    "Your JAM Player is registered to your outlet.\n\n"
                     "Link this JAM Player to a screen\n"
                     "using the mobile app or web app."
                 )
