@@ -56,6 +56,7 @@ which is Linux's inter-process communication (IPC) system. Our service:
 - BlueZ: Must be installed and running (apt install bluez)
 """
 
+import os
 import sys
 import json
 import subprocess
@@ -1544,6 +1545,53 @@ def find_adapter(bus) -> Optional[str]:
         return None
 
 
+def ensure_bluetooth_not_rfkill_blocked() -> None:
+    """
+    Clear any rfkill soft-block on Bluetooth so the adapter can power on.
+
+    We observed a production incident where a customer's JAM Player had
+    Bluetooth soft-blocked by rfkill (visible via `rfkill list` as
+    `Soft blocked: yes`). Under that state, bluetoothd cannot power the
+    adapter on -- every attempt to set `Powered=True` via D-Bus returns
+    `org.bluez.Error.Failed: Failed`, and `bluetoothctl` shows
+    `Powered: no`. No advertisements are ever broadcast, and the mobile
+    app's scan list shows nothing. The BLE provisioning service looked
+    healthy ("Status=Advertising as JAM-PLAYER-XXXXX") but was actually
+    silent because the radio was off. See the 2026-04-22 incident log.
+
+    The block can be set by `rfkill block bluetooth` (either manual
+    troubleshooting or a stray script), or restored by systemd-rfkill
+    from persistent state in /var/lib/systemd/rfkill/ from a previous
+    boot. Our 2.0 code never blocks Bluetooth intentionally, so it is
+    always safe to unblock here.
+
+    This is best-effort and idempotent: a no-op if Bluetooth isn't
+    blocked, and any failure (rfkill not installed, etc.) is logged
+    without preventing the service from starting.
+    """
+    try:
+        result = subprocess.run(
+            ['rfkill', 'unblock', 'bluetooth'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            logger.info("rfkill unblock bluetooth: success (or no-op)")
+        else:
+            logger.warning(
+                f"rfkill unblock bluetooth returned non-zero "
+                f"(rc={result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+    except FileNotFoundError:
+        logger.warning("rfkill not installed -- skipping Bluetooth unblock")
+    except subprocess.TimeoutExpired:
+        logger.warning("rfkill unblock bluetooth timed out")
+    except Exception as e:
+        logger.warning(f"Failed to run rfkill unblock: {e}")
+
+
 def reset_bluetooth_adapter(adapter_path: str):
     """
     Reset the Bluetooth adapter to clear any stale state.
@@ -1575,22 +1623,35 @@ def reset_bluetooth_adapter(adapter_path: str):
         logger.warning(f"Could not reset adapter (non-fatal): {e}")
 
 
-def configure_adapter(bus, adapter_path: str, alias: Optional[str] = None):
+def configure_adapter(bus, adapter_path: str, alias: Optional[str] = None) -> bool:
     """
     Configure the Bluetooth adapter for our use case.
 
+    - Power the adapter on (required for advertising)
     - Disable pairing requirement (no iOS pairing popup)
     - Make adapter discoverable
-    - Set appropriate power state
     - Set the adapter Alias to a per-device name (see below)
+
+    Returns:
+        True if the adapter is powered on after this call. False if
+        powering the adapter on failed -- in that case the caller MUST
+        NOT proceed with advertising because advertisements registered
+        against an unpowered adapter are silently rejected by BlueZ
+        (we sit in the "Advertising as JAM-PLAYER-XXXXX" state while
+        broadcasting nothing, and the mobile app scan list shows an
+        empty list). See the 2026-04-22 rfkill-soft-block incident.
+
+    Power-on is treated as a hard requirement. The other settings
+    (Pairable, Discoverable, Alias) are best-effort -- they improve UX
+    but a failure on any of them should not block a service start.
 
     The Adapter Alias is a BlueZ property separate from our GATT
     advertisement's LocalName. iOS and Android's system Bluetooth
-    settings UI read the Alias (not the LocalName), so if we leave it at
-    the BlueZ default -- which is the system hostname at bluetoothd's
-    startup time -- multiple JAM Players can all show up as
-    "comitup-307" in Settings even though our scan-list LocalName is
-    correctly "JAM-PLAYER-XXXXX". Setting it explicitly here closes
+    settings UI read the Alias (not the LocalName), so if we leave it
+    at the BlueZ default -- which is the system hostname at
+    bluetoothd's startup time -- multiple JAM Players can all show up
+    as "comitup-307" in Settings even though our scan-list LocalName
+    is correctly "JAM-PLAYER-XXXXX". Setting it explicitly here closes
     that gap. bluetoothd does not auto-update Alias when hostname
     changes, so relying on hostnamectl alone isn't enough.
 
@@ -1599,40 +1660,66 @@ def configure_adapter(bus, adapter_path: str, alias: Optional[str] = None):
             provided and non-empty, overrides whatever bluetoothd
             inferred from hostname.
     """
+    adapter_iface = 'org.bluez.Adapter1'
+
     try:
         adapter = dbus.Interface(
             bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
-            DBUS_PROP_IFACE
+            DBUS_PROP_IFACE,
         )
+    except Exception as e:
+        logger.error(f"Could not open adapter D-Bus interface: {e}")
+        return False
 
-        # Adapter1 interface for setting properties
-        adapter_iface = 'org.bluez.Adapter1'
-
-        # Ensure adapter is powered on
+    # Step 1: power on. Critical -- an unpowered adapter silently fails
+    # to broadcast advertisements even after RegisterAdvertisement
+    # reports success.
+    powered_ok = False
+    try:
         adapter.Set(adapter_iface, 'Powered', dbus.Boolean(True))
-        logger.info("Bluetooth adapter powered on")
+        # Read back to verify. BlueZ's Set may appear to succeed while
+        # the radio remains off (e.g. under rfkill soft-block) -- the
+        # only reliable check is to re-Get the property.
+        powered = bool(adapter.Get(adapter_iface, 'Powered'))
+        if powered:
+            logger.info("Bluetooth adapter powered on")
+            powered_ok = True
+        else:
+            logger.error(
+                "Bluetooth adapter did not power on (Set reported no "
+                "error but Powered reads as False). Most likely rfkill "
+                "soft-block, or bluetoothd rejected the mode change. "
+                "Check `rfkill list` and `journalctl -u bluetooth`."
+            )
+    except Exception as e:
+        logger.error(f"Failed to set adapter Powered=True: {e}")
 
-        # Disable pairing requirement - this prevents the iOS pairing popup
-        # Pairable=False means we don't initiate or accept pairing
+    if not powered_ok:
+        # Don't try the remaining settings -- they'd just chain failures.
+        return False
+
+    # Step 2-4: best-effort settings. Each is wrapped individually so
+    # one failure doesn't skip the others.
+    try:
         adapter.Set(adapter_iface, 'Pairable', dbus.Boolean(False))
         logger.info("Pairing disabled (no popup)")
+    except Exception as e:
+        logger.warning(f"Could not set Pairable=False (non-fatal): {e}")
 
-        # Make discoverable (for scanning)
+    try:
         adapter.Set(adapter_iface, 'Discoverable', dbus.Boolean(True))
         logger.info("Adapter set to discoverable")
-
-        # Set a per-device alias so iOS/Android system Bluetooth UI
-        # shows the same identity users see in the scan list of the
-        # setup app (otherwise they all show up as "comitup-307").
-        if alias:
-            try:
-                adapter.Set(adapter_iface, 'Alias', dbus.String(alias))
-                logger.info(f"Adapter Alias set to: {alias}")
-            except Exception as e:
-                logger.warning(f"Could not set adapter Alias (non-fatal): {e}")
-
     except Exception as e:
-        logger.warning(f"Could not configure adapter (non-fatal): {e}")
+        logger.warning(f"Could not set Discoverable=True (non-fatal): {e}")
+
+    if alias:
+        try:
+            adapter.Set(adapter_iface, 'Alias', dbus.String(alias))
+            logger.info(f"Adapter Alias set to: {alias}")
+        except Exception as e:
+            logger.warning(f"Could not set adapter Alias (non-fatal): {e}")
+
+    return True
 
 
 def register_advertisement(bus, adapter_path: str, advertisement):
@@ -1713,6 +1800,13 @@ def main():
 
     logger.info(f"Using Bluetooth adapter: {adapter_path}")
 
+    # Clear any rfkill soft-block on Bluetooth before touching the
+    # adapter. Must happen before reset/configure -- a blocked radio
+    # can't be powered on by any of the downstream calls. See the
+    # 2026-04-22 incident where a customer's JP sat with rfkill
+    # soft-block set, leaving the mobile app with an empty scan list.
+    ensure_bluetooth_not_rfkill_blocked()
+
     # Reset adapter to clear any stale state from previous SD card
     reset_bluetooth_adapter(adapter_path)
 
@@ -1724,8 +1818,19 @@ def main():
     device_uuid = get_device_uuid()
     adapter_alias = get_unique_hostname(device_uuid) if device_uuid else None
 
-    # Configure adapter (disable pairing popup, set per-device alias, etc.)
-    configure_adapter(bus, adapter_path, alias=adapter_alias)
+    # Configure adapter (power-on, disable pairing popup, set per-device
+    # alias, etc.). If this returns False, the adapter did NOT power on
+    # -- proceeding would leave us silently advertising nothing. Exit
+    # and let systemd restart us (with Restart=on-failure + a short
+    # RestartSec, the next attempt re-runs the rfkill unblock above,
+    # which in most cases resolves the issue).
+    if not configure_adapter(bus, adapter_path, alias=adapter_alias):
+        logger.error(
+            "Adapter failed to power on -- exiting so systemd can "
+            "restart this service"
+        )
+        sd_notifier.notify("STATUS=Bluetooth adapter failed to power on")
+        sys.exit(1)
 
     # Register NoInputNoOutput agent to prevent pairing popups
     # This must be done BEFORE accepting any connections
@@ -1790,9 +1895,50 @@ def main():
 
     GLib.timeout_add_seconds(5, initial_reregister)
 
-    # Periodic refresh of advertisement status flags every 30 seconds
-    # This ensures the mobile app sees accurate status without service restart
+    # Helper used by the periodic timer below. Reads back the adapter's
+    # Powered property and returns True if the radio is still on. Any
+    # failure (D-Bus error, property missing, etc.) is treated as "we
+    # don't know" -- we return True and let the next tick try again
+    # rather than triggering a restart on a transient D-Bus hiccup.
+    def adapter_is_powered() -> bool:
+        try:
+            adapter = dbus.Interface(
+                bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+                DBUS_PROP_IFACE,
+            )
+            return bool(adapter.Get('org.bluez.Adapter1', 'Powered'))
+        except Exception as e:
+            logger.warning(f"Failed to read adapter Powered property: {e}")
+            return True  # Unknown -- don't restart on a D-Bus hiccup.
+
+    # Periodic refresh every 30 seconds. Two jobs:
+    # 1. Detect silent radio failure (rfkill set mid-run, etc.) and
+    #    exit so systemd restarts us -- the startup-path unblock
+    #    helper in main() will clear rfkill and power-on again. Without
+    #    this, a rfkill-block-while-running leaves the service claiming
+    #    "Advertising as JAM-PLAYER-XXXXX" with the radio actually off,
+    #    and the mobile app connect hangs (scan list shows a cached
+    #    advertisement, tap-to-connect times out because no LL packets
+    #    are being exchanged).
+    # 2. Refresh the advertisement's status flags so the mobile app's
+    #    scan list shows accurate state without needing a full restart.
     def refresh_advertisement_flags():
+        # Radio health check first -- if the adapter is off, nothing
+        # else we do here matters. Exit and let systemd self-heal.
+        if not adapter_is_powered():
+            logger.error(
+                "Bluetooth adapter lost power while service was running "
+                "(most likely rfkill soft-block). Exiting so systemd can "
+                "restart this service and re-run the startup-path "
+                "unblock."
+            )
+            sd_notifier.notify("STATUS=Bluetooth adapter lost power")
+            # Use os._exit rather than sys.exit: we're inside a GLib
+            # timer callback, and sys.exit raises SystemExit which GLib
+            # may swallow. os._exit is immediate and systemd sees the
+            # non-zero exit cleanly.
+            os._exit(1)
+
         try:
             new_flags = get_status_flags()
             if advertisement.update_status_flags(new_flags):
