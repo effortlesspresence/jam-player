@@ -352,6 +352,73 @@ UNIVERSAL_SETUP_URL = "https://setup.justamenu.com"
 # State checking intervals
 STATE_CHECK_INTERVAL_SEC = 5
 
+# Coordination flag for jam-update.service. While this file exists, the
+# display loop pauses its "feh died -> respawn it" behavior so that
+# jam-update can show the update-in-progress screen without us racing it
+# back to the foreground. jam-update creates the file at start of
+# show_updating_screen() and removes it in hide_updating_screen().
+# Must stay in sync with the UPDATE_IN_PROGRESS_FLAG constant in
+# jam_update.py -- single hardcoded path so we don't need a shared
+# module that both services import (jam_update.py keeps its imports
+# minimal to survive its self-re-execution flow).
+UPDATE_IN_PROGRESS_FLAG = Path('/run/jam-update-in-progress')
+
+# Maximum time the display loop will defer to jam-update before treating
+# the coordination flag as stale. A legitimate install takes ~2-5
+# minutes; 5 minutes gives generous headroom while ensuring a crashed
+# jam-update doesn't leave the customer's display in standby
+# indefinitely. Tuned conservatively -- if we ever have an install that
+# legitimately takes longer than this, the customer briefly sees the
+# old display through the tail of the install, which is a much better
+# failure mode than a permanently-frozen display.
+UPDATE_FLAG_MAX_AGE_SEC = 5 * 60
+
+
+def _is_update_flag_stale() -> bool:
+    """
+    Return True if the update-in-progress flag has been present longer
+    than UPDATE_FLAG_MAX_AGE_SEC. Defensive against jam-update crashing
+    or being SIGKILLed between writing the flag and removing it.
+
+    Returns False (not stale) if the flag doesn't exist or if we can't
+    read its mtime -- err on the side of trusting an active flag,
+    since we have the parallel _jam_update_service_is_active() check
+    as the second gate.
+    """
+    try:
+        mtime = UPDATE_IN_PROGRESS_FLAG.stat().st_mtime
+        age = time.time() - mtime
+        return age > UPDATE_FLAG_MAX_AGE_SEC
+    except OSError:
+        return False
+
+
+def _jam_update_service_is_active() -> bool:
+    """
+    Return True if jam-update.service is currently active per systemd.
+
+    Used as a sanity check on the update-in-progress flag: if the flag
+    exists but the service isn't running, the flag is stale (jam-update
+    crashed without cleanup) and we should ignore it.
+
+    Returns False on any error (subprocess timeout, systemctl missing,
+    etc.) -- safer to assume the service is NOT running and let the
+    display recover, than to assume it IS running and stay paused.
+    """
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', 'jam-update.service'],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        # systemctl prints "active" / "inactive" / "failed" / etc.
+        # Only "active" or "activating" means jam-update is genuinely
+        # running. "inactive" means it finished or never started.
+        return result.stdout.strip() in ('active', 'activating')
+    except Exception:
+        return False
+
 
 def _scaled(base_size: int, screen_height: int) -> int:
     """
@@ -2539,16 +2606,58 @@ class JamPlayerDisplayManager:
                     # After video loop exits, recheck state
                     continue
 
-                # For static display modes, check feh is still running and sleep
+                # For static display modes, check feh is still running and sleep.
                 if self.feh_process:
                     poll_result = self.feh_process.poll()
                     if poll_result is not None:
-                        # feh has exited - this shouldn't happen
-                        logger.warning(f"feh process exited with code {poll_result}, restarting display")
-                        # Force re-transition to current mode to restart feh
-                        old_mode = self.current_mode
-                        self.current_mode = None
-                        self.transition_to_mode(old_mode)
+                        # feh died. Normally we respawn it -- but if
+                        # jam-update.service is currently running and
+                        # showing the "updating" screen, it has
+                        # deliberately killed our feh and replaced it
+                        # with its own. Respawning ours would
+                        # leapfrog jam-update's display in z-order and
+                        # hide the update screen from the customer.
+                        #
+                        # Stay quiescent until the update completes
+                        # (flag is cleared by jam_update.py's
+                        # hide_updating_screen). The next main-loop
+                        # iteration will then see no flag + no feh and
+                        # respawn naturally.
+                        #
+                        # Stale-flag protection: jam-update could
+                        # crash hard between writing the flag and
+                        # removing it, leaving us paused forever. Two
+                        # layers of protection:
+                        #   1. Cross-check that jam-update.service is
+                        #      actually active. The systemctl call is
+                        #      a few ms and tells us truthfully whether
+                        #      the service is running NOW.
+                        #   2. Hard timeout via _is_update_flag_stale.
+                        #      If the flag file is older than
+                        #      UPDATE_FLAG_MAX_AGE_SEC, treat it as
+                        #      stale regardless of what systemctl says.
+                        #      This catches the case where systemctl
+                        #      lies (D-Bus race, etc.) or where
+                        #      jam-update genuinely gets stuck for
+                        #      longer than any legitimate install
+                        #      should take.
+                        if (UPDATE_IN_PROGRESS_FLAG.exists()
+                                and not _is_update_flag_stale()
+                                and _jam_update_service_is_active()):
+                            logger.info(
+                                "feh died but jam-update is in progress -- "
+                                "not respawning to avoid covering update screen"
+                            )
+                            self.feh_process = None
+                        else:
+                            logger.warning(
+                                f"feh process exited with code {poll_result}, "
+                                f"restarting display"
+                            )
+                            # Force re-transition to current mode to restart feh
+                            old_mode = self.current_mode
+                            self.current_mode = None
+                            self.transition_to_mode(old_mode)
 
                 sd_notifier.notify("WATCHDOG=1")
                 time.sleep(1)

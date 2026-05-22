@@ -686,6 +686,21 @@ def create_updating_screen(width: int, height: int) -> Optional[Image.Image]:
     return img
 
 
+# Coordination flag between jam-update.service and jam-player-display.service.
+#
+# While this flag file exists, jam-player-display pauses its
+# "feh died -> respawn it" logic, ceding the screen to whoever else has
+# claimed it (us). Without this coordination, the two services race for
+# display ownership: jam-update kills jam-player-display's feh and
+# spawns its own, then ~1s later jam-player-display's main loop notices
+# its feh died and respawns -- jumping back on top of our update screen.
+#
+# Lives in /run because we want it volatile (cleared on reboot, so a
+# crashed jam-update doesn't leave the flag wedged). /tmp would also
+# work but /run is cleaner for a service-coordination flag.
+UPDATE_IN_PROGRESS_FLAG = Path('/run/jam-update-in-progress')
+
+
 def show_updating_screen():
     """Display the updating screen using feh."""
     global _update_display_process
@@ -697,6 +712,12 @@ def show_updating_screen():
     logger.info("Displaying update screen...")
 
     try:
+        # Set the coordination flag BEFORE we kill jam-player-display's
+        # feh -- otherwise the display service's poll loop could see its
+        # feh die and respawn before reading the flag.
+        UPDATE_IN_PROGRESS_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_IN_PROGRESS_FLAG.touch()
+
         # Get screen size and create image
         width, height = get_fb_size()
         img = create_updating_screen(width, height)
@@ -708,8 +729,15 @@ def show_updating_screen():
         img.save(img_path, 'PNG')
         os.chmod(img_path, 0o644)
 
-        # Kill any existing feh processes first
-        subprocess.run(['pkill', '-f', 'feh'], capture_output=True, timeout=5)
+        # Kill ONLY jam-player-display's feh processes (not all feh) so
+        # we don't accidentally clobber unrelated processes. The pattern
+        # `feh.*jam_display` matches files named jam_display_*.png that
+        # jam-player-display writes to /tmp.
+        subprocess.run(
+            ['pkill', '-f', 'feh.*jam_display'],
+            capture_output=True,
+            timeout=5,
+        )
 
         # Wait for X display to be available (might not be ready yet on boot)
         for _ in range(30):
@@ -739,7 +767,7 @@ def show_updating_screen():
 
 
 def hide_updating_screen():
-    """Kill the updating screen display."""
+    """Kill the updating screen display and unset the coordination flag."""
     global _update_display_process
 
     if _update_display_process:
@@ -755,6 +783,15 @@ def hide_updating_screen():
         subprocess.run(['pkill', '-f', 'feh.*jam_updating'], capture_output=True, timeout=5)
     except:
         pass
+
+    # Clear the coordination flag LAST so jam-player-display only
+    # resumes its display claim after our feh is gone -- otherwise it
+    # would briefly race us during the second between unsetting the flag
+    # and killing our feh.
+    try:
+        UPDATE_IN_PROGRESS_FLAG.unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning(f"Could not remove update-in-progress flag: {e}")
 
 
 # =============================================================================
