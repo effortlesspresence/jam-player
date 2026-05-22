@@ -97,6 +97,14 @@ OUTLET_OPERATIONAL_STATUS_FILE = DEVICE_DATA_DIR / 'outlet_operational_status.js
 # as OUTLET_OPERATIONAL_STATUS_FILE.
 OUTLET_NAME_FILE = DEVICE_DATA_DIR / 'outlet_name.txt'
 
+# Per-device randomized nightly reboot time, "HH:MM" format (local tz).
+# Picked once on first jam-update run after the new code is installed,
+# persisted forever after so the reboot time stays stable. Spreads
+# fleet-wide post-reboot API call surges across a 2.5-hour window
+# (01:45-04:15) instead of all hitting at 03:00 simultaneously.
+# Delete this file to force re-randomization on the next jam-update.
+NIGHTLY_REBOOT_TIME_FILE = DEVICE_DATA_DIR / 'nightly_reboot_time.txt'
+
 # API signing keys (Ed25519)
 API_SIGNING_PRIVATE_KEY_FILE = CREDENTIALS_DIR / 'api_signing_private_key'
 API_SIGNING_PUBLIC_KEY_FILE = CREDENTIALS_DIR / 'api_signing_public_key'

@@ -74,7 +74,6 @@ SERVICES_V2_SRC = JAM_REPO_DIR / 'src' / 'jam_player' / 'services_v2'
 JAM_PLAYER_SRC = JAM_REPO_DIR / 'src' / 'jam_player'
 SYSTEMD_SRC = JAM_REPO_DIR / 'systemd'
 CRON_SRC = JAM_REPO_DIR / 'cron'
-LOGROTATE_SRC = JAM_REPO_DIR / 'logrotate_config'
 CONFIG_SRC = JAM_REPO_DIR / 'jam_player' / 'config'
 ETC_SRC = JAM_REPO_DIR / 'etc'  # System config files (dbus, bluetooth)
 
@@ -1132,47 +1131,23 @@ def cleanup_legacy_cruft():
 
 
 def install_crontab():
-    """Install the JAM crontab with essential scheduled tasks."""
+    """
+    Install the JAM crontab with the device's randomized nightly
+    reboot time. Thin wrapper around
+    common.nightly_reboot.render_and_install_crontab -- the heavy
+    lifting (template read, placeholder substitution, validation,
+    `crontab -` invocation) lives there because jam-first-boot also
+    needs to do the same thing on the very first boot of a fresh
+    device.
+    """
     logger.info("Installing JAM crontab...")
 
-    crontab_src = CRON_SRC / 'jam_crontab.txt'
-    if not crontab_src.exists():
-        logger.warning(f"Crontab file not found: {crontab_src}")
-        return
+    # Local import: nightly_reboot lives under common/ which may have
+    # just been copied as part of this very update -- importing at
+    # module load time risks pulling in a stale version of the module.
+    from common.nightly_reboot import render_and_install_crontab
 
-    # Install crontab for root user (needed for reboot command)
-    success, _, stderr = run_command(
-        ['crontab', str(crontab_src)],
-        timeout=30
-    )
-    if success:
-        logger.info("  Crontab installed for root user")
-    else:
-        logger.warning(f"  Failed to install crontab: {stderr}")
-
-
-def install_logrotate_config():
-    """Install the logrotate configuration to /etc/jam/."""
-    logger.info("Installing logrotate config...")
-
-    logrotate_src = LOGROTATE_SRC / 'logrotate.conf'
-    logrotate_dest = Path('/etc/jam/logrotate.conf')
-
-    if not logrotate_src.exists():
-        logger.warning(f"Logrotate config not found: {logrotate_src}")
-        return
-
-    try:
-        logrotate_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(logrotate_src, logrotate_dest)
-
-        # Logrotate requires root ownership
-        os.chown(logrotate_dest, 0, 0)  # root:root
-        os.chmod(logrotate_dest, 0o644)
-
-        logger.info(f"  Installed {logrotate_dest}")
-    except Exception as e:
-        logger.warning(f"  Failed to install logrotate config: {e}")
+    render_and_install_crontab(CRON_SRC / 'jam_crontab.txt')
 
 
 def install_chrony_peering_config():
@@ -2137,11 +2112,8 @@ def main():
     except Exception as e:
         logger.warning(f"Legacy cleanup had issues (non-fatal): {e}")
 
-    # Install crontab with essential scheduled tasks (3am reboot, logrotate)
+    # Install crontab with essential scheduled tasks (nightly reboot)
     install_crontab()
-
-    # Install logrotate config
-    install_logrotate_config()
 
     # Install chrony peering config for offline clock sync
     install_chrony_peering_config()

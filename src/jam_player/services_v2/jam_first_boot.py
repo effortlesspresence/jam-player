@@ -42,12 +42,20 @@ from common.paths import (
     safe_write_text,
 )
 from common.system import set_unique_hostname
+from common.nightly_reboot import render_and_install_crontab
 
 logger = setup_service_logging('jam-first-boot')
 
 # Path to jam user's SSH directory
 JAM_USER_SSH_DIR = Path('/home/jam/.ssh')
 JAM_USER_AUTHORIZED_KEYS = JAM_USER_SSH_DIR / 'authorized_keys'
+
+# Path to the JAM crontab template on disk. Same path jam-update reads
+# from -- the git checkout that drives the OTA update mechanism. We
+# hardcode the path here (rather than importing JAM_REPO_DIR from
+# jam_update.py) so this module doesn't transitively depend on the
+# heavyweight update module just to know one path.
+JAM_CRONTAB_TEMPLATE = Path('/home/comitup/jam-player/cron/jam_crontab.txt')
 
 
 def ensure_jam_user_exists() -> bool:
@@ -360,6 +368,31 @@ def run_first_boot() -> bool:
             all_success = False
     else:
         logger.info("SSH authorized_keys already configured")
+
+    # 7. Install the JAM crontab with this device's randomized nightly
+    # reboot time. Done here so brand-new devices get a per-device
+    # reboot schedule even if their first jam-update run finds nothing
+    # to install (no internet, or already on the latest commit). The
+    # picker persists its choice to /etc/jam/device_data/nightly_reboot_time.txt
+    # so the time stays stable across updates.
+    #
+    # Crontab install failure is NON-FATAL for first-boot: if the
+    # crontab template is missing or the `crontab` binary errors,
+    # we'd rather complete first-boot and let jam-update retry on
+    # its next run than leave the device stuck retrying first-boot
+    # forever. The fallback is acceptable because old fielded devices
+    # are already running fine without first-boot's crontab call.
+    try:
+        if not render_and_install_crontab(JAM_CRONTAB_TEMPLATE):
+            logger.warning(
+                "Crontab install during first-boot failed (non-fatal); "
+                "jam-update will retry on its next run"
+            )
+    except Exception as e:
+        logger.warning(
+            f"Crontab install during first-boot raised {e} (non-fatal); "
+            f"jam-update will retry on its next run"
+        )
 
     # Mark complete only if all tasks succeeded
     if all_success:
