@@ -1926,6 +1926,7 @@ def restart_services():
         'jam-player-display.service',     # Type=notify, sends READY=1 early
         'jam-health-monitor.service',     # Type=notify, sends READY=1 early
         'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
+        'jam-outlet-status-poller.service',  # Type=notify, 6-min outlet-status backstop poll (has ConditionPath)
         'jam-ws-commands.service',        # Type=notify, WebSocket commands (has ConditionPath)
         'jam-chrony-peering.service',     # Type=simple, chrony peer discovery
         'jam-tailscale.service',          # Type=oneshot, runs once

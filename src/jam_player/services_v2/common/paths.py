@@ -80,6 +80,23 @@ LOCATION_TIMEZONE_FILE = DEVICE_DATA_DIR / 'location_timezone.txt'
 # Also updated by jam-heartbeat.service as fallback
 DISPLAY_ORIENTATION_FILE = DEVICE_DATA_DIR / 'display_orientation.txt'
 
+# Outlet (Location) operational status as computed by the backend.
+# Stored as JSON in EnumWithLabel shape:
+#   {"value": "OFF_SEASON", "label": "Seasonal (Closed)"}
+# The value is one of OPERATIONAL / DEACTIVATED / OFF_SEASON / SCHEDULED
+# / PERIOD_ENDED. The label is the human-readable display string from
+# the backend, used directly by jam-player-display in the inactive
+# screen copy. Absent if the device has never received a value (older
+# fielded builds, never-online devices, devices not yet linked to a
+# location). Written by jam-heartbeat, jam-ws-commands (on
+# SET_OUTLET_OPERATIONAL_STATUS), and jam-outlet-status-poller.
+OUTLET_OPERATIONAL_STATUS_FILE = DEVICE_DATA_DIR / 'outlet_operational_status.json'
+
+# Outlet (Location) display name, cached so the device can show
+# "Outlet '<name>' is inactive" without a follow-up request. Same writers
+# as OUTLET_OPERATIONAL_STATUS_FILE.
+OUTLET_NAME_FILE = DEVICE_DATA_DIR / 'outlet_name.txt'
+
 # API signing keys (Ed25519)
 API_SIGNING_PRIVATE_KEY_FILE = CREDENTIALS_DIR / 'api_signing_private_key'
 API_SIGNING_PUBLIC_KEY_FILE = CREDENTIALS_DIR / 'api_signing_public_key'

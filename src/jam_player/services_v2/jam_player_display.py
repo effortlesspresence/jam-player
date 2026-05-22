@@ -47,12 +47,25 @@ Display Modes (in order of setup progress):
    - Wall clock synchronized playback for multi-display setups
    - Automatically reloads when content is updated
 
+7. OUTLET_INACTIVE (cached outlet operational status is not OPERATIONAL)
+   - The Location this JAM Player is registered to has been deactivated,
+     is off-season, is scheduled for a future window, or its temporary
+     period has ended. The device suppresses content playback and shows
+     a "this outlet is inactive" message directing the customer back to
+     the web app to reactivate.
+   - This check overrides PLAYING_CONTENT: we explicitly do NOT keep
+     showing paid content for a non-operational outlet, even if the
+     device is offline. The flip side: if the device has no cached
+     outlet status (older fielded build, never online), we fail open
+     and behave as if the outlet is OPERATIONAL.
+
 IMPORTANT: PLAYING_CONTENT is evaluated FIRST in determine_display_mode(),
 before any network/setup-state checks. This preserves offline playback:
 a previously-configured device that loses internet (restaurant WiFi drops,
 deployment in a venue with no WiFi, etc.) keeps playing its cached content
-instead of reverting to a setup screen. See determine_display_mode() for
-the full spec.
+instead of reverting to a setup screen. The single exception is
+OUTLET_INACTIVE, which is evaluated even earlier -- see
+determine_display_mode() for the full spec.
 
 This service monitors state changes and transitions between display modes automatically.
 """
@@ -86,6 +99,11 @@ from common.paths import (
 from common.display_cache import (
     cleanup_stale_cache,
     get_or_render_cached,
+)
+from common.outlet_status import (
+    is_outlet_operational,
+    read_outlet_name,
+    read_outlet_status,
 )
 from jam_player import constants
 
@@ -195,6 +213,7 @@ class DisplayMode(Enum):
     DOWNLOADING_CONTENT = "downloading_content"  # screen linked, content not yet on disk
     NO_ACTIVE_SCENES = "no_active_scenes"  # screen linked, backend returned empty scenes list
     PLAYING_CONTENT = "playing_content"  # scenes + media present
+    OUTLET_INACTIVE = "outlet_inactive"  # cached outlet operational status is not OPERATIONAL
 
 
 # =============================================================================
@@ -1266,6 +1285,129 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
     return img
 
 
+def create_outlet_inactive_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
+    """
+    Create the screen for OUTLET_INACTIVE mode.
+
+    Shown when the cached outlet operational status is anything other
+    than OPERATIONAL -- the customer has deactivated this outlet, it's
+    off-season, it's scheduled for the future, or its temporary
+    activation window has ended. The device suppresses content playback
+    and directs the customer to the web app to reactivate.
+
+    The outlet name and the human-readable status label are read from
+    the on-disk cache (populated by jam-heartbeat /
+    jam-ws-commands / jam-outlet-status-poller). The label comes from
+    the backend's EnumWithLabel so we don't keep an enum-to-display
+    mapping in sync on-device.
+    """
+    if not HAS_PIL:
+        logger.error("PIL not available for creating display images")
+        return None
+
+    # Vibrant gradient + orange heading mirrors no-active-scenes; the
+    # state is conceptually similar ("set this up in the web app") and
+    # we want consistent visual language across non-content screens.
+    img = create_mesh_gradient_background(width, height, theme="vibrant")
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
+    instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
+    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
+
+    center_x = width // 2
+
+    # Logo
+    logo_height = _scaled(120, height)
+    y = int(height * 0.12)
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
+        y += logo.height + 40
+    else:
+        y += 40
+
+    # Read cached state. Either may be None on a freshly-cached device
+    # (the WS command was missed and the poller hasn't fired yet) or on
+    # a partially-cached device; fall back to safe defaults.
+    parsed_status = read_outlet_status()
+    status_label = parsed_status[1] if parsed_status else "Inactive"
+    outlet_name = read_outlet_name()
+
+    # Heading: the outlet's name when we have it, generic copy otherwise.
+    heading = (
+        f"{outlet_name} is inactive" if outlet_name else "Outlet inactive"
+    )
+    draw.text(
+        (center_x, y),
+        heading,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mt",
+    )
+    bbox = draw.textbbox((0, 0), heading, font=title_font)
+    y += bbox[3] + 20
+
+    # Sub-line: the specific reason (Seasonal (Closed), Period Ended, ...)
+    # This uses the backend's display label verbatim so we don't drift.
+    status_line = f"Status: {status_label}"
+    draw.text(
+        (center_x, y),
+        status_line,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mt",
+    )
+    bbox = draw.textbbox((0, 0), status_line, font=subtitle_font)
+    y += bbox[3] + 50
+
+    # Customer-facing instruction: where to go to reactivate.
+    line1 = "Reactivate this outlet in the web app"
+    draw.text(
+        (center_x, y),
+        line1,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt",
+    )
+    bbox = draw.textbbox((0, 0), line1, font=instructions_font)
+    y += bbox[3] + 12
+
+    line2 = "to resume content playback."
+    draw.text(
+        (center_x, y),
+        line2,
+        font=instructions_font,
+        fill=TEXT_COLOR,
+        anchor="mt",
+    )
+
+    # Device UUID at bottom (same convention as other non-content
+    # screens, lets support identify the JP in the dashboard).
+    if device_uuid:
+        device_text = f"Device: {device_uuid}"
+        draw.text(
+            (center_x, height - 50),
+            device_text,
+            font=device_font,
+            fill=TEXT_COLOR,
+            anchor="mm",
+        )
+
+    version_font = get_font(_scaled(14, height), bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),
+        anchor="mm",
+    )
+
+    return img
+
+
 def create_fallback_image(width: int, height: int, message: str, img_name: str) -> Optional[str]:
     """
     Create a simple fallback image using ImageMagick when PIL fails.
@@ -1321,6 +1463,13 @@ def build_display_render_registry() -> dict:
     from DisplayMode enum / this module. Keys are the .value of each
     DisplayMode (e.g. "awaiting_registration").
     """
+    # OUTLET_INACTIVE is intentionally NOT in the cache registry: its
+    # rendered content depends on the cached outlet name and status
+    # label, both of which can change without the code commit changing
+    # (which is what the cache keys on). Serving a stale "Bob's Diner
+    # is inactive" after the device gets moved to a different outlet
+    # would be worse than the ~1-2s render hit. Rendered inline by
+    # transition_to_mode every time it's needed.
     return {
         DisplayMode.AWAITING_NETWORK.value: create_unregistered_screen,
         DisplayMode.AWAITING_REGISTRATION.value: create_awaiting_registration_screen,
@@ -1704,18 +1853,17 @@ class JamPlayerDisplayManager:
         """
         Determine which display mode we should be in based on current state.
 
-        CRITICAL: content availability is checked FIRST, before any
-        network/setup-state checks. JAM Players are required to support
-        offline playback -- a device that was previously set up and
-        downloaded content must keep playing that content even if its
-        internet later drops (restaurant WiFi hiccups, deployment
-        location has no WiFi, etc). Gating PLAYING_CONTENT on
-        .internet_verified would yank such a device back to a setup
-        screen, which is a regression we explicitly prevent here.
-
         Order of checks:
+          0. Outlet operational status check (overrides everything).
+             If the on-disk cache has a definite non-OPERATIONAL value,
+             return OUTLET_INACTIVE. We explicitly do NOT keep playing
+             paid content for a deactivated outlet even when offline.
+             A missing cache file (older fielded build, never online)
+             fails open and skips this check.
           1. Playable content on disk -> PLAYING_CONTENT (regardless of
-             network / registration / screen link state).
+             network / registration / screen link state). This is what
+             keeps offline / disconnected devices showing their content
+             instead of setup screens when internet drops.
           2. Otherwise walk the setup ladder:
              a. No .internet_verified -> AWAITING_NETWORK
              b. No .registered        -> AWAITING_REGISTRATION
@@ -1725,6 +1873,15 @@ class JamPlayerDisplayManager:
 
         See the module docstring for the full spec.
         """
+        # 0. Outlet operational status. is_outlet_operational() returns
+        # True when the cache is absent OR has OPERATIONAL; only a
+        # definite non-OPERATIONAL value forces OUTLET_INACTIVE. Putting
+        # this above the content-first check is intentional -- a
+        # deactivated outlet should NOT keep playing content even if it
+        # was previously playing.
+        if not is_outlet_operational():
+            return DisplayMode.OUTLET_INACTIVE
+
         # 1. Content-first: if we have something playable, play it. This
         # is what keeps offline / disconnected devices showing their
         # content instead of setup screens when internet drops.
@@ -1974,6 +2131,25 @@ class JamPlayerDisplayManager:
                 )
             )
             sd_notifier.notify("STATUS=Screen linked but no active scenes")
+
+        elif new_mode == DisplayMode.OUTLET_INACTIVE:
+            logger.info("Showing OUTLET_INACTIVE screen")
+            # Rendered inline (not cached) because the rendered content
+            # depends on the cached outlet name + status label, which
+            # the cache key doesn't include. See build_display_render_registry.
+            img = create_outlet_inactive_screen(
+                self.screen_width, self.screen_height, device_uuid,
+            )
+            self.feh_process = display_image_with_feh(
+                img, img_name="jam_display_outlet_inactive",
+                fallback_message=(
+                    "Outlet inactive\n\n"
+                    "This outlet is not currently active.\n"
+                    "Reactivate this outlet in the web app\n"
+                    "to resume content playback."
+                ),
+            )
+            sd_notifier.notify("STATUS=Outlet inactive")
 
         elif new_mode == DisplayMode.PLAYING_CONTENT:
             logger.info("Entering PLAYING_CONTENT mode")

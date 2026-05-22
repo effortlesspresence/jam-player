@@ -1,0 +1,45 @@
+[Unit]
+Description=JAM Player Outlet Status Poller - Backstop for missed WS outlet-status pushes
+Documentation=https://github.com/anthropics/jam-player
+
+# A device that hasn't registered yet has no outlet to poll for, so
+# only run after .registered exists. .announced isn't enough -- the
+# backend won't return a useful response until the device is linked to
+# a Location.
+ConditionPathExists=/etc/jam/device_data/.registered
+
+# Requires first boot (credentials) and a working clock for TLS.
+Requires=jam-first-boot.service
+After=jam-first-boot.service
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+
+User=root
+Group=root
+
+WorkingDirectory=/opt/jam/services
+
+# 6-minute poll loop. See module docstring in jam_outlet_status_poller.py
+# for cadence rationale.
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_outlet_status_poller.py
+
+Restart=always
+RestartSec=30
+
+# Watchdog ping cadence is 6 min + buffer.
+WatchdogSec=480
+
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-outlet-status-poller
+
+[Install]
+WantedBy=multi-user.target

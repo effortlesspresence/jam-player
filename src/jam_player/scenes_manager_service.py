@@ -47,7 +47,7 @@ LIVE_MEDIA_DIR = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
 STAGED_SCENES_DIR = Path(constants.APP_DATA_STAGED_SCENES_DIR)
 
 # Polling interval in seconds (fallback when WebSocket push fails)
-POLL_INTERVAL_SECONDS = 120
+POLL_INTERVAL_SECONDS = 180
 
 # Event to signal immediatejam-ha  content refresh (set by SIGUSR1 handler)
 refresh_event = threading.Event()
