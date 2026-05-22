@@ -1460,54 +1460,69 @@ def install_lightdm_cursor_config():
 
 def install_cursor_hiding():
     """
-    Configure layered cursor hiding so the mouse pointer is invisible
-    on the desktop background, on top of jam-player-display content, and
-    between transitions. The JP is a digital signage device -- the cursor
-    is never a useful artifact and looks unprofessional in front of
-    Fortune-100-client menu boards.
+    Hide the desktop cursor on the JAM Player, permanently and at every
+    layer that could render one.
 
-    Layer 1 (the only one that actually hides the Wayfire cursor):
-        wayfire.ini gets `cursor_size = 1` + `hide_cursor_when_idle = true`
-        in its [input] section. Wayfire is the Wayland compositor on
-        Bookworm and renders its own cursor independent of X11. Without
-        this, ALL other cursor-hiding flags (lightdm `-nocursor`, feh
-        `--hide-pointer`, mpv `--cursor-autohide`) are ineffective for
-        the desktop background.
+    On Pi OS Bookworm, Wayfire is the Wayland compositor and renders its
+    own cursor *independently of X11*. Pi OS reads the cursor theme +
+    size from **GSettings (dconf)**, NOT from Xresources or wayfire.ini
+    options like cursor_size. An earlier attempt set
+    wayfire.ini cursor_size=1 and an Xcursor.theme: jam-blank Xresource;
+    both were silently ignored. The real source of the cursor theme
+    on Pi OS Bookworm is the dconf key
+        /org/gnome/desktop/interface/cursor-theme
+    which defaults to "PiXflat" at size 24.
 
-    Layer 2 (belt-and-suspenders for Xwayland-hosted apps):
-        Install a system-wide blank Xcursor theme called "jam-blank" so
-        any X11/Xwayland app that asks for a cursor gets a 1x1
-        transparent image instead of an arrow. Set as default via
-        /etc/X11/Xresources.
+    Approach:
 
-    Layer 3 (last line of defense):
-        Install `unclutter` (1980s-era cursor-hiding daemon, ~25 KB)
-        and autostart it from wayfire.ini so any cursor that does
-        render gets warped offscreen within ~100ms.
+      1. Install a real "jam-blank" Xcursor theme containing actual
+         binary cursor files (not /dev/null symlinks -- Wayfire
+         validates the Xcursor binary format and falls back to its
+         built-in cursor when the file is invalid). The cursor file is
+         a 1x1 fully-transparent image, ~50 bytes, written from this
+         function so we don't have to ship a binary in the repo.
 
-    All three layers are idempotent -- re-running this function is
-    safe and incurs no extra work on already-configured JPs.
+      2. Lock that theme via dconf at the system level
+         (/etc/dconf/db/local.d/) and recompile the dconf DB. Both
+         cursor-theme and cursor-size get locked so user-level
+         gsettings calls can't override them. Wayfire reads from this
+         on session start and the cursor renders as a 1x1 transparent
+         image -- invisible.
+
+      3. Belt-and-suspenders: keep the Wayfire cursor_size = 1 +
+         hide_cursor_when_idle = true edits in wayfire.ini. These may
+         or may not have an effect in Wayfire 0.7.5 (the directives
+         seem to be silently ignored in this version), but cost
+         nothing and protect against future Wayfire versions that do
+         honor them.
+
+    We are explicitly NOT installing unclutter anymore -- it requires
+    X11, doesn't work against the Wayland-side cursor, and the dconf
+    lock makes it unnecessary.
+
+    Idempotent: re-running this on an already-configured JP no-ops.
     """
-    logger.info("Installing layered cursor hiding...")
+    logger.info("Installing cursor hiding...")
 
-    # ----- Layer 1: Wayfire compositor config -----
-    # wayfire.ini lives in the comitup user's home and is owned by them.
-    # We want our cursor-hiding directives to coexist with the existing
-    # config (bindings, input-device routing, etc.) so we read, modify
-    # the [input] section in place, and write back.
+    # ----- Step 1: install the jam-blank Xcursor theme -----
+    try:
+        _install_blank_xcursor_theme()
+    except Exception as e:
+        logger.warning(f"  Could not install jam-blank cursor theme: {e}")
+
+    # ----- Step 2: lock cursor theme + size via dconf -----
+    try:
+        _lock_dconf_cursor_theme()
+    except Exception as e:
+        logger.warning(f"  Could not lock dconf cursor theme: {e}")
+
+    # ----- Step 3: wayfire.ini belt-and-suspenders -----
     wayfire_conf = Path('/home/comitup/.config/wayfire.ini')
-    if not wayfire_conf.exists():
-        logger.warning(
-            f"  {wayfire_conf} not found -- skipping Wayfire cursor config. "
-            f"This is unexpected on a Bookworm JP and will leave the "
-            f"desktop cursor visible until investigated."
-        )
-    else:
+    if wayfire_conf.exists():
         try:
             content = wayfire_conf.read_text()
             updated = _patch_wayfire_input_section(content)
             if updated != content:
-                # Preserve ownership (comitup:comitup) since we're root.
                 wayfire_conf.write_text(updated)
                 run_command(['chown', 'comitup:comitup', str(wayfire_conf)])
                 logger.info(f"  Updated {wayfire_conf} [input] section")
@@ -1516,122 +1531,190 @@ def install_cursor_hiding():
         except Exception as e:
             logger.warning(f"  Could not patch wayfire.ini: {e}")
 
-    # ----- Layer 2: blank Xcursor theme -----
-    # The theme is just a single directory with a config file pointing
-    # every cursor name at one tiny transparent PNG. xcursorgen would
-    # normally compile cursor sources, but we can install a pre-built
-    # "core" cursor binary that's just 1x1 transparent and symlink every
-    # cursor name to it. Since we don't ship that binary in the repo
-    # (would be awkward), the simpler approach is:
-    #   - mkdir /usr/share/icons/jam-blank/cursors
-    #   - write index.theme + symlink common cursor names to /dev/null
-    # When Xcursor can't load a cursor file, it renders nothing.
-    # /dev/null trick works on every X11 implementation we care about.
-    try:
-        cursors_dir = Path('/usr/share/icons/jam-blank/cursors')
-        cursors_dir.mkdir(parents=True, exist_ok=True)
-        index_path = Path('/usr/share/icons/jam-blank/index.theme')
-        if not index_path.exists():
-            index_path.write_text(
-                "[Icon Theme]\n"
-                "Name=JAM Blank\n"
-                "Comment=Invisible cursor theme for JAM Player digital signage\n"
-                "Inherits=core\n"
-            )
-        # Map every cursor shape Xwayland might request to /dev/null.
-        # When Xcursor opens /dev/null it gets EOF and falls back to
-        # rendering nothing.
-        cursor_names = [
-            'left_ptr', 'arrow', 'default', 'pointer', 'hand', 'hand1',
-            'hand2', 'crosshair', 'cross', 'text', 'xterm', 'ibeam',
-            'wait', 'watch', 'progress', 'help', 'question_arrow',
-            'sb_v_double_arrow', 'sb_h_double_arrow', 'fleur', 'move',
-            'top_left_corner', 'top_right_corner',
-            'bottom_left_corner', 'bottom_right_corner',
-            'top_side', 'bottom_side', 'left_side', 'right_side',
-            'col-resize', 'row-resize', 'all-scroll',
-        ]
-        for name in cursor_names:
-            link_path = cursors_dir / name
-            if not link_path.exists():
-                # symlink instead of file copy so we don't allocate disk
-                # space for 30+ identical empty files.
-                link_path.symlink_to('/dev/null')
-        logger.info("  Installed jam-blank Xcursor theme at /usr/share/icons/jam-blank/")
-    except Exception as e:
-        logger.warning(f"  Could not install jam-blank cursor theme: {e}")
 
-    # Set jam-blank as the system-default Xcursor theme. Affects Xwayland
-    # and any other X11 client that respects the Xresources convention.
-    try:
-        xresources_path = Path('/etc/X11/Xresources/x11-common')
-        if xresources_path.exists():
-            content = xresources_path.read_text()
-            if 'Xcursor.theme:' not in content:
-                content = content.rstrip() + '\nXcursor.theme: jam-blank\n'
-                xresources_path.write_text(content)
-                logger.info(f"  Set Xcursor.theme=jam-blank in {xresources_path}")
-            elif 'Xcursor.theme: jam-blank' not in content:
-                # Different theme already set -- override it
-                import re
-                content = re.sub(
-                    r'^Xcursor\.theme:.*$',
-                    'Xcursor.theme: jam-blank',
-                    content,
-                    flags=re.MULTILINE,
-                )
-                xresources_path.write_text(content)
-                logger.info(f"  Overrode Xcursor.theme in {xresources_path}")
-            else:
-                logger.info("  Xcursor.theme already set to jam-blank")
-    except Exception as e:
-        logger.warning(f"  Could not set Xcursor.theme: {e}")
+# Pre-computed binary contents of a 1x1 fully-transparent Xcursor file.
+# Format reference: https://man.archlinux.org/man/Xcursor.3 + xcursor file
+# format spec. Layout:
+#   magic "Xcur"                         4 bytes
+#   header size (16)                     4 bytes  (uint32 LE)
+#   version (0x10000)                    4 bytes
+#   ntoc (1, one entry)                  4 bytes
+#   toc[0]: type=0xfffd0002 image,       4 bytes
+#           subtype=1 nominal-size,      4 bytes
+#           position=28 (offset)         4 bytes
+#   image chunk header:
+#     header size (36)                   4 bytes
+#     type=0xfffd0002                    4 bytes
+#     subtype=1                          4 bytes
+#     version=1                          4 bytes
+#     width=1                            4 bytes
+#     height=1                           4 bytes
+#     xhot=0                             4 bytes
+#     yhot=0                             4 bytes
+#     delay=0                            4 bytes
+#   pixel data (1px ARGB)                4 bytes  -> 0x00000000 (transparent)
+#
+# Total: ~68 bytes. This is a valid Xcursor file that renders as nothing.
+_BLANK_XCURSOR_BYTES = (
+    b'Xcur'                                  # magic
+    b'\x10\x00\x00\x00'                      # header size = 16
+    b'\x00\x00\x01\x00'                      # version 0x00010000
+    b'\x01\x00\x00\x00'                      # ntoc = 1
+    b'\x02\x00\xfd\xff'                      # toc[0].type = 0xfffd0002 (image)
+    b'\x01\x00\x00\x00'                      # toc[0].subtype = 1 (nominal size)
+    b'\x1c\x00\x00\x00'                      # toc[0].position = 28
+    b'\x24\x00\x00\x00'                      # image header size = 36
+    b'\x02\x00\xfd\xff'                      # type = 0xfffd0002
+    b'\x01\x00\x00\x00'                      # subtype = 1
+    b'\x01\x00\x00\x00'                      # version = 1
+    b'\x01\x00\x00\x00'                      # width = 1
+    b'\x01\x00\x00\x00'                      # height = 1
+    b'\x00\x00\x00\x00'                      # xhot = 0
+    b'\x00\x00\x00\x00'                      # yhot = 0
+    b'\x00\x00\x00\x00'                      # delay = 0
+    b'\x00\x00\x00\x00'                      # one ARGB pixel = transparent
+)
 
-    # ----- Layer 3: unclutter daemon -----
-    # Install if not present (small package, ~25 KB).
-    try:
-        result = subprocess.run(
-            ['dpkg', '-s', 'unclutter'],
-            capture_output=True,
-            text=True,
+
+def _install_blank_xcursor_theme() -> None:
+    """
+    Create /usr/share/icons/jam-blank with a single transparent Xcursor
+    binary, and symlink every common cursor shape to it. Idempotent:
+    re-running just overwrites the cursor binary (cheap) and skips
+    symlinks that already exist.
+    """
+    theme_dir = Path('/usr/share/icons/jam-blank')
+    cursors_dir = theme_dir / 'cursors'
+    cursors_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write index.theme (or overwrite -- it's small and may have been
+    # written by an earlier broken iteration of this function).
+    (theme_dir / 'index.theme').write_text(
+        "[Icon Theme]\n"
+        "Name=JAM Blank\n"
+        "Comment=Invisible cursor theme for JAM Player digital signage\n"
+        "Inherits=core\n"
+    )
+
+    # The actual transparent cursor binary. We always overwrite this
+    # because earlier broken versions of this function may have left a
+    # symlink-to-/dev/null at the canonical name, which we want to
+    # replace with a real file.
+    canonical_cursor = cursors_dir / 'left_ptr'
+    if canonical_cursor.is_symlink() or canonical_cursor.exists():
+        canonical_cursor.unlink()
+    canonical_cursor.write_bytes(_BLANK_XCURSOR_BYTES)
+
+    # Every other common cursor name symlinks to left_ptr. Using
+    # symlinks (rather than copies) means tweaking the binary only
+    # requires updating one file.
+    cursor_aliases = [
+        'arrow', 'default', 'pointer', 'hand', 'hand1', 'hand2',
+        'crosshair', 'cross', 'text', 'xterm', 'ibeam',
+        'wait', 'watch', 'progress', 'help', 'question_arrow',
+        'sb_v_double_arrow', 'sb_h_double_arrow', 'fleur', 'move',
+        'top_left_corner', 'top_right_corner',
+        'bottom_left_corner', 'bottom_right_corner',
+        'top_side', 'bottom_side', 'left_side', 'right_side',
+        'col-resize', 'row-resize', 'all-scroll',
+        'grab', 'grabbing', 'not-allowed',
+        # Modern named cursors that some apps request via cursor-spec
+        'right_ptr', 'X_cursor', 'plus',
+    ]
+    for alias in cursor_aliases:
+        link_path = cursors_dir / alias
+        if link_path.is_symlink() or link_path.exists():
+            # Replace any pre-existing entry (could be a broken
+            # /dev/null symlink from an earlier iteration).
+            link_path.unlink()
+        link_path.symlink_to('left_ptr')
+
+    logger.info(f"  Installed jam-blank Xcursor theme at {theme_dir}")
+
+
+def _lock_dconf_cursor_theme() -> None:
+    """
+    Lock the GSettings cursor-theme and cursor-size system-wide via
+    dconf, so they can't be overridden by per-user gsettings calls.
+
+    Pi OS Bookworm uses dconf as its settings backend; Wayfire and
+    gtk-based apps read /org/gnome/desktop/interface/cursor-theme from
+    here. A system-wide lock at /etc/dconf/db/local.d/ overrides any
+    per-user value and is the canonical way to enforce desktop settings
+    in enterprise / kiosk deployments.
+
+    Idempotent: re-running just rewrites the same files and re-compiles
+    the dconf DB.
+    """
+    profile_path = Path('/etc/dconf/profile/user')
+    keyfile_path = Path('/etc/dconf/db/local.d/00-jam-cursor')
+    lockfile_path = Path('/etc/dconf/db/local.d/locks/00-jam-cursor')
+
+    # 1. Ensure /etc/dconf/profile/user lists "local" as a layer above
+    # user, so settings in local.d/ override per-user dconf entries.
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_content = "user-db:user\nsystem-db:local\n"
+    if not profile_path.exists() or profile_path.read_text() != profile_content:
+        profile_path.write_text(profile_content)
+        logger.info(f"  Wrote {profile_path}")
+
+    # 2. Write the keyfile that sets cursor-theme and cursor-size.
+    keyfile_path.parent.mkdir(parents=True, exist_ok=True)
+    keyfile_content = (
+        "[org/gnome/desktop/interface]\n"
+        "cursor-theme='jam-blank'\n"
+        "cursor-size=1\n"
+    )
+    if not keyfile_path.exists() or keyfile_path.read_text() != keyfile_content:
+        keyfile_path.write_text(keyfile_content)
+        logger.info(f"  Wrote {keyfile_path}")
+
+    # 3. Write the lockfile listing the keys we want to force. Locked
+    # keys cannot be overridden by user-level gsettings.
+    lockfile_path.parent.mkdir(parents=True, exist_ok=True)
+    lockfile_content = (
+        "/org/gnome/desktop/interface/cursor-theme\n"
+        "/org/gnome/desktop/interface/cursor-size\n"
+    )
+    if not lockfile_path.exists() or lockfile_path.read_text() != lockfile_content:
+        lockfile_path.write_text(lockfile_content)
+        logger.info(f"  Wrote {lockfile_path}")
+
+    # 4. Recompile the dconf system DB. This is what actually makes the
+    # keyfile + lockfile take effect on next session start.
+    result = subprocess.run(
+        ['dconf', 'update'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        logger.info("  Recompiled dconf system DB (dconf update)")
+    else:
+        logger.warning(
+            f"  dconf update returned {result.returncode}: "
+            f"{result.stderr.strip()[:200]}"
         )
-        if result.returncode != 0:
-            logger.info("  Installing unclutter...")
-            install_result = subprocess.run(
-                ['apt-get', '-o', 'Acquire::Check-Valid-Until=false',
-                 'install', '-y', 'unclutter'],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if install_result.returncode == 0:
-                logger.info("  unclutter installed")
-            else:
-                logger.warning(
-                    f"  unclutter install failed (non-fatal): "
-                    f"{install_result.stderr.strip()[:200]}"
-                )
-        else:
-            logger.info("  unclutter already installed")
-    except Exception as e:
-        logger.warning(f"  Could not install unclutter: {e}")
 
 
 def _patch_wayfire_input_section(content: str) -> str:
     """
-    Patch wayfire.ini so the desktop cursor is hidden:
+    Patch wayfire.ini's [input] section with cursor-hiding directives:
 
-      1. [input] section gets cursor_size=1 + hide_cursor_when_idle=true +
-         hide_cursor_delay=0 so Wayfire's own cursor is 1px and hides
-         immediately on mouse idle.
-      2. [autostart] section gets `unclutter = unclutter -idle 0 -root`
-         so any cursor that does render gets warped offscreen.
+      cursor_size = 1
+      hide_cursor_when_idle = true
+      hide_cursor_delay = 0
 
-    Both edits are idempotent: if the directives are already present
-    (with correct values), returns content unchanged. Existing config
-    in other sections is preserved verbatim.
+    These directives may or may not have any effect in Wayfire 0.7.5
+    (empirically the dconf cursor theme is the load-bearing fix on Pi
+    OS Bookworm), but cost nothing and protect against future Wayfire
+    versions that do honor them. The real cursor-hiding work happens
+    via the jam-blank Xcursor theme + dconf lock in
+    install_cursor_hiding().
+
+    Idempotent.
     """
-    content = _patch_ini_section(
+    return _patch_ini_section(
         content,
         section='[input]',
         required={
@@ -1640,14 +1723,6 @@ def _patch_wayfire_input_section(content: str) -> str:
             'hide_cursor_delay': '0',
         },
     )
-    content = _patch_ini_section(
-        content,
-        section='[autostart]',
-        required={
-            'unclutter': 'unclutter -idle 0 -root',
-        },
-    )
-    return content
 
 
 def _patch_ini_section(content: str, section: str, required: dict) -> str:
