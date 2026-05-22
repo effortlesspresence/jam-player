@@ -209,17 +209,50 @@ def render_and_install_crontab(template_path: Path) -> bool:
             text=True,
             timeout=30,
         )
-        if result.returncode == 0:
-            logger.info(
-                f"Installed crontab (nightly reboot at "
-                f"{hour:02d}:{minute:02d} local)"
+        if result.returncode != 0:
+            logger.warning(
+                f"`crontab -` returned {result.returncode}: "
+                f"{result.stderr.strip()}"
             )
-            return True
-        logger.warning(
-            f"`crontab -` returned {result.returncode}: "
-            f"{result.stderr.strip()}"
+            return False
+        logger.info(
+            f"Installed crontab (nightly reboot at "
+            f"{hour:02d}:{minute:02d} local)"
         )
-        return False
     except Exception as e:
         logger.warning(f"Failed to install crontab: {e}")
         return False
+
+    # Clean up: legacy installs left a stale crontab under the
+    # `comitup` user. Nothing in JP 2.0 runs as comitup-cron, so
+    # any entries there are dead weight that confuse diagnostics
+    # (`crontab -l` from a comitup shell shows the wrong content).
+    # `crontab -u comitup -r` removes the comitup crontab if any;
+    # if the user has none, crontab exits non-zero with "no crontab
+    # for comitup" -- we treat that as success.
+    try:
+        result = subprocess.run(
+            ['crontab', '-u', 'comitup', '-r'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        stderr = (result.stderr or '').strip()
+        if result.returncode == 0:
+            logger.info("Removed stale comitup crontab")
+        elif 'no crontab' in stderr.lower():
+            # Expected on devices that never had a comitup crontab,
+            # or on the second+ run of this install after we already
+            # cleaned it up.
+            pass
+        else:
+            logger.warning(
+                f"`crontab -u comitup -r` returned {result.returncode}: "
+                f"{stderr[:200]}"
+            )
+    except Exception as e:
+        # Non-fatal: the root crontab is already installed, the
+        # comitup crontab is just cosmetic cruft.
+        logger.warning(f"Could not clean up comitup crontab: {e}")
+
+    return True

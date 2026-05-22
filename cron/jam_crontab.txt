@@ -3,13 +3,14 @@
 # Only contains essential scheduled tasks
 
 # Reboot the device every morning at a per-device randomized time between
-# 01:45 and 04:15 (local time). The time is picked once per device by
-# jam_update.py and persisted to /etc/jam/device_data/nightly_reboot_time.txt
-# so it stays stable across updates. Randomization spreads the post-reboot
-# heartbeat / installed-version / outlet-status calls across a 2.5-hour
-# window instead of hammering the backend with thousands of simultaneous
-# requests in the same minute. jam_update.py substitutes {REBOOT_MINUTE}
-# and {REBOOT_HOUR} below before installing this file via `crontab`.
+# 01:45 and 04:15 (local time). The time is picked once per device and
+# persisted to /etc/jam/device_data/nightly_reboot_time.txt so it stays
+# stable across updates. Randomization spreads the post-reboot heartbeat
+# / installed-version / outlet-status calls across a 2.5-hour window
+# instead of hammering the backend with thousands of simultaneous
+# requests in the same minute. The minute and hour fields below are
+# placeholders that get substituted before this file is piped into
+# `crontab`; see common/nightly_reboot.py for the renderer.
 # The 42-second sleep prevents reboot loops: a device that comes back up
 # inside the same minute boundary cron could otherwise re-match the same
 # slot and reboot again.
