@@ -64,11 +64,9 @@ import json
 import socket
 import subprocess
 import signal
-import threading
 from pathlib import Path
 from enum import Enum
 from typing import Optional, Any, List, Dict
-from dataclasses import dataclass
 from datetime import datetime, time as dt_time
 
 # Add the services directory to path for imports
@@ -79,14 +77,15 @@ from common.credentials import (
     is_device_registered,
     get_device_uuid,
     get_screen_id,
-    get_device_uuid_short,
     get_display_orientation,
 )
 from common.system import get_systemd_notifier, setup_signal_handlers
 from common.paths import (
-    SCREEN_ID_FILE,
-    REGISTERED_FLAG,
     INTERNET_VERIFIED_FLAG,
+)
+from common.display_cache import (
+    cleanup_stale_cache,
+    get_or_render_cached,
 )
 from jam_player import constants
 
@@ -323,6 +322,13 @@ TEXT_COLOR = (255, 255, 255)  # White
 ACCENT_COLOR = JAM_ORANGE_PRIMARY
 SECONDARY_COLOR = (156, 163, 175)  # #9CA3AF - Muted gray
 
+# Base font sizes - calibrated for a 1080p (1080-pixel-tall) reference
+# display. On larger displays (e.g. 4K = 2160px), call _scaled(base, height)
+# to linearly scale up so text and QR codes stay legible at viewing distance.
+# Do NOT use these raw constants directly inside render functions -- always
+# wrap them in _scaled() so 4K renders correctly. Keeping them as int
+# constants (vs scaled defaults) makes the calibration values easy to find
+# and tune.
 FONT_SIZE_TITLE = 72
 FONT_SIZE_SUBTITLE = 36
 FONT_SIZE_INSTRUCTIONS = 32
@@ -330,14 +336,40 @@ FONT_SIZE_URL = 28
 FONT_SIZE_DEVICE_ID = 24
 FONT_SIZE_TAGLINE = 42
 
-# Logo path on device
-JAM_LOGO_PATH = "/root/jam_logo.png"
+# Reference display height that the FONT_SIZE_* constants are calibrated to.
+# All scaling is linear vs this baseline -- a 4K screen (2160px) renders
+# everything at 2x, a 720p screen (720px) renders at 0.67x, etc.
+REFERENCE_SCREEN_HEIGHT = 1080
+
+# Logo path on device. The logo PNG is installed to the comitup user's home
+# during JP setup; if missing (e.g. shipped image lacks it), render functions
+# fall back to skipping the logo entirely and shift other elements up.
+JAM_LOGO_PATH = "/home/comitup/jam_player_logo.png"
 
 # URLs for setup
 UNIVERSAL_SETUP_URL = "https://setup.justamenu.com"
 
 # State checking intervals
 STATE_CHECK_INTERVAL_SEC = 5
+
+
+def _scaled(base_size: int, screen_height: int) -> int:
+    """
+    Scale a size value linearly relative to a 1080p reference.
+
+    Used so font sizes, logo heights, QR sizes etc. grow proportionally
+    with screen resolution. A 4K display (2160px tall) gets 2x sizes,
+    1440p gets 1.33x, 720p gets 0.67x. Result is always >= 1 so PIL
+    doesn't choke on a zero-sized font.
+
+    Args:
+        base_size: Size in pixels calibrated for a 1080p display
+        screen_height: Actual display height in pixels
+
+    Returns:
+        Scaled size in pixels, minimum 1
+    """
+    return max(1, int(base_size * screen_height / REFERENCE_SCREEN_HEIGHT))
 
 
 # =============================================================================
@@ -575,18 +607,19 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     img = create_mesh_gradient_background(width, height, theme="vibrant")
     draw = ImageDraw.Draw(img)
 
-    # Fonts
-    title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE)
-    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
-    tagline_font = get_font(FONT_SIZE_TAGLINE)
-    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    # Fonts (scaled to display resolution)
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height))
+    instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
+    tagline_font = get_font(_scaled(FONT_SIZE_TAGLINE, height))
+    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
-    # Calculate layout - vertically centered content block
-    logo_height = min(120, height // 8)
-    qr_size = min(320, height // 4)
+    # Layout dimensions scale with display height. 1080p reference values:
+    # logo=120, qr=320. On 4K these become 240/640.
+    logo_height = _scaled(120, height)
+    qr_size = _scaled(320, height)
 
     # Start from top with some padding
     y = int(height * 0.08)
@@ -679,7 +712,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         )
 
     # Version indicator in bottom-right corner
-    version_font = get_font(14, bold=False)
+    version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
         (width - 30, height - 25),
         "v2",
@@ -711,16 +744,16 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     img = create_mesh_gradient_background(width, height, theme="cool")
     draw = ImageDraw.Draw(img)
 
-    # Fonts
-    title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
-    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    # Fonts (scaled to display resolution)
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
+    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
     center_y = height // 2
 
-    # Logo at top
-    logo_height = min(80, height // 10)
+    # Logo at top (scaled). 1080p reference: 80px; 4K: 160px.
+    logo_height = _scaled(80, height)
     logo = load_and_scale_logo(logo_height)
     if logo:
         logo_x = center_x - logo.width // 2
@@ -779,7 +812,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
         )
 
     # Version indicator
-    version_font = get_font(14, bold=False)
+    version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
         (width - 30, height - 25),
         "v2",
@@ -811,15 +844,15 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
     img = create_mesh_gradient_background(width, height, theme="cool")
     draw = ImageDraw.Draw(img)
 
-    title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
-    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
-    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
+    instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
+    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
-    # Logo
-    logo_height = min(120, height // 8)
+    # Logo (scaled). 1080p reference: 120px; 4K: 240px.
+    logo_height = _scaled(120, height)
     y = int(height * 0.12)
     logo = load_and_scale_logo(logo_height)
     if logo:
@@ -846,7 +879,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
     y += bbox[3] + 20
 
     # Secondary line: "Almost there."
-    sub = "Almost there."
+    sub = "Your JAM Player is connected to the internet."
     draw.text(
         (center_x, y),
         sub,
@@ -905,7 +938,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
             anchor="mm"
         )
 
-    version_font = get_font(14, bold=False)
+    version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
         (width - 30, height - 25),
         "v2",
@@ -940,18 +973,18 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
     img = create_mesh_gradient_background(width, height, theme="cool")
     draw = ImageDraw.Draw(img)
 
-    title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
-    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
-    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
+    instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
+    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
     # Layout proportions mirror create_unregistered_screen so the user
     # doesn't experience a jarring layout shift when transitioning from
-    # AWAITING_NETWORK to AWAITING_REGISTRATION.
-    logo_height = min(120, height // 8)
-    qr_size = min(320, height // 4)
+    # AWAITING_NETWORK to AWAITING_REGISTRATION. Scaled to display height.
+    logo_height = _scaled(120, height)
+    qr_size = _scaled(320, height)
 
     y = int(height * 0.08)
 
@@ -981,17 +1014,6 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
     # .internet_verified exists, so this statement is always accurate
     # here. Helps users understand that the "go to the mobile app" step
     # is the one remaining action, not a connectivity problem.
-    status_line = "Your JAM Player is connected to the internet."
-    draw.text(
-        (center_x, y),
-        status_line,
-        font=subtitle_font,
-        fill=TEXT_COLOR,
-        anchor="mt"
-    )
-    bbox = draw.textbbox((0, 0), status_line, font=subtitle_font)
-    y += bbox[3] + 30
-
     # Instruction line 1
     line1 = "Set up this JAM Player in the"
     draw.text(
@@ -1016,7 +1038,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
     y += bbox[3] + 30
 
     # "Scan the QR code to begin."
-    scan_text = "Scan the QR code to begin."
+    scan_text = "Scan the QR code to continue."
     draw.text(
         (center_x, y),
         scan_text,
@@ -1054,7 +1076,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         )
 
     # Version indicator
-    version_font = get_font(14, bold=False)
+    version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
         (width - 30, height - 25),
         "v2",
@@ -1092,14 +1114,14 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
     img = create_mesh_gradient_background(width, height, theme="vibrant")
     draw = ImageDraw.Draw(img)
 
-    title_font = get_font(FONT_SIZE_TITLE)
-    subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
-    instructions_font = get_font(FONT_SIZE_INSTRUCTIONS, bold=False)
-    device_font = get_font(FONT_SIZE_DEVICE_ID, bold=False)
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
+    instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
+    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
-    logo_height = min(120, height // 8)
+    logo_height = _scaled(120, height)
     y = int(height * 0.12)
     logo = load_and_scale_logo(logo_height)
     if logo:
@@ -1165,7 +1187,7 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
             anchor="mm"
         )
 
-    version_font = get_font(14, bold=False)
+    version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
         (width - 30, height - 25),
         "v2",
@@ -1208,6 +1230,39 @@ def create_fallback_image(width: int, height: int, message: str, img_name: str) 
         return None
 
 
+# =============================================================================
+# Render Registry for Display Cache
+#
+# The cache layer lives in common/display_cache.py (it's used by both
+# this service and jam-update at install-time for pre-warming, so it has
+# to be importable from both sides). To avoid circular imports, the cache
+# module accepts a registry of render functions as a parameter rather
+# than importing them from this module directly. This function builds
+# that registry by stringifying our DisplayMode values.
+#
+# Note: NO_ACTIVE_SCENES is rendered inline in
+# _show_no_scheduled_content_screen() (no module-level factory exists for
+# it). It's omitted from the cache registry; a future refactor could
+# extract it to a top-level factory and add it here.
+# =============================================================================
+
+def build_display_render_registry() -> dict:
+    """
+    Build the {mode_value: render_fn} registry used by display_cache.
+
+    Returned as plain str -> callable so display_cache stays decoupled
+    from DisplayMode enum / this module. Keys are the .value of each
+    DisplayMode (e.g. "awaiting_registration").
+    """
+    return {
+        DisplayMode.AWAITING_NETWORK.value: create_unregistered_screen,
+        DisplayMode.AWAITING_REGISTRATION.value: create_awaiting_registration_screen,
+        DisplayMode.AWAITING_SCREEN_LINK.value: create_awaiting_screen_link_screen,
+        DisplayMode.DOWNLOADING_CONTENT.value: create_waiting_for_content_screen,
+        DisplayMode.NO_ACTIVE_SCENES.value: create_no_active_scenes_screen,
+    }
+
+
 def display_image_with_feh(img: Image.Image, img_name: str = "jam_display", fallback_message: str = None) -> Optional[subprocess.Popen]:
     """Display an image fullscreen using feh. Returns the process handle."""
     img_path = f'/tmp/{img_name}.png'
@@ -1243,6 +1298,47 @@ def display_image_with_feh(img: Image.Image, img_name: str = "jam_display", fall
         return None
 
     # Launch feh
+    process = subprocess.Popen(
+        ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'feh', '-F', '--hide-pointer', img_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    return process
+
+
+def display_path_with_feh(img_path: str) -> Optional[subprocess.Popen]:
+    """
+    Display an already-rendered PNG file fullscreen using feh.
+
+    Used by the cache layer to skip the PIL save step entirely on cache
+    hit -- we already have a PNG on disk, just point feh at it. Shares
+    X-display readiness logic with display_image_with_feh.
+
+    Args:
+        img_path: Absolute path to a PNG file readable by the comitup user
+
+    Returns:
+        feh subprocess handle, or None if X server never came up.
+    """
+    if not img_path or not os.path.exists(img_path):
+        logger.error(f"display_path_with_feh: path does not exist: {img_path}")
+        return None
+
+    # Wait for X display to be available (same logic as display_image_with_feh)
+    for _ in range(30):
+        result = subprocess.run(
+            ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'xdpyinfo'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            break
+        time.sleep(1)
+    else:
+        logger.warning("Display not available after 30s")
+        return None
+
     process = subprocess.Popen(
         ['sudo', '-u', 'comitup', 'env', 'DISPLAY=:0', 'feh', '-F', '--hide-pointer', img_path],
         stdout=subprocess.DEVNULL,
@@ -1676,6 +1772,59 @@ class JamPlayerDisplayManager:
             logger.error(f"Error loading scenes: {e}")
             return []
 
+    def _show_cached_screen(
+        self,
+        mode: DisplayMode,
+        device_uuid: Optional[str],
+        fallback_msg: str,
+    ) -> Optional[subprocess.Popen]:
+        """
+        Render-or-fetch a setup-state screen via the display cache and
+        hand the resulting PNG to feh.
+
+        On cache hit, this is essentially instant -- feh just gets a
+        path. On cache miss, we render via PIL (1-15s depending on
+        resolution) and write to the cache atomically for next time.
+
+        Falls back to display_image_with_feh's ImageMagick fallback path
+        if the registry has no entry for `mode` (shouldn't happen for
+        the modes we cache, but defensive).
+        """
+        registry = build_display_render_registry()
+        render_fn = registry.get(mode.value)
+        if render_fn is None:
+            logger.warning(
+                f"No cache registry entry for {mode} -- falling back to "
+                f"in-memory render via display_image_with_feh"
+            )
+            # This shouldn't be reached for the modes we handle in
+            # transition_to_mode, but if a future mode is added without
+            # updating the registry, this keeps the display functional.
+            return display_image_with_feh(None, mode.value, fallback_message=fallback_msg)
+
+        img_path = get_or_render_cached(
+            mode.value,
+            self.screen_width,
+            self.screen_height,
+            render_fn,
+            device_uuid,
+        )
+
+        if not img_path:
+            # Rendering itself failed (PIL not available, etc.). Fall
+            # back to the ImageMagick path inside display_image_with_feh.
+            logger.warning(
+                f"Render returned no path for {mode} -- using ImageMagick fallback"
+            )
+            return display_image_with_feh(None, mode.value, fallback_message=fallback_msg)
+
+        process = display_path_with_feh(img_path)
+        if process:
+            logger.info(f"feh started for {mode.value}: PID {process.pid} ({img_path})")
+        else:
+            logger.error(f"Failed to start feh for {mode.value}")
+        return process
+
     def transition_to_mode(self, new_mode: DisplayMode):
         """Transition to a new display mode."""
         if new_mode == self.current_mode:
@@ -1706,48 +1855,30 @@ class JamPlayerDisplayManager:
 
         if new_mode == DisplayMode.AWAITING_NETWORK:
             logger.info("Showing AWAITING_NETWORK screen (setup/QR code)")
-            img = create_unregistered_screen(
-                self.screen_width, self.screen_height, device_uuid
+            self.feh_process = self._show_cached_screen(
+                new_mode, device_uuid,
+                fallback_msg="JAM Player\n\nSet up with JAM Player Setup App\nScan QR code to begin"
             )
-            self.feh_process = display_image_with_feh(
-                img, "jam_display_awaiting_network",
-                fallback_message="JAM Player\n\nSet up with JAM Player Setup App\nScan QR code to begin"
-            )
-            if self.feh_process:
-                logger.info(f"feh process started: PID {self.feh_process.pid}")
-            else:
-                logger.error("Failed to start feh for AWAITING_NETWORK screen")
             sd_notifier.notify("STATUS=Awaiting network (setup)")
 
         elif new_mode == DisplayMode.AWAITING_REGISTRATION:
             logger.info("Showing AWAITING_REGISTRATION screen")
-            img = create_awaiting_registration_screen(
-                self.screen_width, self.screen_height, device_uuid
-            )
-            self.feh_process = display_image_with_feh(
-                img, "jam_display_awaiting_registration",
-                fallback_message=(
-                    "Almost there.\n\n"
+            self.feh_process = self._show_cached_screen(
+                new_mode, device_uuid,
+                fallback_msg=(
                     "Your JAM Player is connected to the internet.\n\n"
                     "Set up this JAM Player in the\n"
                     "JAM Player Setup app on your phone.\n\n"
                     "Scan the QR code to begin."
                 )
             )
-            if self.feh_process:
-                logger.info(f"feh process started: PID {self.feh_process.pid}")
-            else:
-                logger.error("Failed to start feh for AWAITING_REGISTRATION screen")
             sd_notifier.notify("STATUS=Online, awaiting registration")
 
         elif new_mode == DisplayMode.AWAITING_SCREEN_LINK:
             logger.info("Showing AWAITING_SCREEN_LINK screen")
-            img = create_awaiting_screen_link_screen(
-                self.screen_width, self.screen_height, device_uuid
-            )
-            self.feh_process = display_image_with_feh(
-                img, "jam_display_awaiting_screen_link",
-                fallback_message=(
+            self.feh_process = self._show_cached_screen(
+                new_mode, device_uuid,
+                fallback_msg=(
                     "Registered!\n\n"
                     "Almost there.\n\n"
                     "Your JAM Player is registered to your outlet.\n\n"
@@ -1755,44 +1886,26 @@ class JamPlayerDisplayManager:
                     "using the mobile app or web app."
                 )
             )
-            if self.feh_process:
-                logger.info(f"feh process started: PID {self.feh_process.pid}")
-            else:
-                logger.error("Failed to start feh for AWAITING_SCREEN_LINK screen")
             sd_notifier.notify("STATUS=Registered, awaiting screen link")
 
         elif new_mode == DisplayMode.DOWNLOADING_CONTENT:
             logger.info("Showing DOWNLOADING_CONTENT screen")
-            img = create_waiting_for_content_screen(
-                self.screen_width, self.screen_height, device_uuid
+            self.feh_process = self._show_cached_screen(
+                new_mode, device_uuid,
+                fallback_msg="Waiting for content...\n\nContent is being downloaded.\nThis may take a few minutes."
             )
-            self.feh_process = display_image_with_feh(
-                img, "jam_display_downloading",
-                fallback_message="Waiting for content...\n\nContent is being downloaded.\nThis may take a few minutes."
-            )
-            if self.feh_process:
-                logger.info(f"feh process started: PID {self.feh_process.pid}")
-            else:
-                logger.error("Failed to start feh for DOWNLOADING_CONTENT screen")
             sd_notifier.notify("STATUS=Downloading content")
 
         elif new_mode == DisplayMode.NO_ACTIVE_SCENES:
             logger.info("Showing NO_ACTIVE_SCENES screen")
-            img = create_no_active_scenes_screen(
-                self.screen_width, self.screen_height, device_uuid
-            )
-            self.feh_process = display_image_with_feh(
-                img, "jam_display_no_active_scenes",
-                fallback_message=(
+            self.feh_process = self._show_cached_screen(
+                new_mode, device_uuid,
+                fallback_msg=(
                     "No active scenes\n\n"
                     "This screen has no active scenes.\n"
                     "Add scenes in the web app to display content here."
                 )
             )
-            if self.feh_process:
-                logger.info(f"feh process started: PID {self.feh_process.pid}")
-            else:
-                logger.error("Failed to start feh for NO_ACTIVE_SCENES screen")
             sd_notifier.notify("STATUS=Screen linked but no active scenes")
 
         elif new_mode == DisplayMode.PLAYING_CONTENT:
@@ -2013,14 +2126,14 @@ class JamPlayerDisplayManager:
             )
             draw = ImageDraw.Draw(img)
 
-            title_font = get_font(FONT_SIZE_TITLE)
-            subtitle_font = get_font(FONT_SIZE_SUBTITLE, bold=False)
+            title_font = get_font(_scaled(FONT_SIZE_TITLE, self.screen_height))
+            subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, self.screen_height), bold=False)
 
             center_x = self.screen_width // 2
             center_y = self.screen_height // 2
 
-            # Logo at top
-            logo_height = min(80, self.screen_height // 10)
+            # Logo at top (scaled to display resolution)
+            logo_height = _scaled(80, self.screen_height)
             logo = load_and_scale_logo(logo_height)
             if logo:
                 logo_x = center_x - logo.width // 2
@@ -2047,8 +2160,8 @@ class JamPlayerDisplayManager:
                 anchor="mm"
             )
 
-            # Version indicator
-            version_font = get_font(14, bold=False)
+            # Version indicator (scaled)
+            version_font = get_font(_scaled(14, self.screen_height), bold=False)
             draw.text(
                 (self.screen_width - 30, self.screen_height - 25),
                 "v2",
@@ -2388,6 +2501,18 @@ class JamPlayerDisplayManager:
         logger.info(f"Screen: {self.screen_width}x{self.screen_height}")
         _log_dependency_status()
         logger.info("=" * 60)
+
+        # Sweep the display cache once at startup. Only fires when the
+        # installed commit hash has changed since the last cleanup --
+        # see cleanup_stale_cache() for the short-circuit. Adds ~10ms
+        # on the common no-op path.
+        try:
+            cleanup_stale_cache()
+        except Exception as e:
+            # Cache cleanup is best-effort. A failure here must not
+            # block the service from coming up -- the display has to
+            # work even with a dirty cache.
+            logger.warning(f"Cache cleanup raised, continuing: {e}")
 
         # Send READY=1 immediately - we're initialized and entering main loop
         # Display availability is handled within the loop, not a startup blocker

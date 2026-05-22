@@ -156,3 +156,40 @@ def safe_touch(path: Path, mode: int = 0o644):
         mode: File permissions (default 0o644)
     """
     safe_write_text(path, '', mode)
+
+
+def safe_copy(src: Path, dest: Path, mode: int = 0o644):
+    """
+    Copy a file with explicit fsync so the data hits the SD card before
+    we move on. Returns the number of bytes written.
+
+    Use this instead of shutil.copy2() for any file that must survive a
+    sudden reboot or power loss. We've seen JPs end up with 0-byte
+    destination files after using shutil.copy2() then power-cycling --
+    shutil writes the data but doesn't fsync, so the directory entry's
+    size is committed while the actual data blocks may not be, and ext4
+    journal recovery can then truncate the file back to 0.
+
+    Raises:
+        OSError: If the copy fails or the post-copy size doesn't match
+            the source size (defensive integrity check).
+    """
+    src_bytes = src.read_bytes()
+    src_size = len(src_bytes)
+
+    with open(dest, 'wb') as f:
+        f.write(src_bytes)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(dest, mode)
+
+    # Defensive: re-stat and verify size. If a filesystem layer truncated
+    # us silently, fail loudly so the caller can retry or report.
+    dest_size = dest.stat().st_size
+    if dest_size != src_size:
+        raise OSError(
+            f"safe_copy size mismatch: src={src_size} bytes, "
+            f"dest={dest_size} bytes (path: {dest})"
+        )
+
+    return src_size

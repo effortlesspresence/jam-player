@@ -1,0 +1,42 @@
+[Unit]
+Description=JAM Display Hotplug Monitor - Restarts lightdm on HDMI reconnect
+Documentation=https://github.com/effortlesspresence/jam-player
+
+# Start after the display stack is fully up so we don't race lightdm
+# during its own startup.
+After=display-manager.service
+
+# Restart limits: if this daemon crashes more than 3 times in 5 min,
+# systemd stops trying. Pre-fix behavior (no hotplug recovery) is the
+# fallback, which is acceptable.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=notify
+
+# Run as root for systemctl restart lightdm.
+User=root
+Group=root
+
+WorkingDirectory=/opt/jam/services
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_display_hotplug_monitor.py
+
+# systemd watchdog -- service pings every 10s, must ping at least every
+# 30s or systemd kills+restarts it.
+WatchdogSec=30
+
+# Restart on failure with backoff.
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-display-hotplug-monitor
+
+[Install]
+WantedBy=multi-user.target

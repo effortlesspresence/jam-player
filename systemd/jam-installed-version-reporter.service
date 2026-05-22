@@ -1,0 +1,56 @@
+[Unit]
+Description=JAM Installed Version Reporter - Reports running commit hash to backend on boot
+Documentation=https://github.com/effortlesspresence/jam-player
+
+# Need network for the backend POST. time-sync is also needed for SSL
+# cert validation on Pi 4/5 hardware where the RTC may have drifted.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+# Run after first-boot completes so /etc/jam/credentials is populated
+# (Ed25519 signing requires the device's private key to exist).
+After=jam-first-boot.service
+
+# Run after jam-update so if jam-update just installed a new commit and
+# wrote /etc/jam/version.txt, we read the NEW version, not the old one.
+# jam-update is oneshot so this also waits for it to finish either way.
+After=jam-update.service
+
+# Bounded retry budget. If we fail more than 5 times in 5 minutes, stop
+# trying for this boot -- the next boot will start fresh, and any
+# subsequent successful jam-update will also re-report directly. Worst
+# case: a device with a broken network briefly shows stale
+# installedVersion in the backend, which is acceptable.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+
+# Run as root for /etc/jam/credentials access (Ed25519 private key has
+# 0600 root:root permissions).
+User=root
+Group=root
+
+WorkingDirectory=/opt/jam/services
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_installed_version_reporter.py
+
+# Retry on failure with a 30s gap. The script also has internal retries
+# with exponential backoff (5s -> 40s), so by the time systemd restarts
+# us we've already given the network ~75s to recover.
+Restart=on-failure
+RestartSec=30
+
+# Bounded total time. The script's internal retries take up to ~75s; a
+# 5-minute hard limit gives plenty of headroom while ensuring a stuck
+# script doesn't loop forever.
+TimeoutStartSec=300
+
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-installed-version-reporter
+
+[Install]
+WantedBy=multi-user.target

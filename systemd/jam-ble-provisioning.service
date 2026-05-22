@@ -9,6 +9,19 @@ Requires=bluetooth.target
 # Wait for first boot to complete (credentials generated)
 After=jam-first-boot.service
 
+# Wait for jam-update to finish (success OR failure) before starting.
+# jam-update refreshes the venv on every boot via pip install, and if BLE
+# starts while pip is mid-write, Python imports fail with ModuleNotFoundError
+# (dbus, nacl, etc). Five failures in 300s trip StartLimitBurst and systemd
+# stops trying, leaving the JP invisible on BLE for ~20s until jam-update
+# finishes and manually retriggers us.
+#
+# `After=` (without Requires/Wants) is safe here: on a fresh first-boot with
+# no WiFi configured, jam-update is gated on network-online.target which
+# never activates, so jam-update never starts and `After=` has no effect --
+# BLE provisioning still comes up immediately so the user can configure WiFi.
+After=jam-update.service
+
 # NOTE: We do NOT wait for jam-boot-check.service here!
 # BLE provisioning must start ASAP on fresh devices so users can configure WiFi.
 # Boot check waits for network, but BLE is how users SET UP the network.

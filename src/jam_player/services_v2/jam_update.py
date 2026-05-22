@@ -56,6 +56,12 @@ logger = setup_service_logging('jam-update')
 JAM_REPO_DIR = Path('/home/comitup/jam-player')
 
 # Version tracking
+# Path to the installed-version marker file. Canonical owner is
+# common/installed_version.py (which exports the same Path); we keep
+# this local constant to avoid a module-load-time dependency on
+# common.api during jam_update.py's self-re-execution path -- the new
+# code's common.api may not yet be importable at module-load time when
+# we're swapping ourselves out. Both must agree on the path.
 VERSION_FILE = Path('/etc/jam/version.txt')
 
 # JAM 2.0 installation paths
@@ -212,13 +218,16 @@ def create_backup() -> bool:
         else:
             logger.info("  No existing services directory to backup")
 
-        # Backup systemd units
+        # Backup systemd units (safe_copy = fsync + size-verify so a
+        # power-cycle during backup doesn't leave us with 0-byte backups
+        # that would then nuke /etc/systemd/system on rollback).
+        from common.paths import safe_copy
         SYSTEMD_BACKUP.mkdir(parents=True, exist_ok=True)
         systemd_dir = Path('/etc/systemd/system')
         backed_up_units = 0
         for pattern in ['jam-*.service', 'jam-*.timer', 'jam-*.path']:
             for unit_file in systemd_dir.glob(pattern):
-                shutil.copy2(unit_file, SYSTEMD_BACKUP / unit_file.name)
+                safe_copy(unit_file, SYSTEMD_BACKUP / unit_file.name)
                 backed_up_units += 1
         logger.info(f"  Backed up {backed_up_units} systemd units")
 
@@ -278,12 +287,15 @@ def rollback_from_backup() -> bool:
         success = False
 
     try:
-        # Restore systemd units
+        # Restore systemd units (use safe_copy for same fsync/integrity
+        # guarantees as the install path -- rollback being 0-byte is just
+        # as catastrophic as install being 0-byte).
         if SYSTEMD_BACKUP.exists():
+            from common.paths import safe_copy
             systemd_dir = Path('/etc/systemd/system')
             restored_units = 0
             for unit_file in SYSTEMD_BACKUP.glob('*'):
-                shutil.copy2(unit_file, systemd_dir / unit_file.name)
+                safe_copy(unit_file, systemd_dir / unit_file.name)
                 restored_units += 1
             logger.info(f"  Restored {restored_units} systemd units")
             # Reload systemd to pick up restored units
@@ -471,13 +483,14 @@ def get_current_version() -> Optional[str]:
     Note: We intentionally don't fall back to git rev-parse HEAD because
     that would give us a commit hash even when /opt/jam/services/ hasn't
     been populated yet.
+
+    Thin wrapper over common.installed_version.read_installed_version so
+    the file path / parsing live in one place. Local import to keep
+    jam_update.py's self-re-execution path safe.
     """
     try:
-        if VERSION_FILE.exists():
-            version = VERSION_FILE.read_text().strip()
-            if version:
-                return version
-        return None
+        from common.installed_version import read_installed_version
+        return read_installed_version()
     except Exception as e:
         logger.error(f"Error getting current version: {e}")
         return None
@@ -864,27 +877,48 @@ def install_systemd_units() -> bool:
     """Install systemd service and timer files."""
     logger.info("Installing systemd units...")
 
+    # Import locally to avoid import errors during re-execution
+    # (new jam_update.py may run before new paths.py is copied)
+    from common.paths import safe_copy
+
     try:
         installed_services = []
 
-        # Copy service files
+        # Copy service / timer / path / drop-in files using safe_copy
+        # (fsync + size verification). shutil.copy2() does not fsync, and
+        # we've seen JPs end up with 0-byte destination files after a
+        # reboot following an update -- the ext4 journal recovers the
+        # directory entry but the data blocks were never flushed.
         for service_file in SYSTEMD_SRC.glob('*.service'):
             dest = Path('/etc/systemd/system') / service_file.name
-            shutil.copy2(service_file, dest)
+            safe_copy(service_file, dest)
             logger.info(f"  Installed {service_file.name}")
             installed_services.append(service_file.name)
 
-        # Copy timer files
         for timer_file in SYSTEMD_SRC.glob('*.timer'):
             dest = Path('/etc/systemd/system') / timer_file.name
-            shutil.copy2(timer_file, dest)
+            safe_copy(timer_file, dest)
             logger.info(f"  Installed {timer_file.name}")
 
-        # Copy path files (for file-watching triggers)
         for path_file in SYSTEMD_SRC.glob('*.path'):
             dest = Path('/etc/systemd/system') / path_file.name
-            shutil.copy2(path_file, dest)
+            safe_copy(path_file, dest)
             logger.info(f"  Installed {path_file.name}")
+
+        # Copy drop-in directories (e.g. lightdm.service.d/). These let us
+        # override behavior of system-shipped units (lightdm) without
+        # replacing the unit file itself. Each subdirectory in SYSTEMD_SRC
+        # ending in `.d` is treated as a drop-in dir and copied to
+        # /etc/systemd/system/<dirname>/.
+        for dropin_dir in SYSTEMD_SRC.iterdir():
+            if not dropin_dir.is_dir() or not dropin_dir.name.endswith('.d'):
+                continue
+            dest_dir = Path('/etc/systemd/system') / dropin_dir.name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for conf_file in dropin_dir.glob('*.conf'):
+                dest = dest_dir / conf_file.name
+                safe_copy(conf_file, dest)
+                logger.info(f"  Installed drop-in {dropin_dir.name}/{conf_file.name}")
 
         # Reload systemd
         logger.info("  Reloading systemd daemon...")
@@ -902,18 +936,20 @@ def install_systemd_units() -> bool:
 
 
 def update_version_file(version: str) -> bool:
-    """Update the version file."""
-    try:
-        # Import locally to avoid import errors during re-execution
-        # (new jam_update.py may run before new paths.py is copied)
-        from common.paths import safe_write_text
-        VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        safe_write_text(VERSION_FILE, version)
-        logger.info(f"Version updated to: {version[:12]}...")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update version file: {e}")
-        return False
+    """
+    Update the installed-version marker on disk.
+
+    Thin delegator to common.installed_version.write_installed_version,
+    which is the canonical owner of /etc/jam/version.txt lifecycle.
+    Kept as a separate function here so the install flow code reads
+    cleanly and so the safe_write_text + fsync semantics are guaranteed
+    consistent with everything else that touches this file.
+    """
+    # Local import: avoid module-load-time dependency on common.api
+    # during jam_update.py's self-re-execution path. See VERSION_FILE
+    # comment near the top of this module for context.
+    from common.installed_version import write_installed_version
+    return write_installed_version(version)
 
 
 # =============================================================================
@@ -1422,6 +1458,259 @@ def install_lightdm_cursor_config():
         logger.warning(f"  Failed to install lightdm cursor config: {e}")
 
 
+def install_cursor_hiding():
+    """
+    Configure layered cursor hiding so the mouse pointer is invisible
+    on the desktop background, on top of jam-player-display content, and
+    between transitions. The JP is a digital signage device -- the cursor
+    is never a useful artifact and looks unprofessional in front of
+    Fortune-100-client menu boards.
+
+    Layer 1 (the only one that actually hides the Wayfire cursor):
+        wayfire.ini gets `cursor_size = 1` + `hide_cursor_when_idle = true`
+        in its [input] section. Wayfire is the Wayland compositor on
+        Bookworm and renders its own cursor independent of X11. Without
+        this, ALL other cursor-hiding flags (lightdm `-nocursor`, feh
+        `--hide-pointer`, mpv `--cursor-autohide`) are ineffective for
+        the desktop background.
+
+    Layer 2 (belt-and-suspenders for Xwayland-hosted apps):
+        Install a system-wide blank Xcursor theme called "jam-blank" so
+        any X11/Xwayland app that asks for a cursor gets a 1x1
+        transparent image instead of an arrow. Set as default via
+        /etc/X11/Xresources.
+
+    Layer 3 (last line of defense):
+        Install `unclutter` (1980s-era cursor-hiding daemon, ~25 KB)
+        and autostart it from wayfire.ini so any cursor that does
+        render gets warped offscreen within ~100ms.
+
+    All three layers are idempotent -- re-running this function is
+    safe and incurs no extra work on already-configured JPs.
+    """
+    logger.info("Installing layered cursor hiding...")
+
+    # ----- Layer 1: Wayfire compositor config -----
+    # wayfire.ini lives in the comitup user's home and is owned by them.
+    # We want our cursor-hiding directives to coexist with the existing
+    # config (bindings, input-device routing, etc.) so we read, modify
+    # the [input] section in place, and write back.
+    wayfire_conf = Path('/home/comitup/.config/wayfire.ini')
+    if not wayfire_conf.exists():
+        logger.warning(
+            f"  {wayfire_conf} not found -- skipping Wayfire cursor config. "
+            f"This is unexpected on a Bookworm JP and will leave the "
+            f"desktop cursor visible until investigated."
+        )
+    else:
+        try:
+            content = wayfire_conf.read_text()
+            updated = _patch_wayfire_input_section(content)
+            if updated != content:
+                # Preserve ownership (comitup:comitup) since we're root.
+                wayfire_conf.write_text(updated)
+                run_command(['chown', 'comitup:comitup', str(wayfire_conf)])
+                logger.info(f"  Updated {wayfire_conf} [input] section")
+            else:
+                logger.info(f"  {wayfire_conf} already has cursor-hiding config")
+        except Exception as e:
+            logger.warning(f"  Could not patch wayfire.ini: {e}")
+
+    # ----- Layer 2: blank Xcursor theme -----
+    # The theme is just a single directory with a config file pointing
+    # every cursor name at one tiny transparent PNG. xcursorgen would
+    # normally compile cursor sources, but we can install a pre-built
+    # "core" cursor binary that's just 1x1 transparent and symlink every
+    # cursor name to it. Since we don't ship that binary in the repo
+    # (would be awkward), the simpler approach is:
+    #   - mkdir /usr/share/icons/jam-blank/cursors
+    #   - write index.theme + symlink common cursor names to /dev/null
+    # When Xcursor can't load a cursor file, it renders nothing.
+    # /dev/null trick works on every X11 implementation we care about.
+    try:
+        cursors_dir = Path('/usr/share/icons/jam-blank/cursors')
+        cursors_dir.mkdir(parents=True, exist_ok=True)
+        index_path = Path('/usr/share/icons/jam-blank/index.theme')
+        if not index_path.exists():
+            index_path.write_text(
+                "[Icon Theme]\n"
+                "Name=JAM Blank\n"
+                "Comment=Invisible cursor theme for JAM Player digital signage\n"
+                "Inherits=core\n"
+            )
+        # Map every cursor shape Xwayland might request to /dev/null.
+        # When Xcursor opens /dev/null it gets EOF and falls back to
+        # rendering nothing.
+        cursor_names = [
+            'left_ptr', 'arrow', 'default', 'pointer', 'hand', 'hand1',
+            'hand2', 'crosshair', 'cross', 'text', 'xterm', 'ibeam',
+            'wait', 'watch', 'progress', 'help', 'question_arrow',
+            'sb_v_double_arrow', 'sb_h_double_arrow', 'fleur', 'move',
+            'top_left_corner', 'top_right_corner',
+            'bottom_left_corner', 'bottom_right_corner',
+            'top_side', 'bottom_side', 'left_side', 'right_side',
+            'col-resize', 'row-resize', 'all-scroll',
+        ]
+        for name in cursor_names:
+            link_path = cursors_dir / name
+            if not link_path.exists():
+                # symlink instead of file copy so we don't allocate disk
+                # space for 30+ identical empty files.
+                link_path.symlink_to('/dev/null')
+        logger.info("  Installed jam-blank Xcursor theme at /usr/share/icons/jam-blank/")
+    except Exception as e:
+        logger.warning(f"  Could not install jam-blank cursor theme: {e}")
+
+    # Set jam-blank as the system-default Xcursor theme. Affects Xwayland
+    # and any other X11 client that respects the Xresources convention.
+    try:
+        xresources_path = Path('/etc/X11/Xresources/x11-common')
+        if xresources_path.exists():
+            content = xresources_path.read_text()
+            if 'Xcursor.theme:' not in content:
+                content = content.rstrip() + '\nXcursor.theme: jam-blank\n'
+                xresources_path.write_text(content)
+                logger.info(f"  Set Xcursor.theme=jam-blank in {xresources_path}")
+            elif 'Xcursor.theme: jam-blank' not in content:
+                # Different theme already set -- override it
+                import re
+                content = re.sub(
+                    r'^Xcursor\.theme:.*$',
+                    'Xcursor.theme: jam-blank',
+                    content,
+                    flags=re.MULTILINE,
+                )
+                xresources_path.write_text(content)
+                logger.info(f"  Overrode Xcursor.theme in {xresources_path}")
+            else:
+                logger.info("  Xcursor.theme already set to jam-blank")
+    except Exception as e:
+        logger.warning(f"  Could not set Xcursor.theme: {e}")
+
+    # ----- Layer 3: unclutter daemon -----
+    # Install if not present (small package, ~25 KB).
+    try:
+        result = subprocess.run(
+            ['dpkg', '-s', 'unclutter'],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.info("  Installing unclutter...")
+            install_result = subprocess.run(
+                ['apt-get', '-o', 'Acquire::Check-Valid-Until=false',
+                 'install', '-y', 'unclutter'],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if install_result.returncode == 0:
+                logger.info("  unclutter installed")
+            else:
+                logger.warning(
+                    f"  unclutter install failed (non-fatal): "
+                    f"{install_result.stderr.strip()[:200]}"
+                )
+        else:
+            logger.info("  unclutter already installed")
+    except Exception as e:
+        logger.warning(f"  Could not install unclutter: {e}")
+
+
+def _patch_wayfire_input_section(content: str) -> str:
+    """
+    Patch wayfire.ini so the desktop cursor is hidden:
+
+      1. [input] section gets cursor_size=1 + hide_cursor_when_idle=true +
+         hide_cursor_delay=0 so Wayfire's own cursor is 1px and hides
+         immediately on mouse idle.
+      2. [autostart] section gets `unclutter = unclutter -idle 0 -root`
+         so any cursor that does render gets warped offscreen.
+
+    Both edits are idempotent: if the directives are already present
+    (with correct values), returns content unchanged. Existing config
+    in other sections is preserved verbatim.
+    """
+    content = _patch_ini_section(
+        content,
+        section='[input]',
+        required={
+            'cursor_size': '1',
+            'hide_cursor_when_idle': 'true',
+            'hide_cursor_delay': '0',
+        },
+    )
+    content = _patch_ini_section(
+        content,
+        section='[autostart]',
+        required={
+            'unclutter': 'unclutter -idle 0 -root',
+        },
+    )
+    return content
+
+
+def _patch_ini_section(content: str, section: str, required: dict) -> str:
+    """
+    Generic helper: ensure `section` of an INI-style file contains the
+    given key=value pairs. Idempotent.
+
+    Args:
+        content: Full file content (text).
+        section: Section header including brackets (e.g. '[input]').
+        required: Dict of {key: value} pairs to ensure are present.
+
+    Returns:
+        Updated content. Identical to input if all keys already had
+        the required values. Otherwise either the existing section is
+        modified in place or a new section is appended.
+    """
+    lines = content.split('\n')
+    in_target = False
+    section_start = None
+    section_end = None  # index of first line OUTSIDE the section
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            if in_target:
+                section_end = i
+                break
+            if stripped == section:
+                in_target = True
+                section_start = i
+                continue
+    if in_target and section_end is None:
+        section_end = len(lines)
+
+    if section_start is None:
+        # Section doesn't exist. Append it at the end of the file.
+        new_section = ['', section]
+        for k, v in required.items():
+            new_section.append(f'{k} = {v}')
+        return content.rstrip() + '\n' + '\n'.join(new_section) + '\n'
+
+    # Section exists. Walk it: replace existing values for our keys in
+    # place, then append any keys that weren't already present.
+    section_lines = lines[section_start + 1:section_end]
+    seen: dict = {}
+    new_section_lines = []
+    for line in section_lines:
+        stripped = line.strip()
+        if '=' in stripped and not stripped.startswith('#'):
+            key = stripped.split('=', 1)[0].strip()
+            if key in required:
+                new_section_lines.append(f'{key} = {required[key]}')
+                seen[key] = True
+                continue
+        new_section_lines.append(line)
+    for key, val in required.items():
+        if key not in seen:
+            new_section_lines.append(f'{key} = {val}')
+
+    rebuilt = lines[:section_start + 1] + new_section_lines + lines[section_end:]
+    return '\n'.join(rebuilt)
+
+
 def install_unique_hostname():
     """
     Set a unique hostname for this device based on its UUID.
@@ -1455,6 +1744,56 @@ def install_unique_hostname():
         logger.warning(f"  Failed to set unique hostname: {e}")
 
 
+def prewarm_display_screens():
+    """
+    Pre-render all cacheable jam-player-display setup screens at common
+    resolutions (1920x1080, 3840x2160) and save to
+    /var/cache/jam-player-display/.
+
+    Called once per update, after install completes but before services
+    restart. Adds ~30-90s to update duration on first run for a given
+    code commit (PIL render time at 4K dominates); subsequent updates
+    re-warm only what's missing, which is typically nothing.
+
+    Safe to fail -- if pre-warm errors out, the lazy cache path in
+    jam-player-display still works correctly. The customer just pays a
+    one-time render delay on first post-update display.
+    """
+    logger.info("Pre-warming display screen cache...")
+
+    # Import lazily so a missing jam_player_display module (unlikely but
+    # defensive) doesn't prevent the rest of the update from finishing.
+    # Also: jam_player_display imports a lot of PIL/qrcode/etc. at module
+    # load time -- only worth paying that cost when we're actually
+    # pre-warming.
+    try:
+        from jam_player_display import build_display_render_registry
+        from common.display_cache import prewarm_display_cache
+        from common.credentials import get_device_uuid
+    except ImportError as e:
+        logger.warning(f"  Could not import display modules: {e}")
+        return
+
+    try:
+        registry = build_display_render_registry()
+    except Exception as e:
+        logger.warning(f"  Could not build render registry: {e}")
+        return
+
+    try:
+        device_uuid = get_device_uuid()
+    except Exception:
+        device_uuid = None
+
+    summary = prewarm_display_cache(registry, device_uuid)
+    logger.info(
+        f"  Display cache pre-warm: "
+        f"rendered={summary['rendered']}, "
+        f"skipped={summary['skipped']}, "
+        f"failed={summary['failed']}"
+    )
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
@@ -1478,6 +1817,15 @@ def restart_services():
         'jam-ws-commands.service',        # Type=notify, WebSocket commands (has ConditionPath)
         'jam-chrony-peering.service',     # Type=simple, chrony peer discovery
         'jam-tailscale.service',          # Type=oneshot, runs once
+        # NOTE: do NOT restart jam-display-wait-for-hdmi.service mid-run.
+        # It only matters at boot (gates lightdm). Restarting it post-boot
+        # would have no useful effect.
+        'jam-display-hotplug-monitor.service',  # Type=notify, watches DRM for HDMI hotplug
+        # NOTE: jam-installed-version-reporter is also a no-op to restart
+        # here -- jam_update.py already called report_installed_version_to_backend()
+        # directly above, so the new commit is already known to the
+        # backend. Skipping the systemctl-restart of the reporter avoids
+        # a redundant POST.
     ]
 
     # Trigger all restarts with --no-block to avoid waiting
@@ -1650,6 +1998,26 @@ def main():
     # Update version file
     update_version_file(latest_version)
 
+    # Tell the backend which commit we just installed.
+    #
+    # Best-effort: if the backend is unreachable right now (network down,
+    # API outage, etc.) the per-boot reporter service catches up on the
+    # next boot, and any subsequent jam-update run also re-reports.
+    # Failing to report MUST NOT block the update -- the device is
+    # successfully running new code, just that the backend doesn't know
+    # yet. The backend gets eventual consistency on its own schedule.
+    try:
+        # Local import: this module references common.api which is part
+        # of the freshly-installed code we just copied to /opt/jam/services.
+        # Importing at the top of the file would have referenced the
+        # PRE-update version of common.api -- not what we want.
+        from common.installed_version import report_installed_version_to_backend
+        report_installed_version_to_backend(version=latest_version)
+    except Exception as e:
+        logger.warning(
+            f"Could not report installedVersion to backend (non-fatal): {e}"
+        )
+
     # Clean up legacy cruft (non-critical, don't fail update for this)
     try:
         cleanup_legacy_cruft()
@@ -1680,8 +2048,25 @@ def main():
     # Configure lightdm to hide cursor on desktop
     install_lightdm_cursor_config()
 
+    # Configure Wayfire + Xcursor + unclutter to truly hide the cursor.
+    # The lightdm -nocursor flag above only affects Xwayland and is
+    # insufficient on Bookworm because Wayfire (the Wayland compositor)
+    # renders its own cursor. This layered approach kills the cursor at
+    # all three rendering layers.
+    install_cursor_hiding()
+
     # Set unique hostname (fixes iOS BLE pairing cache issue)
     install_unique_hostname()
+
+    # Pre-warm display screen cache so the first post-update display is
+    # instant for the customer (otherwise we'd pay 1-15s of PIL render
+    # time the next time jam-player-display transitions into a setup
+    # state). Failures here are logged but never block the update --
+    # the lazy cache path will still render on demand.
+    try:
+        prewarm_display_screens()
+    except Exception as e:
+        logger.warning(f"Display cache pre-warm raised (non-fatal): {e}")
 
     # Restart services to pick up changes
     restart_services()

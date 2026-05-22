@@ -1,0 +1,46 @@
+[Unit]
+Description=JAM Display - Wait for HDMI - Blocks lightdm until display is connected
+Documentation=https://github.com/effortlesspresence/jam-player
+
+# Run early in boot, after the kernel has had a chance to enumerate DRM
+# connectors but before any X server / Wayfire session starts.
+After=local-fs.target systemd-udevd.service
+Before=lightdm.service display-manager.service
+
+# We do NOT block on network -- HDMI detection is purely a local sysfs read.
+# That keeps this service fast in the common case (HDMI already plugged in).
+
+[Service]
+Type=oneshot
+
+# Stay "active" once finished so lightdm's `After=` ordering treats us as
+# completed (not as a restart-required dependency).
+RemainAfterExit=yes
+
+# Hard timeout: if our Python wedges or sysfs hangs, systemd kills us after
+# 2 minutes and lightdm proceeds. Python script's own timeout is 5 min so
+# this systemd timeout is the real backstop. The two are intentionally
+# different -- systemd's is the safety net, Python's is the "polite" wait.
+TimeoutStartSec=120
+
+# Run as root for /sys/class/drm reads (some platforms restrict it).
+User=root
+Group=root
+
+ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_display_wait_for_hdmi.py
+
+# Do not restart -- if we fail or timeout, the design is for lightdm to
+# start anyway via Wants= (not Requires=). Restarting would just block
+# lightdm longer.
+Restart=no
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-display-wait-for-hdmi
+
+[Install]
+WantedBy=multi-user.target
