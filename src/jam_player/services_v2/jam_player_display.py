@@ -1337,7 +1337,7 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
 
     title = "No Content Scheduled"
     draw.text(
-        (center_x, center_y - 30),
+        (center_x, center_y - 65),
         title,
         font=title_font,
         fill=JAM_ORANGE_PRIMARY,
@@ -1346,7 +1346,7 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
 
     subtitle = "Content will appear during scheduled hours."
     draw.text(
-        (center_x, center_y + 40),
+        (center_x, center_y + 60),
         subtitle,
         font=subtitle_font,
         fill=TEXT_COLOR,
@@ -2506,12 +2506,60 @@ class JamPlayerDisplayManager:
         scenes = self._load_scenes()
 
         if not scenes:
+            # _load_scenes() returned empty. Two possible causes (same
+            # distinction as in run_video_loop -- see comments at the
+            # other call site for details):
+            #   (a) Scenes exist on disk but all are scheduled off now.
+            #   (b) scenes.json is empty (customer deactivated all scenes).
+            # Show the "no scheduled content" screen ONLY for case (a).
+            # For case (b), bail to the main loop so it transitions to
+            # the proper NO_ACTIVE_SCENES mode -- otherwise the customer
+            # sees "Content will appear during scheduled hours" when
+            # they actually have no content configured at all.
+            unfiltered_check = self._load_scenes(apply_schedule_filter=False)
+            if not unfiltered_check:
+                logger.info(
+                    "No scenes on disk - exiting PLAYING_CONTENT so main "
+                    "loop can transition to NO_ACTIVE_SCENES"
+                )
+                # Clean up display so the cached NO_ACTIVE_SCENES screen
+                # can take over cleanly on the next main-loop tick.
+                kill_feh_processes()
+                if self.feh_process:
+                    try:
+                        self.feh_process.terminate()
+                    except:
+                        pass
+                    self.feh_process = None
+                return
+
             logger.warning("No scenes loaded (all may be scheduled off)")
             # Show "no scheduled content" screen instead of black
             self._show_no_scheduled_content_screen()
             # Wait for schedule to potentially change
             while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
                 time.sleep(10)
+                # Bail-out check on every tick: if scenes.json went
+                # empty while we were waiting (customer deactivated all),
+                # exit to the main loop so it can transition to
+                # NO_ACTIVE_SCENES. Without this we'd sit here showing
+                # "no content scheduled" indefinitely while the real
+                # state is "no content at all."
+                unfiltered_check = self._load_scenes(apply_schedule_filter=False)
+                if not unfiltered_check:
+                    logger.info(
+                        "Scenes removed while waiting - exiting to "
+                        "re-evaluate mode"
+                    )
+                    kill_feh_processes()
+                    if self.feh_process:
+                        try:
+                            self.feh_process.terminate()
+                        except:
+                            pass
+                        self.feh_process = None
+                    return
+
                 # Re-check if any scenes are now scheduled
                 scenes = self._load_scenes()
                 if scenes:
