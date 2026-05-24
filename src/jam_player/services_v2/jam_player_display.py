@@ -1613,7 +1613,17 @@ class MpvIpcClient:
             'mpv',
             '--vo=gpu',
             '--fullscreen',
-            '--no-audio',
+            # Audio: route to the system default sink (HDMI on a Pi
+            # plugged into a TV) at 100% volume. Customers control
+            # loudness via their TV remote -- we deliberately don't
+            # cap volume so a video can be played at the full
+            # dynamic range the TV's speakers support. PipeWire's
+            # default sink picks HDMI automatically when nothing
+            # else is plugged in; mpv `--audio-device=auto` honors
+            # that default rather than hardcoding a sink name (sink
+            # names differ between Pi 4 and Pi 5).
+            '--audio-device=auto',
+            '--volume=100',
             '--keep-open=yes',  # Don't exit when playback ends
             '--image-display-duration=inf',  # Keep images displayed until we load next file
             '--no-osc',  # Disable on-screen controller (play/pause bar)

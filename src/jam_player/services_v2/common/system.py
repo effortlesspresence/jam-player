@@ -8,6 +8,7 @@ service infrastructure (signal handlers, watchdog).
 import subprocess
 import signal
 import logging
+import time
 from pathlib import Path
 from typing import Tuple, List, Optional, Callable
 
@@ -619,34 +620,18 @@ def set_unique_hostname(device_uuid: str) -> bool:
             safe_write_text(hosts_file, '\n'.join(new_lines), 0o644)
             logger.info("Updated /etc/hosts with new hostname")
 
-        # Also try to set the BlueZ adapter Alias so iOS/Android system
-        # Bluetooth UI shows the per-device name (not the stale
-        # "comitup-307" bluetoothd inferred from hostname at its own
-        # startup). This is best-effort: bluetoothd may not be running
-        # yet during jam-first-boot, in which case jam-ble-provisioning
-        # will set the Alias via D-Bus when it later starts up.
-        try:
-            alias_result = subprocess.run(
-                ['bluetoothctl', 'system-alias', new_hostname],
-                capture_output=True,
-                text=True,
-                timeout=DEFAULT_COMMAND_TIMEOUT,
-            )
-            if alias_result.returncode == 0:
-                logger.info(f"Bluetooth adapter alias set to: {new_hostname}")
-            else:
-                # Log at debug -- expected early in boot before bluetoothd is up
-                logger.debug(
-                    f"bluetoothctl system-alias non-zero "
-                    f"(will be set later by jam-ble-provisioning): "
-                    f"{alias_result.stderr.strip() or alias_result.stdout.strip()}"
-                )
-        except FileNotFoundError:
-            logger.debug("bluetoothctl not installed -- skipping alias set")
-        except subprocess.TimeoutExpired:
-            logger.debug("bluetoothctl timed out -- will be set later by jam-ble-provisioning")
-        except Exception as e:
-            logger.debug(f"Could not set bluetooth alias via bluetoothctl: {e}")
+        # Set the BlueZ adapter Alias so iOS/Android system Bluetooth UI
+        # shows the per-device JAM hostname rather than the stale
+        # "comitup-307" that bluetoothd cached from the hostname at its
+        # own startup (the comitup deb sets the hostname to "comitup-XYZ"
+        # at install time; bluetoothd reads it once and never re-reads).
+        #
+        # This is the FIRST line of defense against a customer pairing
+        # dialog showing "comitup-307". The second line lives in
+        # jam-ble-provisioning, which sets the Alias via D-Bus when it
+        # starts. Both paths exist because either can race ahead of the
+        # other depending on systemd ordering on a given boot.
+        _set_bluetooth_alias_with_retry(new_hostname)
 
         logger.info(f"Hostname set to: {new_hostname}")
         return True
@@ -657,3 +642,85 @@ def set_unique_hostname(device_uuid: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to set hostname: {e}")
         return False
+
+
+def _set_bluetooth_alias_with_retry(new_hostname: str) -> bool:
+    """
+    Set the BlueZ adapter Alias to `new_hostname` via `bluetoothctl
+    system-alias`, retrying briefly if bluetoothd isn't immediately
+    responsive. Returns True if the alias was successfully set, False
+    otherwise.
+
+    Background:
+        bluetoothd reads the system hostname once at its own startup
+        and caches it forever as the adapter Alias. iOS / Android
+        system Bluetooth UI shows that Alias in the pairing dialog, so
+        if our hostname change happens AFTER bluetoothd's startup
+        (which is essentially always -- jam-first-boot runs early,
+        bluetoothd activates later when jam-ble-provisioning needs
+        it), the cached Alias stays at the comitup default ("comitup-
+        307"). A customer seeing "comitup-307" in their pairing dialog
+        is a product bug. `bluetoothctl system-alias` tells BlueZ the
+        new Alias without restarting bluetoothd.
+
+    Failure mode -- best-effort:
+        If bluetoothctl fails (bluetoothd not running, D-Bus warmup,
+        package missing, etc.), we log loudly and return False. The
+        authoritative fix lives in jam-ble-provisioning, which calls
+        configure_adapter -> _set_alias_with_verify with a D-Bus Set +
+        read-back verification when it starts up later in boot. Two
+        independent layers (here, and in jam-ble-provisioning) is the
+        whole point.
+
+    Why we do NOT restart bluetooth.service:
+        An earlier version of this code did `systemctl restart
+        bluetooth.service` after setting the alias as a defensive
+        measure for hypothetical downstream cachers. That turned out
+        to be catastrophically dangerous: set_unique_hostname is also
+        called from jam-update.install_unique_hostname, which runs on
+        already-provisioned devices where jam-ble-provisioning is
+        actively connected to BlueZ via D-Bus. Restarting bluetoothd
+        out from under jam-ble-provisioning invalidates its D-Bus
+        connection, advertisement registration, and GATT services --
+        leaving the device silently un-pairable until the next
+        service restart. The marginal benefit of catching hypothetical
+        cachers never justified that risk. DO NOT add the restart
+        back without first making it conditional on
+        jam-ble-provisioning NOT being active, and even then prefer
+        the verify-and-retry path in jam-ble-provisioning itself.
+    """
+    last_err = ""
+    for attempt in range(1, 4):  # 3 tries
+        try:
+            result = subprocess.run(
+                ['bluetoothctl', 'system-alias', new_hostname],
+                capture_output=True,
+                text=True,
+                timeout=DEFAULT_COMMAND_TIMEOUT,
+            )
+            if result.returncode == 0:
+                logger.info(
+                    f"Bluetooth adapter alias set to {new_hostname!r} "
+                    f"(attempt {attempt})"
+                )
+                return True
+            last_err = (
+                result.stderr.strip() or result.stdout.strip() or
+                f"exit code {result.returncode}"
+            )
+        except FileNotFoundError:
+            logger.warning("bluetoothctl not installed -- cannot set alias")
+            return False
+        except subprocess.TimeoutExpired:
+            last_err = "bluetoothctl timed out"
+        except Exception as e:
+            last_err = str(e)
+
+        if attempt < 3:
+            time.sleep(0.5)
+
+    logger.warning(
+        f"Could not set Bluetooth alias after 3 attempts "
+        f"({last_err}). jam-ble-provisioning will retry via D-Bus."
+    )
+    return False

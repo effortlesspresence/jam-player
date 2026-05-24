@@ -1713,13 +1713,82 @@ def configure_adapter(bus, adapter_path: str, alias: Optional[str] = None) -> bo
         logger.warning(f"Could not set Discoverable=True (non-fatal): {e}")
 
     if alias:
-        try:
-            adapter.Set(adapter_iface, 'Alias', dbus.String(alias))
-            logger.info(f"Adapter Alias set to: {alias}")
-        except Exception as e:
-            logger.warning(f"Could not set adapter Alias (non-fatal): {e}")
+        _set_alias_with_verify(adapter, adapter_iface, alias)
 
     return True
+
+
+# How many times to attempt setting + verifying the adapter Alias
+# before giving up. Each attempt is followed by a re-Get to confirm
+# BlueZ actually committed the change -- under load or just after
+# bluetoothd startup, Set can succeed silently while the property
+# remains at its old value. Tuned empirically: 3 attempts with a
+# 250ms backoff between them is more than enough on a healthy adapter
+# and bounded enough that we don't block service start indefinitely
+# on a broken one.
+_ALIAS_VERIFY_MAX_ATTEMPTS = 3
+_ALIAS_VERIFY_BACKOFF_SEC = 0.25
+
+
+def _set_alias_with_verify(adapter, adapter_iface: str, alias: str) -> bool:
+    """
+    Set the BlueZ adapter Alias and verify the change actually took
+    effect by reading it back. This exists because the iOS / Android
+    system Bluetooth UI shows the Alias (not the GATT LocalName), so a
+    silent Set failure here results in the customer seeing the stale
+    cached hostname ("comitup-307") in their pairing dialog -- a
+    visible product bug.
+
+    Returns True if the Alias matches `alias` after the call, False
+    otherwise. False is logged loudly so it's grep-able from the
+    journal during fleet diagnostics.
+
+    Idempotent in effect: BlueZ treats Set with the current value as
+    a no-op, so re-running this when the Alias is already correct is
+    cheap (one D-Bus round-trip for Set + one for Get).
+    """
+    for attempt in range(1, _ALIAS_VERIFY_MAX_ATTEMPTS + 1):
+        try:
+            adapter.Set(adapter_iface, 'Alias', dbus.String(alias))
+        except Exception as e:
+            logger.warning(
+                f"Adapter Alias Set attempt {attempt} raised: {e}"
+            )
+            if attempt < _ALIAS_VERIFY_MAX_ATTEMPTS:
+                time.sleep(_ALIAS_VERIFY_BACKOFF_SEC)
+            continue
+
+        try:
+            current = str(adapter.Get(adapter_iface, 'Alias'))
+        except Exception as e:
+            logger.warning(
+                f"Adapter Alias Get attempt {attempt} raised: {e}"
+            )
+            if attempt < _ALIAS_VERIFY_MAX_ATTEMPTS:
+                time.sleep(_ALIAS_VERIFY_BACKOFF_SEC)
+            continue
+
+        if current == alias:
+            logger.info(
+                f"Adapter Alias set to {alias!r} "
+                f"(verified on attempt {attempt})"
+            )
+            return True
+
+        logger.warning(
+            f"Adapter Alias mismatch after Set on attempt {attempt}: "
+            f"wanted {alias!r}, got {current!r}. Retrying."
+        )
+        if attempt < _ALIAS_VERIFY_MAX_ATTEMPTS:
+            time.sleep(_ALIAS_VERIFY_BACKOFF_SEC)
+
+    logger.error(
+        f"Failed to set adapter Alias to {alias!r} after "
+        f"{_ALIAS_VERIFY_MAX_ATTEMPTS} attempts. Customer pairing "
+        f"dialog may show the stale hostname (e.g. 'comitup-307'). "
+        f"This is a customer-visible regression -- investigate."
+    )
+    return False
 
 
 def register_advertisement(bus, adapter_path: str, advertisement):
