@@ -2536,9 +2536,16 @@ class JamPlayerDisplayManager:
                     self._current_scene_index = -1
 
             if not scenes:
-                # Check if this is "no content at all" vs "content exists but scheduled off"
-                # If no content exists, exit so mode can be re-evaluated
-                if not self._has_content():
+                # Distinguish "no content at all on disk" from "content exists
+                # but is scheduled off right now". _load_scenes() above used
+                # the day/time schedule filter; re-load WITHOUT the filter to
+                # check whether the underlying scenes.json has any scenes at
+                # all. If it doesn't, we shouldn't be in PLAYING_CONTENT --
+                # bail so the main loop transitions us to NO_ACTIVE_SCENES
+                # or DOWNLOADING_CONTENT as appropriate. If it does, we just
+                # need to wait until the schedule permits playback again.
+                unfiltered_scenes = self._load_scenes(apply_schedule_filter=False)
+                if not unfiltered_scenes:
                     logger.info("No content available - exiting to re-evaluate mode")
                     # Clean up display
                     kill_feh_processes()
