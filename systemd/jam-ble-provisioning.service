@@ -9,26 +9,37 @@ Requires=bluetooth.target
 # Wait for first boot to complete (credentials generated)
 After=jam-first-boot.service
 
-# Wait for jam-update to finish (success OR failure) before starting.
-# jam-update refreshes the venv on every boot via pip install, and if BLE
-# starts while pip is mid-write, Python imports fail with ModuleNotFoundError
-# (dbus, nacl, etc). Five failures in 300s trip StartLimitBurst and systemd
-# stops trying, leaving the JP invisible on BLE for ~20s until jam-update
-# finishes and manually retriggers us.
+# Historical note: we used to gate this service on jam-update.service
+# completion (`After=jam-update.service` plus a matching `Before=` in
+# jam-update's unit) because jam-update's pip-install step rewrites
+# /opt/jam/venv/, and if BLE imports happen mid-write they fail with
+# ModuleNotFoundError. On a fresh first boot that gate added ~70-90s
+# of customer-visible delay before the JP appeared in the mobile app's
+# BLE scan list -- jam-update's full first-install pipeline ran while
+# BLE was blocked.
 #
-# `After=` (without Requires/Wants) is safe here: on a fresh first-boot with
-# no WiFi configured, jam-update is gated on network-online.target which
-# never activates, so jam-update never starts and `After=` has no effect --
-# BLE provisioning still comes up immediately so the user can configure WiFi.
-After=jam-update.service
+# That gate has been removed in favor of letting systemd's Restart=
+# policy ride out the pip-install window: BLE starts as soon as
+# bluetooth.target + jam-first-boot are ready, attempts to import its
+# Python modules, and if pip is mid-write it crashes with ImportError.
+# Restart=on-failure + RestartSec=5 retries every 5 seconds. With
+# StartLimitBurst=30 + StartLimitIntervalSec=300 we get ~150s of retry
+# runway, more than enough to outlast any realistic pip-install. Once
+# pip is done, the next retry succeeds immediately. Net result: BLE
+# is live within ~25s on a fresh boot (vs ~90s before), with no
+# permanent-failure risk because the burst limit is comfortably above
+# the expected retry count.
 
 # NOTE: We do NOT wait for jam-boot-check.service here!
 # BLE provisioning must start ASAP on fresh devices so users can configure WiFi.
 # Boot check waits for network, but BLE is how users SET UP the network.
 
-# Restart limits (in Unit section for older systemd versions)
+# Restart limits (in Unit section for older systemd versions).
+# StartLimitBurst raised from 5 to 30 specifically to give us 150s of
+# retry runway during fresh-boot pip-install. See the historical note
+# above for context.
 StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitBurst=30
 
 [Service]
 Type=notify

@@ -10,12 +10,22 @@ Wants=network-online.target time-sync.target
 # Run after first boot completes (credentials must exist for error reporting)
 After=jam-first-boot.service
 
-# Run BEFORE other JAM services so they get the updated code
-# Note: Display is NOT included here - display should start immediately
-# without waiting for updates (existing code will work)
+# Run BEFORE other JAM services so they get the updated code.
+#
+# Display is intentionally NOT included here -- display should start
+# immediately without waiting for updates so the customer never sees
+# the bare desktop.
+#
+# BLE state manager + BLE provisioning are also intentionally NOT
+# included. They used to be, but on a fresh first boot that meant a
+# ~70-90s customer-visible delay before the JP appeared in the mobile
+# app's BLE scan list (jam-update's first-install pipeline ran while
+# BLE was held back). The pip-install race that originally motivated
+# the ordering is now handled by BLE's Restart= + StartLimitBurst=30
+# policy -- see the historical note in jam-ble-provisioning.service
+# for context. Net effect: BLE is live within ~25s on a fresh boot
+# instead of ~90s.
 Before=jam-boot-check.service
-Before=jam-ble-state-manager.service
-Before=jam-ble-provisioning.service
 Before=jam-content-manager.service
 Before=jam-heartbeat.service
 Before=jam-health-monitor.service
