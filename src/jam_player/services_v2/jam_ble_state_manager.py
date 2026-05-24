@@ -110,14 +110,29 @@ DBUS_PROPS_INTERFACE = 'org.freedesktop.DBus.Properties'
 # or CONNECTED_GLOBAL when it doesn't.
 NM_STATE_CONNECTED_LOCAL = 50
 
-# Internet connectivity check settings
-# These are tuned for restaurant environments with flaky WiFi:
-# - 6 failures required before declaring offline
-# - 10 second interval when stable = ~1 minute of no connectivity before BLE starts
-# - This prevents BLE from activating during brief WiFi drops
-# - Longer interval reduces SD card writes and log volume
-INTERNET_CHECK_FAILURES_FOR_OFFLINE = 6
-INTERNET_CHECK_INTERVAL_SECONDS = 10
+# Internet connectivity check settings.
+#
+# Tuning rationale:
+#   - 3 failures × 7 second interval = ~14-21s worst-case offline detection
+#     (the first failure starts the count; flag flips on the 3rd).
+#   - This was 6 × 10s (~60s) historically -- tuned aggressively for
+#     "restaurant flaky WiFi". The original concern was that the display
+#     would flap between PLAYING_CONTENT and AWAITING_NETWORK on brief
+#     blips. That concern doesn't apply: determine_display_mode() in
+#     jam_player_display.py checks PLAYING_CONTENT FIRST, so as long as
+#     content is on disk the display rides through any duration of WiFi
+#     loss. Offline-detection latency only affects the BLE-side
+#     `isConnected` advertisement flag and (rare) setup-flow screens.
+#   - The shorter latency means the mobile app's BLE scan list reflects
+#     the JP's true connectivity state within ~24s of a state change
+#     (offline detection + 3s advertisement refresh tick) instead of
+#     ~90s. This is the load-bearing benefit: customers interacting
+#     with the JP over BLE see fresh status.
+#   - Even with these aggressive numbers, a single transient DNS / TCP
+#     failure doesn't flip the flag -- it takes 3 consecutive failures
+#     spaced ~7s apart.
+INTERNET_CHECK_FAILURES_FOR_OFFLINE = 3
+INTERNET_CHECK_INTERVAL_SECONDS = 7
 
 # Services we control
 BLE_PROVISIONING_SERVICE = 'jam-ble-provisioning.service'

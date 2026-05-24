@@ -191,6 +191,20 @@ SAVED_NETWORKS_UUID = '12345678-1234-5678-1234-56789abcdef7'    # Read saved/kno
 # This is DIFFERENT from the hardware watchdog that reboots the whole Pi.
 WATCHDOG_INTERVAL = 30
 
+# How often to refresh the BLE advertisement's status flags + verify the
+# adapter is still powered. The status flags bit-pack things like
+# isConnected / isAnnounced / isRegistered, which the mobile app reads
+# from the advertisement payload to decide which JPs to show in its
+# scan list. The refresh interval is the worst-case staleness the mobile
+# app sees AFTER the underlying flag file (.internet_verified, etc.)
+# changes on disk -- so a small value here directly improves user-facing
+# freshness when a customer is interacting with their JP over BLE.
+#
+# Was 30s historically. The 10x increase in tick rate is cheap (each
+# tick is a D-Bus property read + a status-flag recompute, both sub-ms)
+# and the customer-facing benefit is large.
+ADVERTISEMENT_REFRESH_INTERVAL_SECONDS = 3
+
 # ============================================================================
 # D-Bus Exception Classes
 # ============================================================================
@@ -2017,7 +2031,7 @@ def main():
             logger.warning(f"Failed to refresh advertisement flags: {e}")
         return True  # Keep repeating
 
-    GLib.timeout_add_seconds(30, refresh_advertisement_flags)
+    GLib.timeout_add_seconds(ADVERTISEMENT_REFRESH_INTERVAL_SECONDS, refresh_advertisement_flags)
 
     # Setup systemd watchdog pinging
     setup_glib_watchdog(WATCHDOG_INTERVAL)
