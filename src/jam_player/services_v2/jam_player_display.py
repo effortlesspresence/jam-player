@@ -2784,7 +2784,35 @@ class JamPlayerDisplayManager:
                     new_mode = self.determine_display_mode()
 
                     if new_mode != self.current_mode:
-                        self.transition_to_mode(new_mode)
+                        # Defer state-driven transitions while jam-update is
+                        # actively running and showing its "updating" screen.
+                        # If we transitioned right now we'd kill jam-update's
+                        # feh (via transition_to_mode's kill_feh_processes)
+                        # and replace it with our own state screen, which
+                        # would (a) hide the "updating" message from the
+                        # customer mid-update and (b) potentially show a
+                        # wrong state (e.g. NO_ACTIVE_SCENES the moment
+                        # screen_id.txt is written but before content has
+                        # been fetched). Leaving self.current_mode unchanged
+                        # means the next iteration AFTER the flag clears
+                        # will see new_mode != current_mode and transition
+                        # cleanly. See the 2026-05-24 incident where the
+                        # customer saw NO_ACTIVE_SCENES while jam-update
+                        # was still mid-install.
+                        #
+                        # Stale-flag protection mirrors the feh-respawn
+                        # guard below: only honor the flag if it's both
+                        # young AND jam-update.service is actually active.
+                        if (UPDATE_IN_PROGRESS_FLAG.exists()
+                                and not _is_update_flag_stale()
+                                and _jam_update_service_is_active()):
+                            logger.info(
+                                f"Display mode change requested ({self.current_mode} -> {new_mode}) "
+                                f"but jam-update is in progress -- deferring "
+                                f"transition until update completes"
+                            )
+                        else:
+                            self.transition_to_mode(new_mode)
 
                 # If in playing mode, run the video loop (blocking until state changes)
                 if self.current_mode == DisplayMode.PLAYING_CONTENT:
