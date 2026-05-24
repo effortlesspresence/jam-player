@@ -371,6 +371,15 @@ UNIVERSAL_SETUP_URL = "https://setup.justamenu.com"
 # State checking intervals
 STATE_CHECK_INTERVAL_SEC = 5
 
+# Cache key for the "No Content Scheduled" screen rendered by
+# create_no_scheduled_content_screen(). This is NOT a DisplayMode value
+# (it's a sub-state of PLAYING_CONTENT shown when all scenes are
+# scheduled off right now), but it shares the same cache infrastructure
+# as the proper DisplayMode-keyed screens so jam-update can pre-warm it
+# alongside the others. Without caching this screen rendered inline at
+# ~10-15s per 4K transition -- see the 2026-05-24 incident.
+NO_SCHEDULED_CONTENT_CACHE_KEY = "no_scheduled_content"
+
 # Coordination flag for jam-update.service. While this file exists, the
 # display loop pauses its "feh died -> respawn it" behavior so that
 # jam-update can show the update-in-progress screen without us racing it
@@ -1285,6 +1294,77 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
     return img
 
 
+def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
+    """
+    Create the "No Content Scheduled" screen.
+
+    Distinct from create_no_active_scenes_screen: this one is shown when
+    scenes exist on disk but ALL of them are scheduled off for the
+    current day/time (day-of-week + time-of-day filter excluded all).
+    The customer-facing message reflects that distinction -- "content
+    will appear during scheduled hours" tells the customer their
+    content is still configured, just not active right now.
+
+    This used to be rendered inline at runtime by
+    JamPlayerDisplayManager._show_no_scheduled_content_screen(), which
+    took ~10-15s at 4K because of the mesh-gradient PIL work. Extracting
+    it to a top-level factory + registering it in the display cache
+    registry lets jam-update pre-warm a PNG once at install time and
+    serve it instantly on every subsequent transition.
+
+    Warm gradient theme matches the "off hours" feel.
+    """
+    if not HAS_PIL:
+        logger.error("PIL not available for creating display images")
+        return None
+
+    img = create_mesh_gradient_background(width, height, theme="warm")
+    draw = ImageDraw.Draw(img)
+
+    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
+    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
+
+    center_x = width // 2
+    center_y = height // 2
+
+    # Logo at top (scaled to display resolution)
+    logo_height = _scaled(80, height)
+    logo = load_and_scale_logo(logo_height)
+    if logo:
+        logo_x = center_x - logo.width // 2
+        logo_y = int(height * 0.15)
+        img.paste(logo, (logo_x, logo_y), logo if logo.mode == 'RGBA' else None)
+
+    title = "No Content Scheduled"
+    draw.text(
+        (center_x, center_y - 30),
+        title,
+        font=title_font,
+        fill=JAM_ORANGE_PRIMARY,
+        anchor="mm",
+    )
+
+    subtitle = "Content will appear during scheduled hours."
+    draw.text(
+        (center_x, center_y + 40),
+        subtitle,
+        font=subtitle_font,
+        fill=TEXT_COLOR,
+        anchor="mm",
+    )
+
+    version_font = get_font(_scaled(14, height), bold=False)
+    draw.text(
+        (width - 30, height - 25),
+        "v2",
+        font=version_font,
+        fill=(80, 80, 80),
+        anchor="mm",
+    )
+
+    return img
+
+
 def create_outlet_inactive_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
     """
     Create the screen for OUTLET_INACTIVE mode.
@@ -1470,12 +1550,18 @@ def build_display_render_registry() -> dict:
     # is inactive" after the device gets moved to a different outlet
     # would be worse than the ~1-2s render hit. Rendered inline by
     # transition_to_mode every time it's needed.
+    # NO_SCHEDULED_CONTENT_CACHE_KEY is NOT a DisplayMode value -- it's
+    # a sub-state shown by run_video_loop while still in PLAYING_CONTENT
+    # mode, when all scenes happen to be scheduled off right now. We
+    # register it here anyway so jam-update's pre-warm step renders it
+    # at install time, making the runtime transition instant.
     return {
         DisplayMode.AWAITING_NETWORK.value: create_unregistered_screen,
         DisplayMode.AWAITING_REGISTRATION.value: create_awaiting_registration_screen,
         DisplayMode.AWAITING_SCREEN_LINK.value: create_awaiting_screen_link_screen,
         DisplayMode.DOWNLOADING_CONTENT.value: create_waiting_for_content_screen,
         DisplayMode.NO_ACTIVE_SCENES.value: create_no_active_scenes_screen,
+        NO_SCHEDULED_CONTENT_CACHE_KEY: create_no_scheduled_content_screen,
     }
 
 
@@ -2363,72 +2449,53 @@ class JamPlayerDisplayManager:
         self._run_scene_by_scene_sync()
 
     def _show_no_scheduled_content_screen(self):
-        """Show a message when content exists but all scenes are scheduled off."""
+        """
+        Show the "No Content Scheduled" message when scenes exist but
+        all are scheduled off for the current day/time.
+
+        Uses the display cache (get_or_render_cached). jam-update
+        pre-warms a PNG at install time so this transition is
+        near-instant. If the cache miss path fires (e.g. first
+        post-update display before pre-warm has run, or commit hash
+        mismatch), falls back to display_image_with_feh's
+        ImageMagick fallback path -- but the freshly-rendered PIL
+        path is avoided here entirely. See the 2026-05-24 incident
+        where rendering inline at 4K caused ~10-15s of bare-desktop
+        before this screen appeared.
+        """
         logger.info("All scenes scheduled off - showing 'no content scheduled' message")
 
-        # Stop MPV if running
+        # Stop MPV if running -- it's holding the screen with content
+        # that's no longer scheduled to play.
         if self.mpv:
             self.mpv.stop_mpv()
             self.mpv = None
 
-        # Create and show a message with gradient background
-        if HAS_PIL:
-            # Warm mesh gradient for "off hours" theme
-            img = create_mesh_gradient_background(
-                self.screen_width, self.screen_height, theme="warm"
-            )
-            draw = ImageDraw.Draw(img)
-
-            title_font = get_font(_scaled(FONT_SIZE_TITLE, self.screen_height))
-            subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, self.screen_height), bold=False)
-
-            center_x = self.screen_width // 2
-            center_y = self.screen_height // 2
-
-            # Logo at top (scaled to display resolution)
-            logo_height = _scaled(80, self.screen_height)
-            logo = load_and_scale_logo(logo_height)
-            if logo:
-                logo_x = center_x - logo.width // 2
-                logo_y = int(self.screen_height * 0.15)
-                img.paste(logo, (logo_x, logo_y), logo if logo.mode == 'RGBA' else None)
-
-            # Title
-            title = "No Content Scheduled"
-            draw.text(
-                (center_x, center_y - 30),
-                title,
-                font=title_font,
-                fill=JAM_ORANGE_PRIMARY,
-                anchor="mm"
-            )
-
-            # Subtitle
-            subtitle = "Content will appear during scheduled hours."
-            draw.text(
-                (center_x, center_y + 40),
-                subtitle,
-                font=subtitle_font,
-                fill=TEXT_COLOR,
-                anchor="mm"
-            )
-
-            # Version indicator (scaled)
-            version_font = get_font(_scaled(14, self.screen_height), bold=False)
-            draw.text(
-                (self.screen_width - 30, self.screen_height - 25),
-                "v2",
-                font=version_font,
-                fill=(80, 80, 80),
-                anchor="mm"
-            )
-        else:
-            img = None
-
-        self.feh_process = display_image_with_feh(
-            img, "jam_display_no_schedule",
-            fallback_message="No Content Scheduled\n\nContent will appear\nduring scheduled hours."
+        device_uuid = get_device_uuid()
+        img_path = get_or_render_cached(
+            NO_SCHEDULED_CONTENT_CACHE_KEY,
+            self.screen_width,
+            self.screen_height,
+            create_no_scheduled_content_screen,
+            device_uuid,
         )
+
+        if img_path:
+            self.feh_process = display_path_with_feh(img_path)
+        else:
+            # Cache + render both failed (PIL unavailable, etc). Fall
+            # through to display_image_with_feh's ImageMagick fallback
+            # so the customer at least sees text instead of a black
+            # screen.
+            logger.warning(
+                "Render returned no path for no_scheduled_content -- "
+                "using ImageMagick fallback"
+            )
+            self.feh_process = display_image_with_feh(
+                None,
+                "jam_display_no_schedule",
+                fallback_message="No Content Scheduled\n\nContent will appear\nduring scheduled hours.",
+            )
 
     def _run_scene_by_scene_sync(self):
         """
@@ -2529,9 +2596,45 @@ class JamPlayerDisplayManager:
                         else:
                             logger.info(f"Scene metadata updated (duration, etc): cycle now {cycle_duration_ms}ms")
                 elif not new_scenes and scenes:
-                    # All scenes now scheduled off - show message screen
-                    logger.info("All scenes now scheduled off - showing waiting screen")
-                    self._show_no_scheduled_content_screen()
+                    # Filtered scene list went from non-empty to empty. Two
+                    # possible causes:
+                    #   (a) Scenes still exist on disk but ALL are scheduled
+                    #       off right now (e.g. day-of-week / time-of-day
+                    #       filter excluded everything). In this case we
+                    #       want to show our "no content scheduled" message
+                    #       and stay in PLAYING_CONTENT so the next loop
+                    #       iteration can pick scenes back up the moment
+                    #       the schedule allows.
+                    #   (b) The backend returned zero scenes for this device
+                    #       (customer deactivated everything in the web app)
+                    #       and scenes.json was overwritten to []. In this
+                    #       case the underlying state is NO_ACTIVE_SCENES;
+                    #       we should bail to the main loop and let it
+                    #       transition to that mode (which uses a
+                    #       pre-rendered cached PNG and is near-instant).
+                    #
+                    # Distinguish via _load_scenes(apply_schedule_filter=False).
+                    # Important: we must NOT call _show_no_scheduled_content_screen()
+                    # in case (b) -- that helper renders a fresh mesh-gradient
+                    # PNG at runtime, which takes ~10-15s at 4K and leaves
+                    # the customer staring at the bare desktop while it
+                    # works. The NO_ACTIVE_SCENES cached screen renders
+                    # near-instantly from disk by comparison.
+                    unfiltered_check = self._load_scenes(apply_schedule_filter=False)
+                    if not unfiltered_check:
+                        # Case (b) -- bail to main loop; the empty `scenes`
+                        # below will trigger the bail-out at line ~2538.
+                        logger.info(
+                            "All scenes removed from backend - "
+                            "exiting PLAYING_CONTENT so main loop can "
+                            "transition to NO_ACTIVE_SCENES"
+                        )
+                    else:
+                        # Case (a) -- show the schedule-off message and
+                        # stay in the loop to wait for the schedule to
+                        # allow playback again.
+                        logger.info("All scenes now scheduled off - showing waiting screen")
+                        self._show_no_scheduled_content_screen()
                     scenes = []
                     self._current_scene_index = -1
 
