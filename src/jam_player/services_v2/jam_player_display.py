@@ -859,7 +859,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     # Subtitle
     subtitle = "Content is being downloaded. This may take a few minutes."
     draw.text(
-        (center_x, center_y + 40),
+        (center_x, center_y + 70),
         subtitle,
         font=subtitle_font,
         fill=TEXT_COLOR,
@@ -868,7 +868,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
 
     # Animated-looking dots (static, but gives impression of activity)
     # Draw three dots with varying opacity to suggest animation
-    dot_y = center_y + 100
+    dot_y = center_y + 150
     dot_spacing = 30
     dot_radius = 8
     for i, alpha in enumerate([255, 180, 100]):
