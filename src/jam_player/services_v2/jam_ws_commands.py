@@ -556,21 +556,33 @@ def on_close(ws, close_status_code, close_msg):
 def on_open(ws):
     """Handle WebSocket connection open."""
     logger.info("WebSocket connection established")
-    # Seed the pong-receipt timestamp so the watchdog doesn't trip in
-    # the first PONG_TIMEOUT_SEC seconds before our first PING has had
-    # time to round-trip.
+    # NOTE: The app-level pinger thread is currently DISABLED on the
+    # device side as a safety measure. The backend `ping` Lambda's
+    # endpoint-construction bug (was using the custom domain instead
+    # of the raw execute-api endpoint -- caused AccessDeniedException
+    # on PostToConnection) has been fixed in
+    # infrastructure/services/websockets/lambdas/ping/index.ts +
+    # serverless.yml, but until that fix is deployed AND we've
+    # verified PONGs are arriving from production, re-enabling the
+    # pinger here risks ~90s reconnect churn on every device. To
+    # re-enable: confirm via CloudWatch logs that the deployed
+    # websocket-ping Lambda is no longer logging AccessDeniedException
+    # on PostToConnection, then uncomment the threading.Thread block
+    # below. The polling backstops (heartbeat 2min, outlet poller 6min,
+    # content-update flag) cover the customer-facing failure modes in
+    # the meantime.
+    #
+    # Seed the pong-receipt timestamp anyway, so if the pinger thread
+    # is ever re-enabled mid-session it has a sensible starting point.
     with _last_pong_lock:
         global _last_pong_at
         _last_pong_at = time.time()
-    # Kick off the app-level pinger thread. Bound to this specific
-    # connection -- it self-terminates when ws.sock is None or the
-    # global `running` flag goes False.
-    threading.Thread(
-        target=_run_app_level_pinger,
-        args=(ws,),
-        daemon=True,
-        name="ws-app-pinger",
-    ).start()
+    # threading.Thread(
+    #     target=_run_app_level_pinger,
+    #     args=(ws,),
+    #     daemon=True,
+    #     name="ws-app-pinger",
+    # ).start()
 
 
 def _run_app_level_pinger(ws):
