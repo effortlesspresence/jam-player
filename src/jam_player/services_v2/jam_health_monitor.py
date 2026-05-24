@@ -115,6 +115,20 @@ WATCHDOG_INTERVAL = 30
 # Bluetooth health check interval (only check every N cycles to avoid spam)
 BT_CHECK_INTERVAL_CYCLES = 2    # Check BT every 2 cycles (60 seconds)
 
+# Per-call timeout for `systemctl is-active` queries from this service.
+# Deliberately tighter than the global DEFAULT_COMMAND_TIMEOUT (10s):
+# - A healthy systemctl call returns in <50ms.
+# - When systemd is busy (e.g., processing a cascade of `systemctl restart`
+#   jobs from jam-update), each query can block for seconds.
+# - Multiplied across MONITORED_SERVICES = 7 entries, the worst case for
+#   one check_services() cycle was 7*10s = 70s, which could exceed systemd's
+#   default TimeoutStopSec=90s when combined with the bluetooth check and
+#   restart logic. That's exactly how we hit the "90-second SIGKILL +
+#   stalled restart queue" incident.
+# - 3s is plenty of headroom for a healthy `is-active` call while ensuring
+#   one stuck query can't burn through the whole stop-shutdown budget.
+HEALTH_MONITOR_QUERY_TIMEOUT_SEC = 3
+
 
 # ============================================================================
 # Failure Tracking
@@ -193,7 +207,14 @@ class HealthMonitor:
         Returns:
             Tuple of (is_running, status_string)
         """
-        status = get_service_status(service)
+        # Use the tight HEALTH_MONITOR_QUERY_TIMEOUT_SEC, not the global
+        # DEFAULT_COMMAND_TIMEOUT, so a stuck systemctl query can't burn
+        # through this service's stop-shutdown budget when systemd is
+        # busy with other jobs. See HEALTH_MONITOR_QUERY_TIMEOUT_SEC
+        # docstring for the incident this protects against.
+        status = get_service_status(
+            service, timeout=HEALTH_MONITOR_QUERY_TIMEOUT_SEC
+        )
         if status is None:
             return False, 'error'
         is_running = (status == 'active')
@@ -396,8 +417,22 @@ class HealthMonitor:
         For services in ALWAYS_RUNNING_SERVICES: attempt restart on failure.
         For other services (like jam-ble-provisioning): log and report failures
         but don't attempt restart since they're managed by other services.
+
+        Cooperative shutdown: we peek at self._running between iterations
+        so a SIGTERM that arrives mid-cycle exits the loop immediately
+        instead of forcing systemd to wait for all 7 services to be queried
+        + any restarts to complete. See the 2026-05-24 incident where a
+        non-interruptible check_services loop blocked systemd's restart
+        queue for the full 90s TimeoutStopSec.
         """
         for service in MONITORED_SERVICES:
+            if not self._running:
+                logger.info(
+                    "check_services interrupted by shutdown request -- "
+                    "exiting loop early"
+                )
+                return
+
             tracker = self._trackers[service]
 
             # Skip if we've given up on this service

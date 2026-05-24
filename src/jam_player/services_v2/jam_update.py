@@ -1881,24 +1881,53 @@ def prewarm_display_screens():
     )
 
 
+# How long jam-update will block waiting for jam-player-display.service to
+# come back up before declaring the wait a non-fatal failure and proceeding.
+# Rationale:
+#   - Display normally starts in ~5s (ExecStartPre=/bin/sleep 3 + service init).
+#   - 45s gives 9x headroom for slow / heavily-loaded Pis.
+#   - If display genuinely takes >45s to start, something is broken in
+#     lightdm/X11 and waiting longer won't help -- log the warning, let the
+#     update complete, and let systemd / on-failure restart logic handle it.
+#   - Bounding the wait protects jam-update.service from blowing its
+#     TimeoutStartSec=900 (15min) outer cap on display-specific failures.
+DISPLAY_RESTART_WAIT_TIMEOUT_SEC = 45
+
+# jam-player-display.service is the ONE service we restart synchronously
+# (blocking) rather than --no-block. Reason: it owns the customer-visible
+# screen during the post-update transition. If we --no-block it like the
+# others, the update completes "successfully" while the customer stares at
+# the Pi desktop background for however long systemd takes to actually
+# get the service active. By blocking on this single service, we guarantee
+# the customer sees jam-update's "updating" screen -> jam-player-display's
+# real content (or DOWNLOADING_CONTENT screen) with no desktop-visible gap.
+# See the 2026-05-24 incident for the ~90s gap that motivated this.
+_SYNCHRONOUS_RESTART_SERVICE = 'jam-player-display.service'
+
+
 def restart_services():
     """
     Restart JAM services to pick up new code.
 
-    Uses --no-block to avoid waiting for each service to fully start.
-    Type=notify services can take time to initialize, and we don't want
-    the update process to hang waiting for them.
+    Uses --no-block for all services EXCEPT jam-player-display.service,
+    which is restarted synchronously so the customer-visible display
+    handoff is guaranteed to happen before jam-update exits. Type=notify
+    services can take time to initialize, and we don't want the update
+    process to hang on every one of them -- but the display service is
+    special because it owns the screen.
 
     After triggering all restarts, we verify services are starting correctly.
     """
     logger.info("Restarting JAM services...")
 
-    # Services to restart - ordered by dependency (independent ones first)
+    # Services to restart - ordered by dependency (independent ones first).
+    # jam-player-display.service is in this list but gets special treatment
+    # (synchronous restart) inside the loop.
     services_to_restart = [
         'jam-content-manager.service',    # Type=simple, starts fast
         'jam-ble-provisioning.service',   # Type=notify, BLE provisioning (must restart after BLE config)
         'jam-ble-state-manager.service',  # Type=notify, but sends READY=1 early
-        'jam-player-display.service',     # Type=notify, sends READY=1 early
+        'jam-player-display.service',     # Type=notify, sends READY=1 early -- SYNCHRONOUS RESTART (see above)
         'jam-health-monitor.service',     # Type=notify, sends READY=1 early
         'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
         'jam-outlet-status-poller.service',  # Type=notify, 6-min outlet-status backstop poll (has ConditionPath)
@@ -1916,19 +1945,47 @@ def restart_services():
         # a redundant POST.
     ]
 
-    # Trigger all restarts with --no-block to avoid waiting
-    # This is more reliable than waiting for Type=notify services
-    logger.info("  Triggering service restarts (non-blocking)...")
+    logger.info("  Triggering service restarts...")
     for service in services_to_restart:
-        success, _, stderr = run_command(
-            ['systemctl', 'restart', '--no-block', service],
-            timeout=10
-        )
-        if success:
-            logger.info(f"    Triggered restart: {service}")
+        if service == _SYNCHRONOUS_RESTART_SERVICE:
+            # Synchronous (blocking) restart with explicit timeout cap.
+            # systemctl blocks until the service reports active (or fails);
+            # we wrap in our own timeout so a hung start can't pin
+            # jam-update indefinitely. If we time out, we proceed --
+            # the rest of jam-update's pipeline is unaffected, and
+            # systemd's Restart=always policy on display will keep
+            # retrying it in the background.
+            logger.info(
+                f"    Restarting (synchronous, waiting up to "
+                f"{DISPLAY_RESTART_WAIT_TIMEOUT_SEC}s): {service}"
+            )
+            success, _, stderr = run_command(
+                ['systemctl', 'restart', service],
+                timeout=DISPLAY_RESTART_WAIT_TIMEOUT_SEC,
+            )
+            if success:
+                logger.info(f"    Synchronous restart completed: {service}")
+            else:
+                logger.warning(
+                    f"    Synchronous restart of {service} did not "
+                    f"complete cleanly within {DISPLAY_RESTART_WAIT_TIMEOUT_SEC}s: "
+                    f"{(stderr or '').strip()[:200]}. Proceeding with "
+                    f"rest of update; systemd will continue retrying."
+                )
         else:
-            # Log warning but continue - the service might just not be enabled
-            logger.warning(f"    Failed to trigger restart for {service}: {stderr[:100] if stderr else 'unknown'}")
+            # Async restart: just hand it to systemd and move on.
+            success, _, stderr = run_command(
+                ['systemctl', 'restart', '--no-block', service],
+                timeout=10,
+            )
+            if success:
+                logger.info(f"    Triggered restart: {service}")
+            else:
+                # Log warning but continue - the service might just not be enabled
+                logger.warning(
+                    f"    Failed to trigger restart for {service}: "
+                    f"{stderr[:100] if stderr else 'unknown'}"
+                )
 
     # Give services a moment to start
     logger.info("  Waiting for services to initialize...")

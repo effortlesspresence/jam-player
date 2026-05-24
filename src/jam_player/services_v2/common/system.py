@@ -413,12 +413,21 @@ def manage_service(service_name: str, should_run: bool) -> bool:
         return stop_service(service_name)
 
 
-def get_service_status(service_name: str) -> Optional[str]:
+def get_service_status(
+    service_name: str,
+    timeout: float = DEFAULT_COMMAND_TIMEOUT,
+) -> Optional[str]:
     """
     Get the current status of a systemd service.
 
     Args:
         service_name: Name of the service
+        timeout: Per-call timeout in seconds for the `systemctl is-active`
+            subprocess. Defaults to DEFAULT_COMMAND_TIMEOUT. Callers that
+            poll many services in a tight loop (e.g., the health monitor)
+            should pass a smaller value -- one stuck query shouldn't be
+            able to consume their entire shutdown budget when systemd is
+            busy processing other jobs.
 
     Returns:
         Status string (active, inactive, failed, etc.) or None on error.
@@ -428,7 +437,7 @@ def get_service_status(service_name: str) -> Optional[str]:
             ['systemctl', 'is-active', service_name],
             capture_output=True,
             text=True,
-            timeout=DEFAULT_COMMAND_TIMEOUT
+            timeout=timeout,
         )
         return result.stdout.strip()
 

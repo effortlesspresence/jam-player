@@ -29,6 +29,16 @@ User=root
 Restart=on-failure
 RestartSec=10
 
+# Cap graceful-shutdown wait at 10 seconds. Default is 90s. The Python
+# code uses tight per-call subprocess timeouts (HEALTH_MONITOR_QUERY_TIMEOUT_SEC=3)
+# and breaks out of check_services on SIGTERM, so shutdown should be near-instant.
+# This timeout is the systemd-side belt to those Python-side suspenders: if any
+# future regression introduces a hung subprocess or signal-blocked Python state,
+# systemd SIGKILLs at 10s instead of pinning the restart queue for 90s. See the
+# 2026-05-24 incident where a hung check_services call caused jam-player-display
+# and jam-content-manager to wait ~90s to restart after a jam-update completion.
+TimeoutStopSec=10
+
 # systemd watchdog - service must ping every 90s
 WatchdogSec=90
 
