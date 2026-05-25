@@ -14,4 +14,4 @@
 # The 42-second sleep prevents reboot loops: a device that comes back up
 # inside the same minute boundary cron could otherwise re-match the same
 # slot and reboot again.
-{REBOOT_MINUTE} {REBOOT_HOUR} * * * sleep 42; /bin/systemctl reboot
+{REBOOT_MINUTE} {REBOOT_HOUR} * * * sleep 42; sudo systemctl reboot
