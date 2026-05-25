@@ -404,6 +404,52 @@ def run_first_boot() -> bool:
         logger.info("=" * 60)
         logger.info("JAM First Boot Service Completed Successfully")
         logger.info("=" * 60)
+
+        # Kick off display-cache pre-warm in a DETACHED background
+        # process. On fresh images jam-update will exit early ("already
+        # up to date") on the first boot, so its inline pre-warm step
+        # never runs -- which means every setup-flow screen lazy-renders
+        # on first encounter (~10-15s of customer-visible CPU per screen
+        # at 4K). Spawning pre-warm here, after we've marked first-boot
+        # complete, lets it run in parallel with jam-ble-provisioning,
+        # jam-player-display, etc. coming up, without delaying any of
+        # them.
+        #
+        # Detached via start_new_session=True so the child survives this
+        # process's exit. stdout/stderr go to /dev/null because they'd
+        # otherwise be inherited from systemd and contaminate the
+        # jam-first-boot journal entry (the pre-warm script has its own
+        # syslog identifier).
+        #
+        # Race safety: display_cache.get_or_render_cached writes via
+        # .tmp.png + atomic rename, and the read path checks for non-
+        # zero file size. jam-player-display's lazy render can race with
+        # this prewarm and both will simply produce the same final PNG --
+        # no partial-image flash possible.
+        try:
+            subprocess.Popen(
+                [
+                    '/opt/jam/venv/bin/python',
+                    '/opt/jam/services/jam_display_cache_prewarm.py',
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            logger.info(
+                "Spawned background display-cache pre-warm "
+                "(jam_display_cache_prewarm.py)"
+            )
+        except Exception as e:
+            # Pre-warm is best-effort. If we can't spawn the helper,
+            # jam-player-display will lazy-render screens on first
+            # encounter -- slower customer experience, but functional.
+            # Don't fail first-boot for this.
+            logger.warning(
+                f"Could not spawn display-cache pre-warm (non-fatal): {e}"
+            )
     else:
         logger.error("=" * 60)
         logger.error("JAM First Boot Service FAILED - will retry on next boot")

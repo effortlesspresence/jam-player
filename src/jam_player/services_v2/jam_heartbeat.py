@@ -180,7 +180,36 @@ def main():
             current_retry_delay = INITIAL_RETRY_DELAY
 
             # Update screen_id if changed
-            update_screen_id_if_changed(screen_id)
+            if update_screen_id_if_changed(screen_id):
+                # screen_id.txt was just rewritten -- nudge content-manager
+                # to fetch fresh content NOW instead of waiting for its
+                # next 180s poll cycle. Without this, customers who link
+                # a JP to a screen via the mobile app see up to ~3 minutes
+                # of "no active scenes" before content arrives, because
+                # the heartbeat-screenId path (which catches missed WS
+                # pushes) writes the file but doesn't wake content-manager.
+                # SIGUSR1 is the same signal jam-ws-commands sends from
+                # its REFRESH_CONTENT handler -- content-manager's main
+                # loop already has a handler that sets refresh_event and
+                # breaks out of its sleep within ~1 second.
+                logger.info(
+                    "Screen ID changed -- signaling jam-content-manager "
+                    "for immediate content refresh"
+                )
+                try:
+                    subprocess.run(
+                        ['systemctl', 'kill', '--signal=SIGUSR1',
+                         'jam-content-manager.service'],
+                        timeout=10,
+                        capture_output=True,
+                    )
+                except Exception as e:
+                    # Non-fatal: content-manager will pick up the new
+                    # screen_id.txt on its next poll cycle. Worst case
+                    # is the slow path that existed before this fix.
+                    logger.warning(
+                        f"Could not signal content-manager: {e}"
+                    )
 
             # Update timezone if changed
             if update_timezone_if_changed(location_timezone):

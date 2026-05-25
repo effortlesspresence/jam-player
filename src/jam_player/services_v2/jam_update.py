@@ -1872,6 +1872,26 @@ def prewarm_display_screens():
     except Exception:
         device_uuid = None
 
+    if not device_uuid:
+        # Skip pre-warm: every cached screen embeds the device UUID in
+        # its footer. Caching with a None UUID would write PNGs with
+        # NO footer that the display service would then serve from
+        # disk indefinitely without ever re-rendering them correctly.
+        # Better to skip pre-warm here (lazy-render path on the
+        # display service will produce correct PNGs on first use)
+        # than to poison the cache.
+        #
+        # In the normal jam-update flow this branch shouldn't fire:
+        # jam-first-boot generates device_uuid.txt early and
+        # jam-update runs After=jam-first-boot.service. If we hit
+        # this, something is wrong upstream.
+        logger.warning(
+            "  Skipping display cache pre-warm: no device UUID yet. "
+            "The display service will lazy-render screens on first "
+            "use. Investigate why device_uuid.txt is missing."
+        )
+        return
+
     summary = prewarm_display_cache(registry, device_uuid)
     logger.info(
         f"  Display cache pre-warm: "
