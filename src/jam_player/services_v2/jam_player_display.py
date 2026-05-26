@@ -816,7 +816,16 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         anchor="mm"
     )
 
-    return img
+    # If `qrcode` wasn't importable when this module loaded (e.g. fresh
+    # 1.0->2.0 migration where jam-player-display started before
+    # jam-update's pip-install finished), generate_qr_code() falls back
+    # to drawing a "QR Code" text placeholder. Returning cacheable=False
+    # tells display_cache to write this render to /tmp only -- NOT to
+    # /var/cache -- so the next call (after jam-update restarts this
+    # service with deps installed) re-renders with a real QR. Without
+    # this, the placeholder PNG would be cached under the current commit
+    # hash and served forever until the commit changed.
+    return img, HAS_QRCODE
 
 
 def create_waiting_for_content_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -1180,7 +1189,12 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         anchor="mm"
     )
 
-    return img
+    # See create_unregistered_screen for the rationale -- this screen
+    # also embeds a QR code, and on a first-boot/migration race where
+    # the `qrcode` Python package isn't yet installed, we fall back to
+    # a text-only "QR Code" placeholder. Flag the render uncacheable so
+    # the next call re-renders once jam-update has installed deps.
+    return img, HAS_QRCODE
 
 
 def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:

@@ -48,9 +48,20 @@ DISPLAY_CACHE_VERSION_FILE = DISPLAY_CACHE_DIR / '.cache_version'
 
 
 # Type alias for a render function: takes (width, height, device_uuid)
-# and returns a PIL.Image. Pre-warm code accepts any object that
-# implements the .save() method PIL.Image provides; we don't import PIL
-# here to keep this module lightweight and PIL-optional.
+# and returns one of:
+#   - a PIL.Image (treated as cacheable -- current/default behavior)
+#   - a (PIL.Image, cacheable: bool) tuple, where cacheable=False means
+#     "this is a degraded fallback render and must NOT be persisted to
+#     /var/cache." Used by render functions whose appearance depends on
+#     an optional Python dep (e.g. `qrcode`) that may not be installed
+#     yet on first boot: rather than caching a placeholder PNG that the
+#     post-install display would happily serve forever, the render
+#     declares itself uncacheable so the next call (after deps land)
+#     re-renders fresh.
+#
+# Pre-warm code accepts any object that implements the .save() method
+# PIL.Image provides; we don't import PIL here to keep this module
+# lightweight and PIL-optional.
 RenderFn = Callable[[int, int, Optional[str]], object]
 
 # Type alias for the registry. Keys are stringified DisplayMode values
@@ -79,6 +90,23 @@ def _read_installed_commit_short() -> Optional[str]:
 def _cache_path(mode_value: str, width: int, height: int, commit_short: str) -> Path:
     """Compute the deterministic cache filename for a given screen render."""
     return DISPLAY_CACHE_DIR / f"{mode_value}_{width}x{height}_{commit_short}.png"
+
+
+def _unwrap_render_result(result):
+    """
+    Normalize a render-function return value to (image, cacheable).
+
+    Accepts either:
+      - a plain PIL.Image (treated as cacheable -- default for the vast
+        majority of renders that have no optional-dep fallback)
+      - a (PIL.Image, bool) tuple
+
+    Returns (image, cacheable). image may be None if the renderer
+    failed.
+    """
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0], bool(result[1])
+    return result, True
 
 
 def get_or_render_cached(
@@ -123,12 +151,20 @@ def get_or_render_cached(
             return str(cached)
 
     # Cache miss: render
-    img = render_fn(width, height, device_uuid)
+    result = render_fn(width, height, device_uuid)
+    img, cacheable = _unwrap_render_result(result)
     if img is None:
         return None
 
     # Try to save to cache. Failure is non-fatal -- fall through to /tmp.
-    if cache_enabled:
+    # Renders that flagged themselves as non-cacheable (e.g. a setup-screen
+    # render that fell back to a "QR Code" text placeholder because the
+    # `qrcode` package wasn't installed yet) deliberately skip the cache
+    # write so the NEXT call -- once deps are installed -- gets a fresh
+    # cache miss and renders a proper image. Without this, the broken
+    # placeholder PNG would be served for the rest of this commit's
+    # lifetime on the device.
+    if cache_enabled and cacheable:
         try:
             DISPLAY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cached = _cache_path(mode_value, width, height, commit_short)
@@ -148,6 +184,12 @@ def get_or_render_cached(
                 f"Cache write failed for {mode_value} ({width}x{height}): {e}. "
                 f"Falling back to /tmp (uncached)."
             )
+    elif cache_enabled and not cacheable:
+        logger.warning(
+            f"Render for {mode_value} ({width}x{height}) flagged uncacheable "
+            f"(missing optional dependency). Writing to /tmp only -- next "
+            f"call will re-render in case deps have since been installed."
+        )
 
     # Fallback: write to /tmp so the customer still sees content even
     # when /var/cache is broken.
@@ -267,10 +309,18 @@ def prewarm_display_cache(
             functions handle it.
 
     Returns:
-        dict with counts: {'rendered': int, 'skipped': int, 'failed': int}
-        'skipped' = cache hit (no work needed). Always returns.
+        dict with counts: {'rendered': int, 'skipped': int,
+        'skipped_uncacheable': int, 'failed': int}.
+            - 'rendered' = freshly rendered and written to /var/cache
+            - 'skipped' = cache hit (no work needed)
+            - 'skipped_uncacheable' = render produced a degraded fallback
+              (e.g. qrcode dep missing) and asked not to be cached; we
+              honor that here too so prewarm doesn't write a placeholder
+              to /var/cache that the runtime would then serve.
+            - 'failed' = render returned None or raised.
+        Always returns.
     """
-    summary = {'rendered': 0, 'skipped': 0, 'failed': 0}
+    summary = {'rendered': 0, 'skipped': 0, 'skipped_uncacheable': 0, 'failed': 0}
 
     commit_short = _read_installed_commit_short()
     if commit_short is None:
@@ -284,13 +334,38 @@ def prewarm_display_cache(
                 summary['skipped'] += 1
                 continue
             try:
-                path = get_or_render_cached(
-                    mode_value, width, height, render_fn, device_uuid
-                )
-                if path is not None and Path(path).exists():
-                    summary['rendered'] += 1
-                else:
+                # Invoke the render function directly here (rather than
+                # delegating to get_or_render_cached) so we can inspect
+                # the cacheable flag and skip the write for degraded
+                # renders. Going through get_or_render_cached would
+                # write the degraded image to /tmp -- harmless during
+                # prewarm but pointless work.
+                result = render_fn(width, height, device_uuid)
+                img, cacheable = _unwrap_render_result(result)
+                if img is None:
                     summary['failed'] += 1
+                    continue
+                if not cacheable:
+                    logger.info(
+                        f"Pre-warm skipping {mode_value} at {width}x{height}: "
+                        f"render flagged uncacheable (missing optional dep). "
+                        f"Runtime will lazy-render once deps are installed."
+                    )
+                    summary['skipped_uncacheable'] += 1
+                    continue
+
+                # Cacheable render -- write to /var/cache via the same
+                # atomic-write path get_or_render_cached uses.
+                DISPLAY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp_path = cached.with_suffix('.tmp.png')
+                with open(tmp_path, 'wb') as f:
+                    img.save(f, 'PNG', optimize=False, compress_level=1)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp_path, 0o644)
+                tmp_path.rename(cached)
+                logger.info(f"Cached rendered screen at {cached}")
+                summary['rendered'] += 1
             except Exception as e:
                 logger.warning(
                     f"Pre-warm failed for {mode_value} at {width}x{height}: {e}"
@@ -300,6 +375,7 @@ def prewarm_display_cache(
     logger.info(
         f"Display cache pre-warm complete: "
         f"rendered={summary['rendered']}, skipped={summary['skipped']}, "
+        f"skipped_uncacheable={summary['skipped_uncacheable']}, "
         f"failed={summary['failed']}"
     )
     return summary
