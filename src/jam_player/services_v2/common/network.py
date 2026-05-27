@@ -422,8 +422,26 @@ def _connect_wifi_secure(ssid: str, password: str) -> subprocess.CompletedProces
     except Exception as e:
         logger.warning(f"Error cleaning up existing connections: {e}")
 
-    # Create a NetworkManager keyfile (connection profile) with the credentials
-    # This avoids passing the password as a command-line argument
+    # Create a NetworkManager keyfile (connection profile) with the
+    # credentials. This avoids passing the password as a command-line
+    # argument.
+    #
+    # For OPEN networks (no password) the [wifi-security] section must
+    # be OMITTED entirely. Writing `key-mgmt=wpa-psk` with an empty psk
+    # makes NetworkManager attempt WPA-PSK against an open AP, which
+    # fails with "Secrets were required, but not provided" before any
+    # association is attempted. This is exactly what produced the
+    # "mobile app says 'Invalid password' for a network that has no
+    # password" symptom on fielded JPs prior to this fix.
+    if password:
+        security_section = (
+            "\n[wifi-security]\n"
+            "key-mgmt=wpa-psk\n"
+            f"psk={password}\n"
+        )
+    else:
+        security_section = ""
+
     keyfile_content = f"""[connection]
 id={conn_name}
 type=wifi
@@ -432,11 +450,7 @@ autoconnect=true
 [wifi]
 ssid={ssid}
 mode=infrastructure
-
-[wifi-security]
-key-mgmt=wpa-psk
-psk={password}
-
+{security_section}
 [ipv4]
 method=auto
 
