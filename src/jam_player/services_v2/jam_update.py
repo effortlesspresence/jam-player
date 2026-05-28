@@ -2156,6 +2156,44 @@ def main():
     if not install_dependencies():
         fail_update("Failed to install dependencies", should_rollback=has_backup)
 
+    # Capture whether the lightdm `Restart=no` drop-in is about to be
+    # newly installed or have its content changed.  If yes, we'll need to
+    # cycle lightdm after install_systemd_units() runs so the new policy
+    # actually applies to any in-progress crash storm (see comment block
+    # at the cycle site for the full rationale).  If no (drop-in already
+    # on disk with matching content), lightdm is left untouched -- the
+    # policy is already in effect from a prior boot or update, and
+    # cycling it would cause a needless screen flicker on every nightly
+    # cron-reboot's jam-update run.
+    lightdm_no_restart_src = SYSTEMD_SRC / 'lightdm.service.d' / 'jam-no-restart.conf'
+    lightdm_no_restart_dest = Path('/etc/systemd/system/lightdm.service.d/jam-no-restart.conf')
+    lightdm_dropin_changed = False
+    try:
+        if lightdm_no_restart_src.exists():
+            src_bytes = lightdm_no_restart_src.read_bytes()
+            if not lightdm_no_restart_dest.exists():
+                lightdm_dropin_changed = True
+                logger.info(
+                    "lightdm jam-no-restart drop-in is not yet on disk -- "
+                    "will install it and cycle lightdm after services restart."
+                )
+            elif lightdm_no_restart_dest.read_bytes() != src_bytes:
+                lightdm_dropin_changed = True
+                logger.info(
+                    "lightdm jam-no-restart drop-in content changed -- "
+                    "will reinstall and cycle lightdm after services restart."
+                )
+    except Exception as e:
+        # Conservative: if we can't compare, don't cycle.  Worst case the
+        # new drop-in only takes effect at the next boot (cron-reboot at
+        # 1:45 AM local) instead of right now.  Better than introducing a
+        # regression that flickers customer screens on every nightly update.
+        logger.warning(
+            f"Could not compare lightdm drop-in for change detection "
+            f"(non-fatal, will not cycle lightdm): {e}"
+        )
+        lightdm_dropin_changed = False
+
     # Install systemd units
     if not install_systemd_units():
         fail_update("Failed to install systemd units", should_rollback=has_backup)
@@ -2248,7 +2286,6 @@ def main():
     # See common comment in jam_display_hotplug_monitor.py /
     # jam_display_wait_for_hdmi.py for full design context.
     try:
-        from pathlib import Path
         hdmi_connectors = list(Path("/sys/class/drm").glob("card*-HDMI-A-*"))
         any_connected = False
         for c in hdmi_connectors:
@@ -2275,6 +2312,70 @@ def main():
 
     # Restart services to pick up changes
     restart_services()
+
+    # Forcibly terminate any in-progress lightdm restart storm.  Only
+    # runs on updates that newly install or change the jam-no-restart
+    # drop-in (see change-detection block above install_systemd_units);
+    # subsequent jam-update runs leave lightdm alone.  Why this is
+    # necessary on the install path:
+    #
+    # The fielded lightdm has a latent GLib NULL-class-pointer crash
+    # that fires deterministically when the autologin session opens then
+    # closes (which it always does on a JP). The stock systemd unit ships
+    # with `Restart=always`, so systemd auto-restarts lightdm every ~3
+    # seconds in an infinite loop. Each restart tears down + reinits
+    # the X server, which manifests as the customer-visible "content
+    # flashing between display and black every second" symptom -- mpv
+    # holds the DRM/KMS handle directly and keeps rendering, but the
+    # X server keeps disappearing from under it.
+    #
+    # The drop-in we just installed (`lightdm.service.d/
+    # jam-no-restart.conf`) sets Restart=no, breaking the loop -- but
+    # the drop-in only takes effect on the NEXT lightdm exit, not the
+    # current crash storm that's been running since this boot started.
+    # Without explicit intervention here, fielded JPs would stay in the
+    # storm until the next reboot (24h+ later if no manual intervention).
+    #
+    # `systemctl stop lightdm` forcibly terminates the storm. The
+    # subsequent `systemctl start` runs lightdm one final time with the
+    # new Restart=no policy in effect: lightdm either succeeds (no
+    # crash, display works perfectly) or crashes once and stays
+    # `failed` (mpv's existing DRM surface keeps rendering customer
+    # content). Either way, no more cycling.
+    #
+    # Brief screen flicker during these two systemctl calls is
+    # acceptable -- jam-update is already a customer-visible event
+    # (we show an "Updating..." screen) and a few seconds of flicker
+    # at the tail end of it is preferable to letting the storm
+    # continue past the update.
+    #
+    # Best-effort: if either subprocess fails for any reason, log and
+    # continue. Worst case is we don't terminate the storm and the JP
+    # is no worse off than if jam-update hadn't run at all.
+    if lightdm_dropin_changed:
+        logger.info("Stopping lightdm to terminate any in-progress restart storm...")
+        try:
+            run_command(["systemctl", "stop", "lightdm.service"], timeout=30)
+        except Exception as e:
+            logger.warning(f"systemctl stop lightdm raised (non-fatal): {e}")
+        # Brief pause so systemd fully processes the stop before we
+        # request a start. Without this we've seen systemctl warn about
+        # job conflicts.
+        time.sleep(1.0)
+        logger.info("Starting lightdm fresh with new Restart=no drop-in active...")
+        try:
+            run_command(["systemctl", "start", "lightdm.service"], timeout=30)
+        except Exception as e:
+            # If lightdm fails to start cleanly that's fine -- the new
+            # Restart=no means systemd won't loop, and mpv's existing
+            # DRM surface keeps rendering customer content.
+            logger.warning(f"systemctl start lightdm raised (non-fatal): {e}")
+    else:
+        logger.info(
+            "lightdm jam-no-restart drop-in unchanged -- leaving lightdm "
+            "alone (no cycle needed, drop-in already in effect from a "
+            "prior boot/update)."
+        )
 
     # Update successful - clean up backup
     if has_backup:
