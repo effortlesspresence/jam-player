@@ -55,12 +55,31 @@ POLL_INTERVAL_SEC = 1.0
 # disconnect/reconnect cycle is fully handled before we consider another.
 MIN_RESTART_INTERVAL_SEC = 150.0
 
+# How often to force a lightdm restart while in "boot recovery" mode --
+# i.e. the system came up headless (jam-display-wait-for-hdmi timed
+# out, leaving the HDMI_MISSING_AT_BOOT_FLAG behind) and no HDMI has
+# been detected since. Each lightdm restart forces the kernel to
+# re-enumerate DRM connectors; on Pi 5 boots that found "card0 with
+# Cannot find any crtc or sizes" this is the only known way to get the
+# kernel to notice that a TV has come on after boot. 5 minutes is the
+# tradeoff: long enough that we're not slamming the display stack if
+# the customer truly has no TV attached, short enough that powering
+# the TV on in the morning gets the display back within a few minutes.
+# Floored by MIN_RESTART_INTERVAL_SEC anyway.
+RECOVERY_RESTART_INTERVAL_SEC = 300.0
+
 # systemd watchdog ping interval. Service unit sets WatchdogSec=30 so we
 # ping every 10s for headroom.
 WATCHDOG_PING_INTERVAL_SEC = 10.0
 
 # DRM connector glob.
 HDMI_GLOB = "card*-HDMI-A-*"
+
+# Runtime flag set by jam-display-wait-for-hdmi when it gives up after
+# 5 minutes without seeing any HDMI connector. Presence at our startup
+# tells us this boot came up "headless" and the normal transition-watch
+# path is insufficient -- see RECOVERY_RESTART_INTERVAL_SEC docstring.
+HDMI_MISSING_AT_BOOT_FLAG = Path("/run/jam-hdmi-was-missing-at-boot")
 
 
 def _hdmi_connector_states() -> dict[str, bool]:
@@ -78,6 +97,21 @@ def _hdmi_connector_states() -> dict[str, bool]:
             continue
         states[connector_dir.name] = status == "connected"
     return states
+
+
+def _clear_recovery_flag() -> None:
+    """
+    Best-effort removal of HDMI_MISSING_AT_BOOT_FLAG.
+
+    Called when we've successfully detected HDMI after coming up in
+    recovery mode -- the flag served its purpose and shouldn't linger
+    across hotplug-monitor restarts. Errors are logged but never raised:
+    /run/ is tmpfs so the flag dies on reboot anyway.
+    """
+    try:
+        HDMI_MISSING_AT_BOOT_FLAG.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not remove {HDMI_MISSING_AT_BOOT_FLAG}: {e}")
 
 
 def _restart_lightdm() -> bool:
@@ -124,13 +158,47 @@ def main() -> int:
     # Tell systemd we're ready.
     sd_notifier.notify("READY=1")
 
+    # Detect "boot recovery" mode. jam-display-wait-for-hdmi writes the
+    # flag below when it gives up after 5 minutes of polling without
+    # seeing any HDMI connector. While in this mode, the normal
+    # transition-detection path is insufficient because the kernel may
+    # have registered the GPU without usable connectors -- no future
+    # connector "appears" for us to react to. We periodically force a
+    # lightdm restart instead, which causes DRM re-enumeration and
+    # picks up the TV once it comes on.
+    recovery_mode = HDMI_MISSING_AT_BOOT_FLAG.exists()
+    if recovery_mode:
+        logger.warning(
+            f"Detected {HDMI_MISSING_AT_BOOT_FLAG} -- entering recovery "
+            f"mode. Will force a lightdm restart every "
+            f"{RECOVERY_RESTART_INTERVAL_SEC:.0f}s until HDMI is "
+            f"detected."
+        )
+
     # Initial snapshot. Whatever state HDMI is in *right now* is treated
     # as baseline -- we don't fire a restart for the existing state, only
     # for transitions away from it.
     prev_states = _hdmi_connector_states()
     logger.info(f"Initial HDMI connector states: {prev_states}")
 
-    last_restart_at = 0.0
+    # If we booted with HDMI present, recovery mode is unnecessary even
+    # if the flag is somehow stale -- clear it so subsequent service
+    # restarts don't re-enter recovery for no reason.
+    if recovery_mode and any(prev_states.values()):
+        logger.info(
+            "HDMI already connected at startup despite recovery flag -- "
+            "skipping recovery mode and clearing the flag."
+        )
+        _clear_recovery_flag()
+        recovery_mode = False
+
+    # If we're entering recovery mode, anchor last_restart_at to NOW so
+    # the first forced lightdm restart fires exactly
+    # RECOVERY_RESTART_INTERVAL_SEC seconds later -- not immediately.
+    # In normal mode we start at 0.0 so a legitimate reconnect within
+    # the first MIN_RESTART_INTERVAL_SEC of the monitor's life isn't
+    # blocked.
+    last_restart_at = time.monotonic() if recovery_mode else 0.0
     last_watchdog_at = time.monotonic()
 
     while True:
@@ -180,6 +248,33 @@ def main() -> int:
                     f"HDMI disconnect detected on: {', '.join(disconnected)} "
                     f"(no action -- waiting for reconnect)"
                 )
+
+            # Recovery-mode tick: if we came up headless and STILL see no
+            # HDMI after RECOVERY_RESTART_INTERVAL_SEC, force a lightdm
+            # restart. Don't bother re-checking 'reconnected' above --
+            # if a real reconnect just fired we already restarted and
+            # last_restart_at was updated, so the rate-limit check here
+            # will skip and prev_states will record the True states for
+            # next iteration. Once any HDMI shows True we exit recovery
+            # mode entirely.
+            if recovery_mode:
+                if any(current_states.values()):
+                    logger.info(
+                        f"HDMI now detected ({current_states}) -- exiting "
+                        f"recovery mode."
+                    )
+                    _clear_recovery_flag()
+                    recovery_mode = False
+                else:
+                    since_last = now - last_restart_at
+                    if since_last >= RECOVERY_RESTART_INTERVAL_SEC:
+                        logger.warning(
+                            f"Recovery mode: still no HDMI after "
+                            f"{since_last:.0f}s. Forcing lightdm restart "
+                            f"to trigger DRM re-enumeration."
+                        )
+                        if _restart_lightdm():
+                            last_restart_at = now
 
             prev_states = current_states
 

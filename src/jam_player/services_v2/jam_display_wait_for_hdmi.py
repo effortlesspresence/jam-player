@@ -58,6 +58,21 @@ MAX_WAIT_SEC = 300
 # HDMI). We treat any connected HDMI-A-* port as success.
 HDMI_GLOB = "card*-HDMI-A-*"
 
+# Runtime flag file written when wait-for-hdmi gives up without seeing
+# any HDMI connector. Read by jam-display-hotplug-monitor at startup --
+# its presence indicates the system booted "headless" (no display
+# present at boot), which is a known failure mode where the kernel may
+# register the GPU as card0 with no real connectors and subsequent
+# hotplug events never fire as the connectors don't physically exist
+# from the kernel's point of view. The hotplug-monitor uses this flag
+# to enter a recovery mode that periodically forces a lightdm restart
+# (which re-enumerates DRM) until a real display is finally detected.
+#
+# Lives in /run/ so it's wiped on reboot -- a fresh boot with a TV
+# attached should not inherit recovery mode from a previous headless
+# boot. Matches the existing convention from /run/jam-update-in-progress.
+HDMI_MISSING_AT_BOOT_FLAG = Path("/run/jam-hdmi-was-missing-at-boot")
+
 
 def _list_hdmi_connectors() -> list[Path]:
     """Return all DRM connector directories that look like HDMI ports."""
@@ -119,6 +134,27 @@ def wait_for_hdmi() -> bool:
         f"start anyway -- display won't render content until HDMI is plugged in "
         f"and the hotplug monitor restarts lightdm."
     )
+    # Mark the system as "booted headless" so jam-display-hotplug-monitor
+    # enters its recovery mode. Without this flag the monitor would just
+    # set its baseline to {all False} and wait for a False->True
+    # transition that may never come if the kernel registered the GPU
+    # without a usable connector (the "card0 with no crtc or sizes"
+    # state seen on Pi 5 reboots where the TV was off). Best-effort write
+    # -- if /run is unwritable we log and continue, since the monitor
+    # gracefully falls back to its normal transition-detection path when
+    # the flag is absent.
+    try:
+        HDMI_MISSING_AT_BOOT_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        HDMI_MISSING_AT_BOOT_FLAG.touch()
+        logger.info(
+            f"Created {HDMI_MISSING_AT_BOOT_FLAG} -- "
+            f"hotplug-monitor will enter recovery mode."
+        )
+    except OSError as e:
+        logger.error(
+            f"Could not write {HDMI_MISSING_AT_BOOT_FLAG}: {e}. "
+            f"Hotplug recovery mode will NOT activate on this boot."
+        )
     return False
 
 
