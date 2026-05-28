@@ -55,6 +55,39 @@ POLL_INTERVAL_SEC = 1.0
 # disconnect/reconnect cycle is fully handled before we consider another.
 MIN_RESTART_INTERVAL_SEC = 150.0
 
+# How long a disconnect must persist before the eventual reconnect is
+# treated as a "real" event that warrants a lightdm restart. Brief sub-
+# second EDID renegotiations (TV CEC handshakes, HDMI mode switches,
+# the brief flicker many TVs do when power-saving toggles, etc.) all
+# manifest as fast disconnect->reconnect cycles in /sys/class/drm.
+# Restarting lightdm for those is both unnecessary AND dangerous --
+# fielded JPs running ae53eae have a latent lightdm/Wayfire crash bug
+# (g_signal_emit_valist assertion on a NULL class pointer) that fires
+# probabilistically on lightdm restart and permanently wedges the
+# display stack until manual reboot. Customer-visible failure today is
+# that 4-6 EDID flaps per day eventually hit that crash and the JP
+# stays dead overnight.
+#
+# 15 seconds is generous enough to absorb any plausible CEC/EDID
+# renegotiation (which complete in <1s in practice) while still
+# treating an "I unplugged the cable to move it" disconnect as real.
+# A customer powering their TV off for the night will be disconnected
+# for hours, far past this threshold.
+DISCONNECT_DEBOUNCE_SEC = 15.0
+
+# When lightdm restart fails (systemd reports failure, or "Start
+# request repeated too quickly"), the display stack is in a wedged
+# state that further restarts will not fix and may make worse. Stop
+# trying to restart it for this long.
+#
+# 5 minutes is the trade-off: well past systemd's own ~10s restart
+# counter window (so a fresh attempt won't get rejected as
+# "Start request repeated too quickly"), short enough that a customer
+# whose TV finally turns on doesn't wait too long to see content, and
+# long enough to break out of any retry-storm dynamic between us and
+# lightdm.
+LIGHTDM_FAILURE_BACKOFF_SEC = 300.0
+
 # How often to force a lightdm restart while in "boot recovery" mode --
 # i.e. the system came up headless (jam-display-wait-for-hdmi timed
 # out, leaving the HDMI_MISSING_AT_BOOT_FLAG behind) and no HDMI has
@@ -116,11 +149,23 @@ def _clear_recovery_flag() -> None:
 
 def _restart_lightdm() -> bool:
     """
-    Restart lightdm.service via systemctl. Returns True on success.
+    Restart lightdm.service via systemctl. Returns True iff lightdm is
+    actually running afterward (not just "systemctl accepted the
+    command").
 
     Intentionally synchronous -- we want to know whether the restart
     completed before resuming polling, since racing another restart
     would be bad.
+
+    Why the post-restart `is-active` check: `systemctl restart` exits
+    with rc=0 even when the unit immediately crashes after start. On
+    fielded JPs we've seen lightdm.service crash 5 times in <1 second
+    (g_signal_emit_valist assertion on a NULL class pointer), exhaust
+    systemd's restart counter, and end up "failed" -- but the original
+    `systemctl restart` call returned 0 because it only verifies the
+    job was enqueued, not that the unit reached active. Checking
+    is-active after the call lets the caller know to enter backoff
+    mode rather than blindly trying again.
     """
     logger.info("Restarting lightdm.service to pick up new HDMI EDID...")
     try:
@@ -130,19 +175,43 @@ def _restart_lightdm() -> bool:
             capture_output=True,
             text=True,
         )
-        if result.returncode == 0:
-            logger.info("lightdm.service restarted successfully")
-            return True
-        logger.error(
-            f"lightdm restart failed (rc={result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
-        return False
+        if result.returncode != 0:
+            logger.error(
+                f"lightdm restart returned rc={result.returncode}: "
+                f"{result.stderr.strip()}"
+            )
+            return False
     except subprocess.TimeoutExpired:
         logger.error("lightdm restart timed out after 60s")
         return False
     except Exception as e:
         logger.error(f"lightdm restart raised: {e}")
+        return False
+
+    # systemctl returned 0; verify lightdm is actually running. A small
+    # wait gives systemd time to start the unit and observe any
+    # immediate crashes.
+    time.sleep(2.0)
+    try:
+        check = subprocess.run(
+            ["systemctl", "is-active", "lightdm.service"],
+            timeout=10,
+            capture_output=True,
+            text=True,
+        )
+        state = check.stdout.strip()
+        if state == "active":
+            logger.info("lightdm.service restarted successfully")
+            return True
+        logger.error(
+            f"lightdm.service post-restart state is '{state}' (not 'active'). "
+            f"Likely hit the systemd 'Start request repeated too quickly' "
+            f"or a lightdm/Wayfire crash. Caller should enter backoff."
+        )
+        return False
+    except Exception as e:
+        logger.error(f"Could not verify lightdm state post-restart: {e}")
+        # Pessimistic: treat unknown state as failure so caller backs off.
         return False
 
 
@@ -152,7 +221,9 @@ def main() -> int:
     logger.info("=" * 60)
     logger.info(
         f"Poll interval: {POLL_INTERVAL_SEC}s, "
-        f"min restart interval: {MIN_RESTART_INTERVAL_SEC}s"
+        f"disconnect debounce: {DISCONNECT_DEBOUNCE_SEC}s, "
+        f"min restart interval: {MIN_RESTART_INTERVAL_SEC}s, "
+        f"lightdm failure backoff: {LIGHTDM_FAILURE_BACKOFF_SEC}s"
     )
 
     # Tell systemd we're ready.
@@ -192,6 +263,16 @@ def main() -> int:
         _clear_recovery_flag()
         recovery_mode = False
 
+    # Per-connector "when did this transition to disconnected?" tracking
+    # for debouncing. None means the connector is currently connected.
+    # We only fire a lightdm restart on reconnect if the connector spent
+    # at least DISCONNECT_DEBOUNCE_SEC in the disconnected state -- this
+    # filters out sub-second EDID renegotiations that don't warrant a
+    # display-stack restart and would otherwise probabilistically
+    # trigger the lightdm/Wayfire crash bug. See module-level docstring
+    # on DISCONNECT_DEBOUNCE_SEC.
+    disconnected_at: dict[str, float] = {}
+
     # If we're entering recovery mode, anchor last_restart_at to NOW so
     # the first forced lightdm restart fires exactly
     # RECOVERY_RESTART_INTERVAL_SEC seconds later -- not immediately.
@@ -199,7 +280,22 @@ def main() -> int:
     # the first MIN_RESTART_INTERVAL_SEC of the monitor's life isn't
     # blocked.
     last_restart_at = time.monotonic() if recovery_mode else 0.0
+
+    # When the most recent _restart_lightdm() returned False. 0.0 means
+    # no recent failure. While we're inside LIGHTDM_FAILURE_BACKOFF_SEC
+    # of this timestamp, we skip ALL restart attempts (debounced
+    # reconnects AND recovery-mode forced restarts). lightdm is wedged
+    # and further restarts will likely just retrigger the same crash.
+    last_restart_failed_at = 0.0
+
     last_watchdog_at = time.monotonic()
+
+    def in_lightdm_backoff(now: float) -> tuple[bool, float]:
+        """Return (in_backoff, seconds_remaining)."""
+        if last_restart_failed_at == 0.0:
+            return False, 0.0
+        remaining = LIGHTDM_FAILURE_BACKOFF_SEC - (now - last_restart_failed_at)
+        return remaining > 0, max(0.0, remaining)
 
     while True:
         try:
@@ -212,17 +308,67 @@ def main() -> int:
 
             current_states = _hdmi_connector_states()
 
-            # Detect any disconnected -> connected transition.
-            reconnected = [
-                name
-                for name, connected in current_states.items()
-                if connected and not prev_states.get(name, False)
-            ]
+            # Track disconnects: stamp the moment a connector transitions
+            # to disconnected, so we can measure how long it stayed
+            # disconnected when it later reconnects.
+            for name, prev_connected in prev_states.items():
+                now_connected = current_states.get(name, False)
+                if prev_connected and not now_connected:
+                    # Just transitioned to disconnected -- start the
+                    # debounce timer.
+                    disconnected_at[name] = now
+                    logger.info(
+                        f"HDMI disconnect detected on: {name} "
+                        f"(starting {DISCONNECT_DEBOUNCE_SEC:.0f}s debounce)"
+                    )
 
-            if reconnected:
-                logger.info(
-                    f"HDMI reconnect detected on: {', '.join(reconnected)}"
-                )
+            # Detect any disconnected -> connected transition AND check
+            # the debounce.
+            for name, now_connected in current_states.items():
+                prev_connected = prev_states.get(name, False)
+                if not (now_connected and not prev_connected):
+                    continue  # Not a reconnect transition.
+
+                # This connector just reconnected. How long was it down?
+                down_since = disconnected_at.pop(name, None)
+                if down_since is None:
+                    # We never observed the disconnect (probably because
+                    # this is the connector's FIRST appearance, e.g. it
+                    # came online after boot). Treat as real -- it's a
+                    # legitimate "HDMI came up" event we want to react to.
+                    logger.info(
+                        f"HDMI reconnect detected on: {name} "
+                        f"(no prior disconnect timestamp -- treating as real)"
+                    )
+                    down_duration = float("inf")
+                else:
+                    down_duration = now - down_since
+                    logger.info(
+                        f"HDMI reconnect detected on: {name} "
+                        f"(was disconnected for {down_duration:.1f}s)"
+                    )
+
+                # Debounce: skip if the disconnect was too brief.
+                if down_duration < DISCONNECT_DEBOUNCE_SEC:
+                    logger.info(
+                        f"Ignoring brief disconnect/reconnect on {name} "
+                        f"({down_duration:.1f}s < {DISCONNECT_DEBOUNCE_SEC:.0f}s "
+                        f"debounce). No lightdm restart needed -- the TV's "
+                        f"existing session is still valid."
+                    )
+                    continue
+
+                # Failure backoff check: don't slam a wedged lightdm.
+                in_backoff, backoff_remaining = in_lightdm_backoff(now)
+                if in_backoff:
+                    logger.warning(
+                        f"Skipping lightdm restart for {name} reconnect: "
+                        f"in failure backoff ({backoff_remaining:.0f}s "
+                        f"remaining). Last lightdm restart attempt failed; "
+                        f"holding off to avoid re-triggering the crash."
+                    )
+                    continue
+
                 # Rate-limit restarts.
                 since_last = now - last_restart_at
                 if since_last < MIN_RESTART_INTERVAL_SEC:
@@ -233,30 +379,24 @@ def main() -> int:
                         f"display blackout otherwise; will catch the next "
                         f"reconnect after the interval."
                     )
-                else:
-                    if _restart_lightdm():
-                        last_restart_at = now
+                    continue
 
-            # Track disconnects too, purely for logs / observability.
-            disconnected = [
-                name
-                for name, was_connected in prev_states.items()
-                if was_connected and not current_states.get(name, False)
-            ]
-            if disconnected:
-                logger.info(
-                    f"HDMI disconnect detected on: {', '.join(disconnected)} "
-                    f"(no action -- waiting for reconnect)"
-                )
+                # All gates passed: actually restart lightdm.
+                if _restart_lightdm():
+                    last_restart_at = now
+                else:
+                    last_restart_failed_at = now
+                    logger.error(
+                        f"lightdm restart failed -- entering "
+                        f"{LIGHTDM_FAILURE_BACKOFF_SEC:.0f}s backoff. Will "
+                        f"not attempt further restarts during that window."
+                    )
 
             # Recovery-mode tick: if we came up headless and STILL see no
             # HDMI after RECOVERY_RESTART_INTERVAL_SEC, force a lightdm
-            # restart. Don't bother re-checking 'reconnected' above --
-            # if a real reconnect just fired we already restarted and
-            # last_restart_at was updated, so the rate-limit check here
-            # will skip and prev_states will record the True states for
-            # next iteration. Once any HDMI shows True we exit recovery
-            # mode entirely.
+            # restart. The same backoff + rate-limit gates apply -- a
+            # wedged lightdm doesn't get better by pounding on it.
+            # Once any HDMI shows True we exit recovery mode entirely.
             if recovery_mode:
                 if any(current_states.values()):
                     logger.info(
@@ -268,13 +408,29 @@ def main() -> int:
                 else:
                     since_last = now - last_restart_at
                     if since_last >= RECOVERY_RESTART_INTERVAL_SEC:
-                        logger.warning(
-                            f"Recovery mode: still no HDMI after "
-                            f"{since_last:.0f}s. Forcing lightdm restart "
-                            f"to trigger DRM re-enumeration."
-                        )
-                        if _restart_lightdm():
-                            last_restart_at = now
+                        in_backoff, backoff_remaining = in_lightdm_backoff(now)
+                        if in_backoff:
+                            logger.warning(
+                                f"Recovery mode: would force lightdm restart "
+                                f"but in failure backoff "
+                                f"({backoff_remaining:.0f}s remaining). "
+                                f"Holding off."
+                            )
+                        else:
+                            logger.warning(
+                                f"Recovery mode: still no HDMI after "
+                                f"{since_last:.0f}s. Forcing lightdm restart "
+                                f"to trigger DRM re-enumeration."
+                            )
+                            if _restart_lightdm():
+                                last_restart_at = now
+                            else:
+                                last_restart_failed_at = now
+                                logger.error(
+                                    f"Recovery-mode lightdm restart failed -- "
+                                    f"entering {LIGHTDM_FAILURE_BACKOFF_SEC:.0f}s "
+                                    f"backoff."
+                                )
 
             prev_states = current_states
 
