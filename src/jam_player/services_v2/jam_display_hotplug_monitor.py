@@ -166,12 +166,23 @@ def _restart_lightdm() -> bool:
     job was enqueued, not that the unit reached active. Checking
     is-active after the call lets the caller know to enter backoff
     mode rather than blindly trying again.
+
+    Watchdog discipline: the service unit sets WatchdogSec=30. The two
+    subprocess calls below + the sleep can collectively block for up to
+    ~32s in the worst case, which is enough to miss a watchdog deadline
+    and get SIGABRT'd by systemd. We ping the watchdog between the
+    blocking calls to keep systemd happy, and use timeouts well below
+    WatchdogSec so any individual call can't blow past the deadline on
+    its own. (Without this, we observed the monitor process getting
+    SIGABRT'd by systemd 30s after kicking off the restart, and entering
+    a death-loop where systemd restarted us, we restarted lightdm
+    again, watchdog killed us again, etc.)
     """
     logger.info("Restarting lightdm.service to pick up new HDMI EDID...")
     try:
         result = subprocess.run(
             ["systemctl", "restart", "lightdm.service"],
-            timeout=60,
+            timeout=20,
             capture_output=True,
             text=True,
         )
@@ -182,37 +193,69 @@ def _restart_lightdm() -> bool:
             )
             return False
     except subprocess.TimeoutExpired:
-        logger.error("lightdm restart timed out after 60s")
+        logger.error("lightdm restart timed out after 20s")
         return False
     except Exception as e:
         logger.error(f"lightdm restart raised: {e}")
         return False
 
-    # systemctl returned 0; verify lightdm is actually running. A small
-    # wait gives systemd time to start the unit and observe any
-    # immediate crashes.
-    time.sleep(2.0)
-    try:
-        check = subprocess.run(
-            ["systemctl", "is-active", "lightdm.service"],
-            timeout=10,
-            capture_output=True,
-            text=True,
-        )
-        state = check.stdout.strip()
-        if state == "active":
+    # Reset the systemd watchdog before the second blocking call -- we
+    # may have just spent up to 20s in the restart above.
+    sd_notifier.notify("WATCHDOG=1")
+
+    # systemctl returned 0; verify lightdm actually reaches the active
+    # state. We poll with retries rather than a single check because:
+    #   - lightdm legitimately takes a few seconds to start on a slow
+    #     boot or when DRM enumeration is happening.
+    #   - "activating" is a normal transient state and shouldn't be
+    #     treated as failure.
+    #   - A single check at T+2s could false-negative on a healthy
+    #     restart, which would put us in the 5-min failure backoff
+    #     unnecessarily and block legitimate future restarts.
+    # We only report failure if the unit ends up explicitly "failed",
+    # or if it never reaches "active" within our total budget (~10s --
+    # well under the watchdog reset of 30s we set above).
+    is_active_deadline = time.monotonic() + 10.0
+    last_state = "unknown"
+    while time.monotonic() < is_active_deadline:
+        # Keep watchdog happy throughout the polling loop. Cheap call.
+        sd_notifier.notify("WATCHDOG=1")
+        try:
+            check = subprocess.run(
+                ["systemctl", "is-active", "lightdm.service"],
+                timeout=3,
+                capture_output=True,
+                text=True,
+            )
+            last_state = check.stdout.strip()
+        except Exception as e:
+            logger.warning(f"is-active check raised: {e}")
+            last_state = "unknown"
+
+        if last_state == "active":
             logger.info("lightdm.service restarted successfully")
             return True
-        logger.error(
-            f"lightdm.service post-restart state is '{state}' (not 'active'). "
-            f"Likely hit the systemd 'Start request repeated too quickly' "
-            f"or a lightdm/Wayfire crash. Caller should enter backoff."
-        )
-        return False
-    except Exception as e:
-        logger.error(f"Could not verify lightdm state post-restart: {e}")
-        # Pessimistic: treat unknown state as failure so caller backs off.
-        return False
+        if last_state == "failed":
+            # Hard failure -- no point waiting further. Either the
+            # lightdm/Wayfire crash bug hit, or systemd exhausted its
+            # restart counter ("Start request repeated too quickly").
+            logger.error(
+                "lightdm.service post-restart state is 'failed'. Likely "
+                "hit the lightdm/Wayfire NULL class pointer crash. "
+                "Caller should enter backoff."
+            )
+            return False
+        # "activating" / "deactivating" / "inactive" / unknown: give it
+        # more time. The unit is mid-transition.
+        time.sleep(1.0)
+
+    logger.error(
+        f"lightdm.service did not reach 'active' within 10s "
+        f"(last state: '{last_state}'). Treating as failure so caller "
+        f"enters backoff. If lightdm IS actually healthy on this device, "
+        f"the next reconnect attempt will retry after the backoff window."
+    )
+    return False
 
 
 def main() -> int:
@@ -287,6 +330,15 @@ def main() -> int:
     # reconnects AND recovery-mode forced restarts). lightdm is wedged
     # and further restarts will likely just retrigger the same crash.
     last_restart_failed_at = 0.0
+
+    # Rate-limit the recovery-mode "skipping restart" log lines so we
+    # don't spam the journal once per second while in failure backoff.
+    # The recovery-mode loop runs every poll iteration once the recovery
+    # interval has elapsed; without this, a 5-min backoff produces ~300
+    # identical WARNING lines. Still want SOME visibility while gated --
+    # just not hundreds per minute.
+    SKIP_LOG_INTERVAL_SEC = 60.0
+    last_recovery_skip_log_at = 0.0
 
     last_watchdog_at = time.monotonic()
 
@@ -410,12 +462,20 @@ def main() -> int:
                     if since_last >= RECOVERY_RESTART_INTERVAL_SEC:
                         in_backoff, backoff_remaining = in_lightdm_backoff(now)
                         if in_backoff:
-                            logger.warning(
-                                f"Recovery mode: would force lightdm restart "
-                                f"but in failure backoff "
-                                f"({backoff_remaining:.0f}s remaining). "
-                                f"Holding off."
-                            )
+                            # Rate-limited: this branch fires every poll
+                            # iteration (every 1s) while we're past the
+                            # recovery interval AND in backoff. Logging
+                            # at full rate would emit ~300 identical
+                            # lines per backoff window.
+                            if now - last_recovery_skip_log_at >= SKIP_LOG_INTERVAL_SEC:
+                                logger.warning(
+                                    f"Recovery mode: would force lightdm restart "
+                                    f"but in failure backoff "
+                                    f"({backoff_remaining:.0f}s remaining). "
+                                    f"Holding off. (Suppressing further "
+                                    f"messages for {SKIP_LOG_INTERVAL_SEC:.0f}s.)"
+                                )
+                                last_recovery_skip_log_at = now
                         else:
                             logger.warning(
                                 f"Recovery mode: still no HDMI after "
