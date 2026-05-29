@@ -2268,48 +2268,6 @@ def main():
     except Exception as e:
         logger.warning(f"Display cache pre-warm raised (non-fatal): {e}")
 
-    # If we got here on a boot where the TV was off / HDMI unplugged,
-    # the boot-time jam-display-wait-for-hdmi.service ran the OLD code
-    # (pre-update) and would NOT have written /run/jam-hdmi-was-missing-
-    # at-boot -- it doesn't know about that flag yet. When we restart
-    # jam-display-hotplug-monitor a few lines down, the new code will
-    # look for that flag, not find it, and never enter recovery mode --
-    # meaning the JP will stay stuck on a black screen until the
-    # customer manually reboots, even though the new code is installed.
-    #
-    # Close that gap by checking HDMI state right here and writing the
-    # flag retroactively if no HDMI connector is currently reporting
-    # connected. The new hotplug-monitor (restarted moments from now)
-    # will see the flag, enter recovery mode, and force a lightdm
-    # restart in 5 minutes -- saving the customer from a bad morning.
-    #
-    # See common comment in jam_display_hotplug_monitor.py /
-    # jam_display_wait_for_hdmi.py for full design context.
-    try:
-        hdmi_connectors = list(Path("/sys/class/drm").glob("card*-HDMI-A-*"))
-        any_connected = False
-        for c in hdmi_connectors:
-            try:
-                if (c / "status").read_text().strip() == "connected":
-                    any_connected = True
-                    break
-            except OSError:
-                continue
-        if hdmi_connectors and not any_connected:
-            flag = Path("/run/jam-hdmi-was-missing-at-boot")
-            flag.parent.mkdir(parents=True, exist_ok=True)
-            flag.touch()
-            logger.warning(
-                f"No HDMI connectors report connected at update time. "
-                f"Wrote {flag} so the post-update hotplug-monitor enters "
-                f"recovery mode and self-heals when HDMI comes back."
-            )
-    except Exception as e:
-        # Non-fatal -- if this fails, the only consequence is that a
-        # JP that was already going to need a manual reboot tomorrow
-        # morning still needs a manual reboot. Don't block the update.
-        logger.warning(f"Could not check HDMI state for retroactive flag write: {e}")
-
     # Restart services to pick up changes
     restart_services()
 
