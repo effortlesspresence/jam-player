@@ -92,7 +92,7 @@ from common.credentials import (
     get_screen_id,
     get_display_orientation,
 )
-from common.system import get_systemd_notifier, setup_signal_handlers
+from common.system import get_systemd_notifier, setup_signal_handlers, check_chrony_sync
 from common.paths import (
     INTERNET_VERIFIED_FLAG,
 )
@@ -195,6 +195,17 @@ SPEED_MODERATE_FAST = 1.03
 SPEED_MODERATE_SLOW = 0.97
 SPEED_AGGRESSIVE_FAST = 1.05
 SPEED_AGGRESSIVE_SLOW = 0.95
+
+# --- Wall-clock seek-on-load sync (multi-screen video walls only) ------------
+# Kill-switch: if this file exists, wall sync is force-disabled fleet-wide
+# (fast off-ramp without a redeploy).
+WALL_SYNC_KILL_SWITCH = Path('/etc/jam/disable_wall_sync')
+# Don't seek for offsets below this -- imperceptible on a wall, and a seek
+# would cause more visible disruption than it fixes.
+WALL_SYNC_MIN_SEEK_MS = 250
+# How often to re-check chrony sync (it shells out to chronyc; don't do it on
+# every scene load). A late-converging clock starts being trusted within this.
+WALL_SYNC_CLOCK_RECHECK_S = 30
 
 
 class DisplayMode(Enum):
@@ -1879,9 +1890,12 @@ class MpvIpcClient:
         self.set_property('pause', False)
         return True
 
-    def seek(self, position_seconds: float) -> bool:
-        """Seek to a position in seconds (absolute)."""
-        return self._send_command(['seek', str(position_seconds), 'absolute']) is not None
+    def seek(self, position_seconds: float, exact: bool = False) -> bool:
+        """Seek to a position in seconds (absolute). exact=True adds mpv's
+        'exact' flag for frame-accurate (hr-seek) landing, at the cost of a
+        slightly slower seek -- worth it for tight wall convergence."""
+        flags = 'absolute+exact' if exact else 'absolute'
+        return self._send_command(['seek', str(position_seconds), flags]) is not None
 
     def set_property(self, name: str, value: Any) -> bool:
         """Set an MPV property value."""
@@ -1926,6 +1940,11 @@ class JamPlayerDisplayManager:
         self._mpv_crash_times: list = []
         self._mpv_crash_threshold = 5  # Number of crashes
         self._mpv_crash_window_seconds = 30  # Time window to track crashes
+
+        # Wall-clock seek-on-load sync state (multi-screen video walls)
+        self._num_screens: Optional[int] = None   # layout screen count (num_screens.txt)
+        self._clock_synced: bool = False           # cached check_chrony_sync() result
+        self._clock_checked_at: float = 0.0        # monotonic ts of last chrony check
 
         # Get screen dimensions
         self.screen_width, self.screen_height = get_fb_size()
@@ -2511,6 +2530,51 @@ class JamPlayerDisplayManager:
                 fallback_message="No Content Scheduled\n\nContent will appear\nduring scheduled hours.",
             )
 
+    def _get_num_screens(self) -> Optional[int]:
+        """Layout screen count, written next to scenes.json by
+        scenes_manager. None if the backend/scenes_manager didn't provide it
+        -> treated as single-screen (no sync), so this is fully backward
+        compatible with an older backend or a device mid-rollout."""
+        try:
+            f = Path(constants.APP_DATA_LIVE_SCENES_DIR) / "num_screens.txt"
+            if f.exists():
+                return int(f.read_text().strip())
+        except (ValueError, OSError):
+            pass
+        return None
+
+    def _clock_is_synced(self) -> bool:
+        """check_chrony_sync() cached + re-polled every WALL_SYNC_CLOCK_RECHECK_S.
+        Avoids shelling out to chronyc on every scene load, and lets a
+        late-converging clock start being trusted without a restart."""
+        now = time.monotonic()
+        if now - self._clock_checked_at >= WALL_SYNC_CLOCK_RECHECK_S:
+            self._clock_checked_at = now
+            try:
+                self._clock_synced = check_chrony_sync()
+            except Exception:
+                self._clock_synced = False
+        return self._clock_synced
+
+    def _wall_sync_active(self) -> bool:
+        """Master gate for wall-clock seek-on-load. ALL must hold:
+          - not force-disabled by the kill-switch file
+          - the layout has >1 screen (a single screen NEVER syncs -- its
+            playback stays byte-identical to the legacy bare load)
+          - the shared clock has converged (seeking to a wrong wall clock
+            would be strictly worse than not seeking)
+        Media-type (VIDEO only) and the offset threshold are checked at the
+        seek site. Every failing gate falls back to today's behavior."""
+        try:
+            if WALL_SYNC_KILL_SWITCH.exists():
+                return False
+        except OSError:
+            pass
+        n = self._num_screens
+        if n is None or n <= 1:
+            return False
+        return self._clock_is_synced()
+
     def _run_scene_by_scene_sync(self):
         """
         Play scenes one by one with wall clock sync.
@@ -2518,6 +2582,9 @@ class JamPlayerDisplayManager:
         """
         media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
         scenes = self._load_scenes()
+        # Layout size for this content, read once per entry (it only changes on
+        # a relink, which re-enters this loop). Gates whether we wall-sync.
+        self._num_screens = self._get_num_screens()
 
         if not scenes:
             # _load_scenes() returned empty. Two possible causes (same
@@ -2809,8 +2876,23 @@ class JamPlayerDisplayManager:
                 logger.debug(f"Switching to scene {scene_index}: {scene.get('id')} ({media_type})")
                 self._current_scene_index = scene_index
 
-                # Just load and play - no seeking or sync logic for now
+                # Load the scene. On a multi-screen wall (and only then) seek
+                # to the wall-clock offset so a screen entering this scene late
+                # jumps to where its peers already are, instead of playing from
+                # t=0 and staying desynced every cycle. Single-screen layouts,
+                # image scenes, an unconverged clock, or sub-threshold offsets
+                # all fall through to the legacy bare load -- byte-identical to
+                # before this change.
                 self.mpv.load_file(str(media_path))
+                if (media_type == 'VIDEO'
+                        and position_in_scene_ms >= WALL_SYNC_MIN_SEEK_MS
+                        and self._wall_sync_active()):
+                    self.mpv.seek(position_in_scene_ms / 1000.0, exact=True)
+                    logger.info(
+                        f"Wall sync: seeked scene {scene_index} to "
+                        f"{position_in_scene_ms / 1000.0:.2f}s "
+                        f"(numScreens={self._num_screens})"
+                    )
                 time.sleep(0.1)  # Brief delay for MPV to initialize
 
                 # For single-scene content, ensure looping is enabled

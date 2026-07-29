@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import signal
 import threading
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 
 from jam_player import constants
@@ -113,7 +113,7 @@ def check_for_updates() -> bool:
         return False
 
 
-def fetch_content() -> Optional[List[Dict[str, Any]]]:
+def fetch_content() -> Optional[Tuple[List[Dict[str, Any]], Optional[int]]]:
     """
     Fetch content from the JAM 2.0 API.
 
@@ -147,8 +147,13 @@ def fetch_content() -> Optional[List[Dict[str, Any]]]:
 
         data = response.json()
         scenes = data.get('jamPlayerScenes', [])
-        logger.info(f"Fetched {len(scenes)} scenes from API")
-        return scenes
+        # numScreens: how many screens are in this JP's layout (added additively
+        # by the backend). None if an older backend didn't include it -- the
+        # display treats "unknown" as "do NOT wall-clock-sync" (safe single-
+        # screen default), so this stays fully backward-compatible.
+        num_screens = data.get('numScreens')
+        logger.info(f"Fetched {len(scenes)} scenes from API (numScreens={num_screens})")
+        return scenes, num_screens
 
     except Exception as e:
         logger.error(f"Error fetching content: {e}", exc_info=True)
@@ -455,10 +460,11 @@ def load_content() -> bool:
     _invalidate_stale_live_scenes_if_screen_changed()
 
     # Fetch content from API
-    scenes = fetch_content()
-    if scenes is None:
+    fetch_result = fetch_content()
+    if fetch_result is None:
         logger.error("Failed to fetch content from API")
         return False
+    scenes, num_screens = fetch_result
 
     # Track how many scenes the API returned (before download attempts)
     api_scene_count = len(scenes) if scenes else 0
@@ -598,6 +604,18 @@ def load_content() -> bool:
     with open(STAGED_SCENES_DIR / "content_meta.json", 'w') as f:
         json.dump(content_meta, f, indent=2)
     logger.info(f"Content metadata written: {total_duration:.1f}s total, {len(processed_scenes)} scenes")
+
+    # Persist the layout screen count next to scenes.json so it swaps into
+    # LIVE atomically with the content it belongs to. The display reads this
+    # to gate wall-clock video sync on being in a multi-screen wall. Only
+    # written when the backend actually provided it; absence -> display
+    # defaults to no-sync (single-screen-safe).
+    if num_screens is not None:
+        try:
+            with open(STAGED_SCENES_DIR / "num_screens.txt", 'w') as f:
+                f.write(str(int(num_screens)))
+        except (ValueError, TypeError, OSError) as e:
+            logger.warning(f"Could not write num_screens.txt (non-fatal): {e}")
 
     # Atomically swap staged to live using a safe 3-step process:
     # 1. Copy staged to a NEW temp directory (if interrupted, live is untouched)
