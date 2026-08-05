@@ -19,6 +19,7 @@ This handles cases where:
 
 import subprocess
 import socket
+import ssl
 import time
 import logging
 import os
@@ -33,11 +34,20 @@ DEFAULT_NETWORK_WAIT_TIMEOUT = 30  # seconds
 DEFAULT_COMMAND_TIMEOUT = 10  # seconds
 DEFAULT_INTERNET_CHECK_TIMEOUT = 5  # seconds per check
 
-# Fallback endpoints for internet connectivity verification
-# Used when JAM backend is unreachable but we need to verify internet works
-FALLBACK_DNS_SERVERS = [
-    ("1.1.1.1", 53),   # Cloudflare DNS
-    ("8.8.8.8", 53),   # Google DNS
+# Fallback endpoints for internet connectivity verification.
+# Used when the JAM backend is unreachable but we need to tell "backend is
+# down" apart from "this network has no internet".
+#
+# These are checked with a VERIFIED TLS handshake on 443 -- NOT a bare TCP
+# connect on 53. See _check_tls_connectivity for why that distinction is
+# load-bearing (captive portals). Both Cloudflare and Google publish IP SANs
+# for these addresses, so the certificate validates against the IP literal
+# and no DNS lookup is required (a portal hijacks DNS too).
+#
+# NOTE: customer firewall whitelists must allow these on TCP 443.
+FALLBACK_TLS_HOSTS = [
+    ("1.1.1.1", 443),   # Cloudflare (cert has IP SAN 1.1.1.1)
+    ("8.8.8.8", 443),   # Google (cert has IP SAN 8.8.8.8)
 ]
 
 
@@ -883,28 +893,58 @@ def get_current_connection_info() -> Optional[Dict[str, str]]:
 # Internet Connectivity Verification
 # ============================================================================
 
-def _check_tcp_connectivity(host: str, port: int, timeout: float) -> bool:
+def _check_tls_connectivity(host: str, port: int, timeout: float) -> bool:
     """
-    Check if we can establish a TCP connection to a host:port.
+    Prove real end-to-end internet by completing a TLS handshake with FULL
+    certificate verification against `host`.
 
-    This is a low-level check used as a fallback when HTTP checks fail.
-    Connecting to DNS servers on port 53 is a reliable internet indicator.
+    WHY NOT A BARE TCP CONNECT (the bug this replaces):
+    A captive portal transparently accepts TCP to *any* address, so
+    socket.connect_ex(('1.1.1.1', 53)) returns 0 against the portal's
+    interceptor and reports "internet works" when it does not. That produced
+    a fielded failure where a device on a portal network wrote
+    .internet_verified, was then registered, and -- being "online AND
+    registered" -- stopped BLE provisioning: no internet, no BLE, no
+    Tailscale, recoverable only by physically touching the device.
+    Reproduced on a Starbucks portal: backend HTTPS check correctly failed
+    (curl exit 7) while `nc -z 1.1.1.1 53` returned 0.
+
+    A portal cannot forge a certificate that validates for 1.1.1.1 or
+    8.8.8.8 -- no CA will issue one -- so a verified handshake is the
+    cheapest proof we actually reached the real host.
+
+    We verify against the IP literal itself (both providers publish IP SANs
+    for their resolver addresses), so this needs NO DNS lookup, which
+    matters because portals hijack DNS as well.
 
     Args:
-        host: IP address or hostname
-        port: Port number
-        timeout: Connection timeout in seconds
+        host: IP address of the fallback host
+        port: Port number (443)
+        timeout: Timeout in seconds, covering connect AND handshake
 
     Returns:
-        True if TCP connection succeeds
+        True only if the TLS handshake completed and the certificate
+        validated for `host`.
     """
+    context = ssl.create_default_context()
+    # Explicit rather than implicit: these are the two properties that make
+    # this check portal-proof, so never let a future refactor weaken them.
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except Exception:
+        with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+            # server_hostname as an IP literal: Python skips SNI (per RFC 6066)
+            # and validates against the certificate's IP SANs instead.
+            with context.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+                # getpeercert() is non-empty only after a validated handshake.
+                return bool(tls_sock.getpeercert())
+    except (ssl.SSLError, ssl.CertificateError, OSError):
+        # Portal interception lands here (cert mismatch / handshake failure),
+        # as does a genuinely offline network. Both mean "no internet".
+        return False
+    except Exception as e:
+        logger.debug(f"Unexpected error in TLS connectivity check to {host}: {e}")
         return False
 
 
@@ -916,35 +956,43 @@ def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT)
     NetworkManager state, which can report "connected" even when
     there's no real internet access.
 
+    EVERY check here must be portal-proof: a captive-portal network satisfies
+    naive reachability tests (it answers TCP, DNS, and plain HTTP for any
+    destination) while routing nothing. Both checks below therefore require a
+    verified TLS peer -- something a portal cannot fake.
+
     Test order:
-    1. JAM backend health endpoint (what actually matters)
-    2. Fallback to TCP connection to public DNS servers
+    1. JAM backend health endpoint over HTTPS (what actually matters)
+    2. Fallback: verified TLS handshake to public resolver IPs on 443,
+       which distinguishes "our backend is down" from "no internet"
 
     Args:
         timeout: Timeout in seconds for each individual check
 
     Returns:
         Tuple of (has_internet, check_that_succeeded)
-        check_that_succeeded is one of: 'jam_backend', 'cloudflare_dns',
-        'google_dns', or 'none'
+        check_that_succeeded is one of: 'jam_backend', 'cloudflare_tls',
+        'google_tls', or 'none'
     """
     # Import here to avoid circular dependency
     from .api import check_api_availability
 
-    # First, try the JAM backend - this is what actually matters
+    # First, try the JAM backend - this is what actually matters.
+    # This is HTTPS with cert validation, so a portal cannot satisfy it.
     if check_api_availability(timeout=int(timeout)):
         return True, 'jam_backend'
 
-    # Backend unreachable - could be backend down or no internet
-    # Try fallback DNS servers to determine which
-    for host, port in FALLBACK_DNS_SERVERS:
-        if _check_tcp_connectivity(host, port, timeout):
-            # We have internet, just can't reach JAM backend
-            # Don't log here - this is normal during routine checks
-            check_name = 'cloudflare_dns' if host == '1.1.1.1' else 'google_dns'
+    # Backend unreachable - could be backend down or no internet.
+    # Verified TLS to a public resolver tells us which.
+    for host, port in FALLBACK_TLS_HOSTS:
+        if _check_tls_connectivity(host, port, timeout):
+            # We have real internet, just can't reach the JAM backend.
+            # Don't log here - this is normal during routine checks.
+            check_name = 'cloudflare_tls' if host == '1.1.1.1' else 'google_tls'
             return True, check_name
 
-    # Nothing reachable - no internet
+    # Nothing verifiable - no internet (or a captive portal, which is
+    # operationally the same thing for us).
     return False, 'none'
 
 
