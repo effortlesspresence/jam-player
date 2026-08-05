@@ -2696,6 +2696,17 @@ class JamPlayerDisplayManager:
             if content_changed or schedule_check_needed:
                 if content_changed:
                     self._last_scenes_mtime = scenes_mtime
+                    # Re-read the layout screen count. num_screens.txt is swapped
+                    # into LIVE atomically with scenes.json, so a changed scenes
+                    # mtime guarantees this value is fresh too -- no extra polling.
+                    #
+                    # Without this, _num_screens is only read once per entry into
+                    # this method, so a layout resized IN PLACE (same screen, a
+                    # screen added to or removed from the layout) leaves a stale
+                    # count until the display restarts: wall sync would never
+                    # engage on a newly-multi-screen layout, or would keep seeking
+                    # on a screen that has since become standalone.
+                    self._num_screens = self._get_num_screens()
                     logger.info("Content file updated, reloading scenes")
                 if schedule_check_needed:
                     self._last_schedule_check = current_time_sec
