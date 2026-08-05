@@ -202,11 +202,39 @@ def safe_copy(src: Path, dest: Path, mode: int = 0o644):
     src_bytes = src.read_bytes()
     src_size = len(src_bytes)
 
-    with open(dest, 'wb') as f:
-        f.write(src_bytes)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(dest, mode)
+    # Write to a sibling temp file, fsync, then atomically rename over the
+    # destination. The old in-place open(dest,'wb') TRUNCATED the live file
+    # first, so a kill between truncate and write-complete left a 0-byte/
+    # partial destination (fatal when the destination is e.g. a systemd unit
+    # or a service script). With rename, the destination is at every instant
+    # either the complete old file or the complete new file.
+    # PID-suffixed so two processes safe_copying the same dest can never
+    # truncate each other's in-flight temp file. (Today jam_update is the
+    # sole caller and is serialized by systemd, but this module is shared.)
+    tmp = dest.with_name(f"{dest.name}.safecopy-tmp.{os.getpid()}")
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(src_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.rename(tmp, dest)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    # fsync the parent directory so the rename itself survives power loss
+    # (otherwise ext4 journal recovery can resurrect the old directory entry).
+    try:
+        dir_fd = os.open(str(dest.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass  # best-effort: file data is already fsynced
 
     # Defensive: re-stat and verify size. If a filesystem layer truncated
     # us silently, fail loudly so the caller can retry or report.

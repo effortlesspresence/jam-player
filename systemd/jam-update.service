@@ -47,8 +47,30 @@ ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_update.py
 # Don't restart - this is a one-shot service that runs on boot
 Restart=no
 
-# Give it plenty of time for git operations and install
-TimeoutStartSec=900
+# Sized ABOVE the script's worst-case internal budget so systemd never
+# SIGTERMs an update mid-flight (which bypasses fail_update/rollback entirely
+# and can kill the process inside a file-copy). Budget (see the coupling
+# comment at PIP_SUBPROCESS_TIMEOUT in jam_update.py):
+#   git pull w/ retries      ~1650s
+#   pip: 2 calls x (2 x 1200s + backoff)  ~4810s
+#   venv verify x2            ~120s
+#   services/units/configs    ~300s
+#   ------------------------------
+#   worst case               ~6880s
+#   (+ ~1650s one-time when jam_update.py itself changed: the re-exec'd new
+#    process repeats the git-fetch phase -> ~8530s true worst case)
+# 9000s covers the re-exec worst case with ~8min margin. Every subprocess inside jam_update.py carries
+# its own timeout, so the run is internally bounded well below this ceiling;
+# this is a backstop, not the working limit. Change the pip constants ->
+# re-check this number.
+#
+# TRANSITION NOTE: a fielded device's FIRST update through this code still
+# runs under the OLD unit's 900s ceiling (the new unit file only governs
+# later runs -- a daemon-reload mid-run does not extend the running job).
+# That kill is survivable by design: all file operations are atomic
+# (safe_copy/copy-over), the venv self-heal is installed and enabled BEFORE
+# the dependency phase, and the pip cache resumes across boots.
+TimeoutStartSec=9000
 
 # Environment
 Environment=PYTHONUNBUFFERED=1

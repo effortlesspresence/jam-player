@@ -82,6 +82,13 @@ BACKUP_DIR = OPT_JAM_DIR / 'backup'
 SERVICES_BACKUP = BACKUP_DIR / 'services'
 SYSTEMD_BACKUP = BACKUP_DIR / 'systemd'
 VERSION_BACKUP = BACKUP_DIR / 'version.txt'
+# Written (inside the backup) the moment the install phase begins mutating
+# disk. If a later run finds it, the CURRENT disk state is mid-update residue,
+# not known-good -- so create_backup() keeps the existing snapshot instead of
+# destroying the only good backup and re-snapshotting the residue ("backup
+# poisoning"). Removed only by cleanup_backup() after a fully successful
+# update.
+UPDATE_IN_PROGRESS_SENTINEL = BACKUP_DIR / '.update_in_progress'
 
 # Legacy paths (for cleanup)
 LEGACY_JAM_DIR = Path('/home/comitup/.jam')
@@ -189,6 +196,79 @@ def retry_with_backoff(
 # Backup and Rollback Functions
 # =============================================================================
 
+def _copy_tree_over(src_dir: Path, dest_dir: Path) -> int:
+    """Crash-safe recursive copy ONTO a (possibly existing) tree.
+
+    Never deletes dest_dir or anything in it: every file lands via safe_copy
+    (tmp + fsync + atomic rename), so at any kill point the destination
+    contains only complete-old or complete-new files and the directory itself
+    always exists. This replaces the rmtree-then-copytree pattern, whose
+    kill window left /opt/jam/services missing entirely -- a permanent brick,
+    since every recovery mechanism (jam-update, jam-venv-repair) executes
+    from that directory.
+
+    Files that exist in dest but not in src are deliberately left in place:
+    stale python modules are inert (nothing imports them), and on rollback
+    this is what lets NEW-version-only recovery files (jam_venv_repair.py,
+    venv_check.py) survive the restore of an older services tree.
+
+    INVARIANT the leave-in-place rule depends on: never rename a module
+    between file form (foo.py) and package form (foo/) across releases
+    without a migration step. Python resolves a package dir BEFORE a
+    same-named module file, so a stale leftover of the other form would
+    silently shadow the intended code with zero diagnostics.
+
+    Skips __pycache__/, *.pyc, and safe_copy's *.safecopy-tmp orphans.
+    Returns the number of files copied.
+    """
+    from common.paths import safe_copy
+    copied = 0
+    for root, dirs, files in os.walk(str(src_dir)):
+        dirs[:] = [d for d in dirs if d != '__pycache__']
+        rel = Path(root).relative_to(src_dir)
+        (dest_dir / rel).mkdir(parents=True, exist_ok=True)
+        for fname in files:
+            if fname.endswith('.pyc') or '.safecopy-tmp' in fname:
+                continue
+            safe_copy(Path(root) / fname, dest_dir / rel / fname)
+            copied += 1
+    return copied
+
+
+def _fsync_dir(dir_path: Path):
+    """fsync a directory so entry creations/renames inside it survive power
+    loss (same rationale as safe_copy's parent-dir fsync). Best-effort."""
+    try:
+        dir_fd = os.open(str(dir_path), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def mark_update_in_progress() -> bool:
+    """Drop the sentinel that tells future runs 'disk state is mid-update'.
+
+    Called right before the first disk mutation of the install phase.
+    FAIL-CLOSED: if the sentinel cannot be written (classically ENOSPC on a
+    full SD card), the poisoning guard is unarmed -- a later interrupted run
+    would destroy the only good backup and re-snapshot mid-update residue.
+    Better to abort now and retry next boot; a failing write here is also a
+    strong signal the update itself was about to fail. The sentinel's payload
+    is its DIRECTORY ENTRY (consumed via .exists()), so the parent dir is
+    fsynced too."""
+    try:
+        from common.paths import safe_write_text
+        safe_write_text(UPDATE_IN_PROGRESS_SENTINEL, 'update started\n')
+        _fsync_dir(BACKUP_DIR)
+        return True
+    except Exception as e:
+        logger.error(f"Could not write update-in-progress sentinel: {e}")
+        return False
+
+
 def create_backup() -> bool:
     """
     Create a backup of current installation before updating.
@@ -203,51 +283,90 @@ def create_backup() -> bool:
     """
     logger.info("Creating backup of current installation...")
 
+    # BACKUP-POISONING GUARD: if a backup exists and a prior run's install
+    # phase began against it (sentinel present), the CURRENT disk state is
+    # mid-update residue -- possibly half-rolled-back or half-installed --
+    # not known-good. Re-snapshotting it would destroy the only good backup
+    # and make future rollbacks "restore" the damage. Keep the existing
+    # snapshot instead; it remains the last state verified good.
+    staging = BACKUP_DIR.with_name(BACKUP_DIR.name + '.tmp')
+
+    if BACKUP_DIR.exists() and UPDATE_IN_PROGRESS_SENTINEL.exists():
+        logger.info(
+            "Existing backup predates an interrupted update attempt -- "
+            "keeping it (current disk state is not known-good)"
+        )
+        # Reclaim any staging leftover from a run killed mid-snapshot; on
+        # this keep-branch nothing below would clean it, and a services-tree
+        # copy is real space on 16GB SD cards.
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+        except Exception:
+            pass
+        return True
+
+    # Build the new backup in a staging dir, then swap it into place. A kill
+    # at ANY point leaves either the old complete backup (still at BACKUP_DIR)
+    # or the new complete one -- never a partial backup that a later rollback
+    # could restore from.
     try:
-        # Clean up any existing backup
-        if BACKUP_DIR.exists():
-            shutil.rmtree(BACKUP_DIR)
+        from common.paths import safe_copy
 
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
 
-        # Backup services directory
+        # Backup services directory. _copy_tree_over (safe_copy per file) so
+        # every backed-up file is fsynced: this tree is the payload rollback
+        # restores, and the sentinel forces later runs to TRUST it -- a
+        # power-cut-truncated backup that rollback faithfully restores would
+        # be worse than no backup.
         if SERVICES_DEST.exists():
-            shutil.copytree(SERVICES_DEST, SERVICES_BACKUP)
+            _copy_tree_over(SERVICES_DEST, staging / 'services')
             logger.info(f"  Backed up {SERVICES_DEST}")
         else:
             logger.info("  No existing services directory to backup")
 
-        # Backup systemd units (safe_copy = fsync + size-verify so a
+        # Backup systemd units (safe_copy = fsync + atomic rename so a
         # power-cycle during backup doesn't leave us with 0-byte backups
         # that would then nuke /etc/systemd/system on rollback).
-        from common.paths import safe_copy
-        SYSTEMD_BACKUP.mkdir(parents=True, exist_ok=True)
+        (staging / 'systemd').mkdir(exist_ok=True)
         systemd_dir = Path('/etc/systemd/system')
         backed_up_units = 0
         for pattern in ['jam-*.service', 'jam-*.timer', 'jam-*.path']:
             for unit_file in systemd_dir.glob(pattern):
-                safe_copy(unit_file, SYSTEMD_BACKUP / unit_file.name)
+                safe_copy(unit_file, staging / 'systemd' / unit_file.name)
                 backed_up_units += 1
         logger.info(f"  Backed up {backed_up_units} systemd units")
 
-        # Backup version file
+        # Backup version file (safe_copy, NOT copy2: a 0-byte restored
+        # version.txt silently downgrades the next run to a backup-less
+        # force_install).
         if VERSION_FILE.exists():
-            shutil.copy2(VERSION_FILE, VERSION_BACKUP)
+            safe_copy(VERSION_FILE, staging / 'version.txt')
             logger.info(f"  Backed up {VERSION_FILE}")
         else:
             logger.info("  No existing version file to backup")
+
+        # Swap staged -> live backup location, and fsync the parent dir so
+        # the rename survives power loss.
+        if BACKUP_DIR.exists():
+            shutil.rmtree(BACKUP_DIR)
+        os.rename(staging, BACKUP_DIR)
+        _fsync_dir(BACKUP_DIR.parent)
 
         logger.info("Backup created successfully")
         return True
 
     except Exception as e:
         logger.error(f"Failed to create backup: {e}")
-        # Clean up partial backup
-        if BACKUP_DIR.exists():
-            try:
-                shutil.rmtree(BACKUP_DIR)
-            except:
-                pass
+        # Clean up the staging dir only -- never touch an existing good backup.
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+        except Exception:
+            pass
         return False
 
 
@@ -257,8 +376,16 @@ def rollback_from_backup() -> bool:
 
     This is called when an update fails partway through. It restores:
     - Services directory
-    - Systemd unit files
+    - Systemd unit files (EXCEPT the recovery infrastructure's own units)
     - Version file
+
+    KNOWN LIMITATION -- common/ compatibility invariant: check_and_reexec
+    copies the NEW jam_update.py + NEW common/ into the services dir BEFORE
+    create_backup runs, so the backup (and therefore every rollback) is
+    "old services + new common". Rollback correctness depends on common/
+    staying backward compatible with the immediately prior release's
+    services. Treat common/'s surface as a one-release-compat boundary when
+    changing signatures there.
 
     Returns:
         True if rollback succeeded, False otherwise.
@@ -272,12 +399,22 @@ def rollback_from_backup() -> bool:
     success = True
 
     try:
-        # Restore services directory
+        # Restore services directory via crash-safe COPY-OVER -- deliberately
+        # NOT rmtree+copytree. The old pattern had a kill window where
+        # /opt/jam/services was gone entirely; since jam-update and
+        # jam-venv-repair both execute from that directory, a kill in the
+        # window was a permanent brick no boot could heal. Copy-over means
+        # the directory always exists and every file is complete-old or
+        # complete-new at any instant.
+        #
+        # Side effect (intentional): files added by the NEW version that the
+        # backup predates are left in place. Stale python modules are inert
+        # under old code, and this is exactly what keeps the recovery pair
+        # (jam_venv_repair.py, venv_check.py) and their systemd unit working
+        # after a rollback.
         if SERVICES_BACKUP.exists():
-            if SERVICES_DEST.exists():
-                shutil.rmtree(SERVICES_DEST)
-            shutil.copytree(SERVICES_BACKUP, SERVICES_DEST)
-            logger.info(f"  Restored {SERVICES_DEST}")
+            restored = _copy_tree_over(SERVICES_BACKUP, SERVICES_DEST)
+            logger.info(f"  Restored {SERVICES_DEST} ({restored} files, copy-over)")
         else:
             logger.warning("  No services backup to restore")
 
@@ -292,8 +429,18 @@ def rollback_from_backup() -> bool:
         if SYSTEMD_BACKUP.exists():
             from common.paths import safe_copy
             systemd_dir = Path('/etc/systemd/system')
+            # NEVER roll back the recovery infrastructure's own units. The
+            # backed-up jam-update.service may carry the old 900s ceiling --
+            # restoring it would re-arm the mid-flight SIGTERM this release
+            # fixes, on exactly the failing devices that roll back the most.
+            # The new units only raise the timeout / keep the healer working,
+            # both safe under old code.
+            recovery_units = {'jam-update.service', 'jam-venv-repair.service'}
             restored_units = 0
             for unit_file in SYSTEMD_BACKUP.glob('*'):
+                if unit_file.name in recovery_units:
+                    logger.info(f"  Skipping {unit_file.name} (recovery infrastructure is never rolled back)")
+                    continue
                 safe_copy(unit_file, systemd_dir / unit_file.name)
                 restored_units += 1
             logger.info(f"  Restored {restored_units} systemd units")
@@ -307,9 +454,12 @@ def rollback_from_backup() -> bool:
         success = False
 
     try:
-        # Restore version file
+        # Restore version file (safe_copy, NOT copy2: a 0-byte version.txt
+        # after power loss silently downgrades the next run to a backup-less
+        # force_install -- rollback protection off exactly when it's needed).
         if VERSION_BACKUP.exists():
-            shutil.copy2(VERSION_BACKUP, VERSION_FILE)
+            from common.paths import safe_copy
+            safe_copy(VERSION_BACKUP, VERSION_FILE)
             logger.info(f"  Restored {VERSION_FILE}")
         else:
             logger.warning("  No version backup to restore")
@@ -327,13 +477,23 @@ def rollback_from_backup() -> bool:
 
 
 def cleanup_backup():
-    """Remove the backup directory after a successful update."""
+    """Remove the backup directory after a successful update.
+
+    A FAILED cleanup is reported loudly: a backup that survives a committed
+    update becomes a stale-rollback hazard for the next update generation
+    (see the sentinel reconciliation on the up-to-date path), so the fleet
+    should see when a device's rmtree is wedged rather than discovering it
+    via a mystery multi-version rollback later."""
     if BACKUP_DIR.exists():
         try:
             shutil.rmtree(BACKUP_DIR)
             logger.info("Cleaned up backup directory")
         except Exception as e:
-            logger.warning(f"Failed to clean up backup: {e}")
+            logger.error(f"Failed to clean up backup -- stale-rollback hazard: {e}")
+            try:
+                report_error(f"cleanup_backup failed (stale-rollback hazard): {e}")
+            except Exception:
+                pass
 
 
 def check_and_reexec_if_updated() -> bool:
@@ -387,19 +547,25 @@ def check_and_reexec_if_updated() -> bool:
 
         logger.info("jam_update.py has changed - preparing to re-exec with new version...")
 
-        # Copy new version to installed location
-        shutil.copy2(repo_script, installed_script)
+        # Copy new version to installed location (safe_copy: atomic rename,
+        # so a kill mid-copy can't leave a truncated updater that then fails
+        # at every boot).
+        from common.paths import safe_copy
+        safe_copy(repo_script, installed_script)
         logger.info(f"Copied new jam_update.py to {installed_script}")
 
         # Also copy the common/ directory to prevent import errors
-        # (new jam_update.py may depend on new imports from common/)
+        # (new jam_update.py may depend on new imports from common/).
+        # Copy-over, NOT rmtree+copytree: this runs BEFORE create_backup, so
+        # the old kill window (common/ deleted, not yet re-copied) had no
+        # backup to recover from -- jam-update itself and every venv service
+        # import common.* at module load, so that window was a permanent
+        # brick. Copy-over keeps common/ present and complete at all times.
         repo_common = SERVICES_V2_SRC / 'common'
         installed_common = SERVICES_DEST / 'common'
         if repo_common.exists():
-            if installed_common.exists():
-                shutil.rmtree(installed_common)
-            shutil.copytree(repo_common, installed_common)
-            logger.info(f"Copied common/ to {installed_common}")
+            copied = _copy_tree_over(repo_common, installed_common)
+            logger.info(f"Copied common/ to {installed_common} ({copied} files)")
 
         # Set environment variable to prevent infinite loop
         os.environ[REEXEC_ENV_VAR] = '1'
@@ -849,16 +1015,22 @@ def install_services() -> bool:
         SERVICES_DEST.mkdir(parents=True, exist_ok=True)
         (SERVICES_DEST / 'common').mkdir(exist_ok=True)
 
+        # All copies below use safe_copy (via _copy_tree_over or directly):
+        # fsync + atomic rename, so a kill/power-cut mid-install leaves every
+        # file complete-old or complete-new, never truncated. install_services
+        # is a full re-copy each run, so it also heals any stale partial state.
+        from common.paths import safe_copy
+
         # Copy JAM 2.0 service files
         logger.info("  Copying v2 services...")
         for py_file in SERVICES_V2_SRC.glob('*.py'):
-            shutil.copy2(py_file, SERVICES_DEST / py_file.name)
+            safe_copy(py_file, SERVICES_DEST / py_file.name)
 
         # Copy common module
         common_src = SERVICES_V2_SRC / 'common'
         if common_src.exists():
             for py_file in common_src.glob('*.py'):
-                shutil.copy2(py_file, SERVICES_DEST / 'common' / py_file.name)
+                safe_copy(py_file, SERVICES_DEST / 'common' / py_file.name)
 
         # Copy legacy scripts that are still needed (jam_player_app.py, scenes_manager_service.py)
         logger.info("  Copying legacy scripts...")
@@ -866,15 +1038,15 @@ def install_services() -> bool:
         for script in legacy_scripts:
             src = JAM_PLAYER_SRC / script
             if src.exists():
-                shutil.copy2(src, SERVICES_DEST / script)
+                safe_copy(src, SERVICES_DEST / script)
                 logger.info(f"    Copied {script}")
 
-        # Copy the entire jam_player package (needed for imports)
+        # Copy the entire jam_player package (needed for imports).
+        # Copy-over, NOT rmtree+copytree: the old pattern had a kill window
+        # with the package missing entirely (import failure in every service).
         logger.info("  Copying jam_player package...")
         pkg_dest = SERVICES_DEST / 'jam_player'
-        if pkg_dest.exists():
-            shutil.rmtree(pkg_dest)
-        shutil.copytree(JAM_PLAYER_SRC, pkg_dest, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        _copy_tree_over(JAM_PLAYER_SRC, pkg_dest)
 
         return True
     except Exception as e:
@@ -882,31 +1054,123 @@ def install_services() -> bool:
         return False
 
 
+# --- Dependency-install resilience (bad-store-wifi hardening) -----------------
+# A persistent pip cache so retries -- and even a re-run on the NEXT boot --
+# resume from wheels already downloaded, instead of starting from zero. This
+# is what lets a device on a spotty/dropping connection grind forward to a
+# complete venv over multiple attempts.
+PIP_CACHE_DIR = OPT_JAM_DIR / 'pip-cache'
+# Wall-clock ceiling for a single pip invocation. Deliberately generous: the
+# failure mode we're fixing is a 300s kill knocking pip off a slow-but-working
+# download. retry_with_backoff wraps this for transient/dropped connections.
+#
+# Attempts kept LOW on purpose: the persistent pip cache means the real retry
+# mechanism is the NEXT RUN resuming from cached wheels (every boot retries a
+# not-up-to-date device), so in-run retries only need to cover brief blips.
+#
+# BUDGET COUPLING: these two values feed TimeoutStartSec in
+# systemd/jam-update.service. install_dependencies() runs run_pip_install
+# TWICE, so pip worst case ~= 2 * (ATTEMPTS * TIMEOUT + backoff); add git
+# retries (~1650s) and verify/install overhead (~300s), and the unit's
+# TimeoutStartSec must stay comfortably ABOVE the total or systemd will
+# SIGTERM an update mid-flight -- bypassing fail_update/rollback entirely.
+# Bump either value here -> re-check the unit file.
+PIP_SUBPROCESS_TIMEOUT = 1200
+PIP_RETRY_MAX_ATTEMPTS = 2
+
+
+def run_pip_install(pip_args: list, description: str) -> bool:
+    """Run `pip install` resiliently on a flaky store network.
+
+    - long per-connection --timeout + --retries (pip default is 15s/no-retry)
+    - --prefer-binary to avoid slow source builds when a wheel exists
+    - --cache-dir on persistent storage so partial progress survives reboots
+    - an outer exponential-backoff retry loop, so a dropped connection is
+      retried (resuming from cache) instead of fatally killing the install
+    """
+    PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(VENV_DIR / 'bin' / 'pip'), 'install',
+        '--timeout', '120',
+        '--retries', '10',
+        '--prefer-binary',
+        '--cache-dir', str(PIP_CACHE_DIR),
+    ] + pip_args
+
+    def attempt():
+        success, _, stderr = run_command(cmd, timeout=PIP_SUBPROCESS_TIMEOUT)
+        if not success:
+            # Return None so retry_with_backoff retries; log the tail only.
+            logger.warning(f"pip install ({description}) attempt failed: {stderr[-500:]}")
+            return None
+        return True
+
+    return retry_with_backoff(
+        attempt, f"pip install ({description})",
+        max_attempts=PIP_RETRY_MAX_ATTEMPTS,
+    ) is True
+
+
+def verify_venv_complete() -> bool:
+    """Ground-truth check that the venv satisfies requirements.txt -- the
+    SINGLE source of truth for the dependency set. This, not pip's exit code,
+    is the real "install done" signal (pip's return code lies when it's killed
+    mid-download). Delegates to the shared, stdlib-only venv_check so the same
+    logic guards both this (prevention) and jam_venv_repair (self-heal)."""
+    # Local import: a freshly-pulled jam_update.py may run (via re-exec) before
+    # venv_check.py has been copied into place, same reasoning as safe_copy.
+    from venv_check import missing_requirements
+
+    req_file = SERVICES_DEST / 'requirements.txt'
+    if not req_file.exists():
+        req_file = SERVICES_V2_SRC / 'requirements.txt'
+    missing = missing_requirements(VENV_DIR / 'bin' / 'python', req_file)
+    if missing:
+        logger.error(f"venv completeness check FAILED -- not satisfied: {missing}")
+        return False
+    return True
+
+
 def install_dependencies() -> bool:
-    """Install Python dependencies to /opt/jam/venv."""
+    """Install Python dependencies to /opt/jam/venv and VERIFY completeness.
+
+    Fails CLOSED: on a network/pip failure it returns False so main() aborts
+    (and rolls back if a backup exists) instead of the old behavior of
+    swallowing the failure and marching on with a half-installed venv. The
+    real gate is verify_venv_complete() -- pip is best-effort, the import
+    check decides."""
     logger.info("Installing Python dependencies...")
 
-    # Install requirements.txt if exists
-    req_file = SERVICES_V2_SRC / 'requirements.txt'
-    if req_file.exists():
-        shutil.copy2(req_file, SERVICES_DEST / 'requirements.txt')
-        success, _, stderr = run_command(
-            [str(VENV_DIR / 'bin' / 'pip'), 'install', '-r', str(SERVICES_DEST / 'requirements.txt')],
-            timeout=300
-        )
-        if not success:
-            logger.warning(f"pip install requirements.txt had issues: {stderr}")
+    # The whole body is guarded: an unexpected raise here (e.g. OSError from
+    # a full SD card during the copy or cache mkdir) previously propagated
+    # past main()'s `if not install_dependencies()` check entirely -- no
+    # fail_update, no rollback, stale backup left behind. Any raise is a
+    # failed install; fail closed.
+    try:
+        # Install requirements.txt if exists
+        req_file = SERVICES_V2_SRC / 'requirements.txt'
+        if req_file.exists():
+            from common.paths import safe_copy
+            safe_copy(req_file, SERVICES_DEST / 'requirements.txt')
+            if not run_pip_install(['-r', str(SERVICES_DEST / 'requirements.txt')], 'requirements.txt'):
+                logger.error("pip install requirements.txt failed after retries")
+                # fall through -- the completeness check below is the real gate
 
-    # Install the jam_player package
-    logger.info("  Installing jam_player package...")
-    success, _, stderr = run_command(
-        [str(VENV_DIR / 'bin' / 'pip'), 'install', str(JAM_REPO_DIR)],
-        timeout=300
-    )
-    if not success:
-        logger.warning(f"pip install jam_player had issues: {stderr}")
+        # Install the jam_player package
+        logger.info("  Installing jam_player package...")
+        if not run_pip_install([str(JAM_REPO_DIR)], 'jam_player package'):
+            logger.error("pip install jam_player failed after retries")
 
-    return True
+        # THE GATE: is the venv actually usable? If not, fail closed.
+        if not verify_venv_complete():
+            logger.error("Dependency install INCOMPLETE -- refusing to proceed on a broken venv")
+            return False
+
+        logger.info("Dependencies installed and verified complete")
+        return True
+    except Exception as e:
+        logger.error(f"install_dependencies raised unexpectedly -- failing closed: {e}")
+        return False
 
 
 def install_systemd_units() -> bool:
@@ -1909,8 +2173,9 @@ def prewarm_display_screens():
 #   - If display genuinely takes >45s to start, something is broken in
 #     lightdm/X11 and waiting longer won't help -- log the warning, let the
 #     update complete, and let systemd / on-failure restart logic handle it.
-#   - Bounding the wait protects jam-update.service from blowing its
-#     TimeoutStartSec=900 (15min) outer cap on display-specific failures.
+#   - Bounding the wait keeps display-specific failures from eating into
+#     jam-update.service's TimeoutStartSec ceiling (see the budget-coupling
+#     comment at PIP_SUBPROCESS_TIMEOUT -- the unit file owns the number).
 DISPLAY_RESTART_WAIT_TIMEOUT_SEC = 45
 
 # jam-player-display.service is the ONE service we restart synchronously
@@ -2105,6 +2370,16 @@ def main():
     # Check if update is needed (skip check if forcing install)
     if not force_install and current_version == latest_version:
         logger.info("Already up to date")
+        # Reconcile stale rollback state: if a backup (and its in-progress
+        # sentinel) survived a prior run -- cleanup_backup failed, or the run
+        # was killed between the version commit point and cleanup -- the disk
+        # is PROVABLY current here (version marker matches origin), so the
+        # backup is provably stale. Left alone, the sentinel would make the
+        # NEXT update generation keep this ancient snapshot and a failure
+        # there would "roll back" to code from generations ago.
+        if BACKUP_DIR.exists():
+            logger.info("Removing stale backup from a prior update generation")
+            cleanup_backup()
         sys.exit(0)
 
     if force_install:
@@ -2117,10 +2392,21 @@ def main():
 
     # Helper function to handle update failure with rollback
     def fail_update(error_msg: str, should_rollback: bool = True):
-        """Handle update failure: rollback if needed, report error, and exit."""
+        """Handle update failure: rollback if needed, report error, and exit.
+
+        A FAILED rollback is a materially different fleet event than a clean
+        one (the device may be inconsistent on disk), so it is surfaced
+        distinctly in the reported error instead of being silently swallowed
+        -- previously the return value was discarded and a half-rolled-back
+        device was indistinguishable from a cleanly rolled-back one."""
         logger.error(f"Update failed: {error_msg}")
         if should_rollback:
-            rollback_from_backup()
+            if not rollback_from_backup():
+                error_msg = (
+                    f"{error_msg} [ROLLBACK FAILED OR PARTIAL -- device may be "
+                    f"in an inconsistent state; backup preserved for retry]"
+                )
+                logger.error("Rollback did not complete cleanly -- reporting distinctly")
         hide_updating_screen()
         report_error(error_msg)
         sys.exit(1)
@@ -2138,15 +2424,86 @@ def main():
     if not ensure_venv_exists():
         fail_update("Failed to create/verify virtual environment", should_rollback=False)
 
-    # Create backup of current installation before making changes
-    # Skip backup for fresh installs (nothing to backup)
+    # Create backup of current installation before making changes.
+    #
+    # Keyed on DISK STATE, not force_install: the healer (jam_venv_repair)
+    # deliberately clears version.txt after a repair, which flips the next
+    # run into force_install mode -- but the device still has a fully
+    # populated, working installation that absolutely should be backed up.
+    # The old `if not force_install` guard silently ran that entire update
+    # with rollback protection off. Only a genuinely fresh install (no
+    # services dir yet) skips the backup.
     has_backup = False
-    if not force_install:
+    try:
+        services_populated = SERVICES_DEST.exists() and any(SERVICES_DEST.iterdir())
+    except OSError as e:
+        # Filesystem-level failure probing the install dir: report cleanly
+        # (with the updating screen hidden) instead of dying with the screen
+        # wedged until the nightly reboot.
+        fail_update(f"Cannot probe {SERVICES_DEST}: {e}", should_rollback=False)
+    if services_populated:
         if not create_backup():
             fail_update("Failed to create backup - aborting update for safety", should_rollback=False)
         has_backup = True
+        # Mark the install phase as begun: from here until the version-marker
+        # commit point, the disk is mid-update and must never be
+        # re-snapshotted as "known good" by a later interrupted-run's
+        # create_backup. Fail-closed: without the sentinel the poisoning
+        # guard is unarmed, so don't start mutating.
+        if not mark_update_in_progress():
+            fail_update("Failed to arm the backup-poisoning guard (sentinel write) "
+                        "- aborting before any disk mutation", should_rollback=False)
+    else:
+        logger.info("No existing services installation -- fresh install, nothing to back up")
 
     # From here on, failures should trigger rollback (if we have a backup)
+
+    # Install the RECOVERY HOOKS before the risky dependency phase, so the
+    # self-heal exists on disk and in systemd BEFORE anything can break the
+    # venv. Previously the healer was only installed by install_systemd_units
+    # -- which runs AFTER install_dependencies -- so on the fleet's first
+    # update through this code, a deps failure rolled back the healer's
+    # script and the unit was never installed: zero self-heal coverage on
+    # exactly the failure it was built for. Best-effort: a failure here must
+    # not abort the update (install_services/install_systemd_units will
+    # re-copy everything properly later in the run).
+    try:
+        from common.paths import safe_copy
+        SERVICES_DEST.mkdir(parents=True, exist_ok=True)
+        for recovery_file in ('jam_venv_repair.py', 'venv_check.py', 'requirements.txt'):
+            recovery_src = SERVICES_V2_SRC / recovery_file
+            if recovery_src.exists():
+                safe_copy(recovery_src, SERVICES_DEST / recovery_file)
+        # Pre-install BOTH recovery units, not just the healer's:
+        # jam-update.service carries the raised TimeoutStartSec, and until it
+        # lands, a fielded device runs every attempt under the OLD 900s
+        # ceiling. install_systemd_units() would install it -- but that runs
+        # AFTER the pip phase, which is exactly what a chronically slow
+        # network prevents from ever completing. Installing it here (~1-2 min
+        # into the run, well inside any ceiling) bounds the escape at one
+        # more boot: the CURRENT run still dies at 900s (a daemon-reload does
+        # not extend a running start job), but the NEXT boot runs under the
+        # new ceiling. No enable needed for jam-update.service (already
+        # enabled on every fielded device).
+        units_copied = False
+        for recovery_unit in ('jam-venv-repair.service', 'jam-update.service'):
+            unit_src = SYSTEMD_SRC / recovery_unit
+            if unit_src.exists():
+                safe_copy(unit_src, Path('/etc/systemd/system') / recovery_unit)
+                units_copied = True
+        if units_copied:
+            run_command(['systemctl', 'daemon-reload'], timeout=30)
+            enable_ok, _, enable_err = run_command(
+                ['systemctl', 'enable', 'jam-venv-repair.service'], timeout=10)
+            if not enable_ok:
+                # Non-fatal, but NOT invisible: without the enable symlink the
+                # healer never runs at boot, so self-heal coverage is silently
+                # absent until an update fully succeeds.
+                logger.error(f"Failed to enable jam-venv-repair.service -- "
+                             f"self-heal will not run at boot: {enable_err}")
+        logger.info("Recovery hooks (venv self-heal + updater unit) installed ahead of dependency phase")
+    except Exception as e:
+        logger.warning(f"Could not pre-install recovery hooks (non-fatal): {e}")
 
     # Install services
     if not install_services():
@@ -2198,8 +2555,35 @@ def main():
     if not install_systemd_units():
         fail_update("Failed to install systemd units", should_rollback=has_backup)
 
-    # Update version file
-    update_version_file(latest_version)
+    # Final completeness gate before we declare this version installed. The
+    # version marker is the signal that says "device is up to date, stop
+    # retrying" -- so it must never be written on top of a broken venv.
+    # install_dependencies() already verified, but re-check here so nothing
+    # between then and now (a stray failure) can commit a lying marker.
+    if not verify_venv_complete():
+        fail_update("venv incomplete at commit time -- not marking version installed",
+                    should_rollback=has_backup)
+
+    # Update version file. This is the COMMIT POINT: the marker is the
+    # "device is up to date, stop retrying" signal, so a silent write failure
+    # (it returns False, never raises) would re-run the entire update -- full
+    # pip pass, service restarts, screen churn -- on every boot forever,
+    # while telemetry below claims the new version. Fail closed instead.
+    if not update_version_file(latest_version):
+        fail_update("Failed to persist version marker -- update would re-run every boot",
+                    should_rollback=has_backup)
+
+    # The version marker is committed: disk state IS the new known-good
+    # version, and everything after this point is best-effort/idempotent.
+    # Retire the in-progress sentinel NOW (not at cleanup_backup, minutes
+    # away past service restarts) so a kill in the tail can't leave a
+    # sentinel that outlives the successful commit -- which would make the
+    # next update generation keep this generation's backup as "known good"
+    # forever.
+    try:
+        UPDATE_IN_PROGRESS_SENTINEL.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not remove update-in-progress sentinel (non-fatal): {e}")
 
     # Tell the backend which commit we just installed.
     #

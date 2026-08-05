@@ -1,0 +1,59 @@
+[Unit]
+Description=JAM Player venv self-heal - repair a half-installed venv before other services use it
+Documentation=https://github.com/effortlesspresence/jam-player-v2
+
+# Run after first boot completes.
+After=jam-first-boot.service
+
+# Run BEFORE every service that depends on the shared venv. On a HEALTHY venv
+# this is a sub-second import check, so the boot cost is negligible. On a
+# BROKEN venv (a prior update/migration half-installed it) those services
+# genuinely cannot run until it's repaired, so blocking here -- rather than
+# letting them crash-loop into the bare desktop -- is correct.
+#
+# We deliberately do NOT gate on network-online.target: that would delay
+# offline-playback devices on every boot. The repair script does its own fast
+# connectivity probe, and only when a repair is actually needed.
+Before=jam-update.service
+Before=jam-player-display.service
+Before=jam-heartbeat.service
+Before=jam-ws-commands.service
+Before=jam-content-manager.service
+Before=jam-announce.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Run as root (writes to /opt/jam and /etc/jam).
+User=root
+Group=root
+
+# CRITICAL: runs on the SYSTEM python (/usr/bin/python3), NEVER the venv --
+# the whole point is to keep working when the venv is broken. The script is
+# standard-library-only.
+ExecStart=/usr/bin/python3 /opt/jam/services/jam_venv_repair.py
+
+# Bounds how long boot waits for a repair. If it exceeds this, the service
+# fails but boot continues (ordered-after services still start); the pip cache
+# preserves progress and the repair resumes on the next boot.
+#
+# Sized ABOVE the script's own worst-case internal budget so systemd never
+# SIGTERMs it mid-repair (which would strand a half-written venv). Budget:
+#   initial venv check      ~60s
+#   venv recreation        ~120s  (only when the venv itself is gone)
+#   package-index wait     ~100s  (90s poll window + one in-flight probe up to
+#                                  ~10s: 2 hosts x 5s connect)
+#   repair: 2 attempts   ~1320s  (2 x [600s pip + 60s recheck])
+#   -----------------------------
+#   worst case            ~1600s
+# 2100s leaves ~500s of margin. On a HEALTHY venv the script exits in under a
+# second, so this ceiling only ever applies when a repair is actually running.
+TimeoutStartSec=2100
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jam-venv-repair
+
+[Install]
+WantedBy=multi-user.target
