@@ -1558,14 +1558,23 @@ def install_boot_config():
 
 def install_wifi_stability_configs():
     """
-    Install NetworkManager configuration for WiFi stability.
+    Install NetworkManager configuration for network stability.
 
-    These configs improve WiFi reliability on Raspberry Pi:
+    Installs every *.conf from etc/NetworkManager/conf.d/ in the repo, so
+    adding a file there is all that's needed to ship a new NM setting:
     - wifi-powersave-off.conf: Disables WiFi power management to prevent
       the Broadcom chip from becoming unresponsive
-    - wifi-stability.conf: Unlimited auth retries, disable MAC randomization
+    - wifi-stability.conf: Unlimited auth retries, no scan-time MAC
+      randomization
+    - mac-address-permanent.conf: Pins wifi AND ethernet to the permanent
+      hardware MAC. Customers allowlist these devices by MAC (NAC/MAB,
+      DHCP reservations), so a randomized MAC would drop a whole site off
+      the network at once.
 
     Also immediately disables power save for the current session using iw.
+    (The MAC settings need no immediate-apply step: they take effect on the
+    next connection activation, and fielded devices already use their
+    hardware MAC -- this pins that against future NM default changes.)
     """
     logger.info("Installing WiFi stability configs...")
 
