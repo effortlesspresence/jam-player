@@ -733,3 +733,28 @@ def _set_bluetooth_alias_with_retry(new_hostname: str) -> bool:
         f"({last_err}). jam-ble-provisioning will retry via D-Bus."
     )
     return False
+
+
+def seconds_since_boot() -> float:
+    """
+    Seconds since the kernel booted, read from /proc/uptime.
+
+    Deliberately NOT wall-clock arithmetic: fake-hwclock restores a stale
+    saved time at boot and NTP later steps the clock by hours, so any
+    now-minus-boot-timestamp calculation can jump or go negative mid-boot
+    (this is what made a 34-hour outage invisible in the journal once).
+    /proc/uptime is monotonic, immune to both, and counts from BOOT rather
+    than from process start -- so a service that crashes and restarts still
+    sees the true age of this boot.
+
+    Returns:
+        Seconds since boot, or 0.0 if /proc/uptime cannot be read (fail
+        SAFE: 0.0 means "just booted", which keeps recovery affordances
+        switched ON rather than off).
+    """
+    try:
+        with open('/proc/uptime', 'r') as f:
+            return float(f.readline().split()[0])
+    except Exception as e:
+        logger.warning(f"Could not read /proc/uptime ({e}); treating as just-booted")
+        return 0.0

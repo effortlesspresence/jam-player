@@ -592,6 +592,137 @@ def _stop_comitup_hotspot() -> bool:
         return False
 
 
+
+# ----------------------------------------------------------------------------
+# Autoconnect priority
+# ----------------------------------------------------------------------------
+# NetworkManager picks among saved WiFi profiles by connection.autoconnect-
+# priority (higher wins; range -999..999). We never used to set it, so a
+# player with several known networks reconnected to whichever NM preferred,
+# not the one the user last chose. Now: the network the user most recently
+# connected to is ALWAYS the top autoconnect candidate, and the others keep
+# their relative order beneath it.
+
+# Stay well inside NM's documented range so we can always add 1 on top.
+_AUTOCONNECT_PRIORITY_CEILING = 900
+
+
+def _list_wifi_profile_priorities() -> List[Tuple[str, int]]:
+    """
+    All saved 802-11-wireless profiles with their autoconnect priority.
+
+    Returns:
+        List of (connection_name, priority). Profiles whose priority cannot
+        be read are reported as 0 (NM's default).
+    """
+    profiles: List[Tuple[str, int]] = []
+    try:
+        listing = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+            capture_output=True, text=True, timeout=10
+        )
+        if listing.returncode != 0:
+            return profiles
+        for line in listing.stdout.strip().split('\n'):
+            if not line or ':' not in line:
+                continue
+            name, _, ctype = line.rpartition(':')
+            if ctype != '802-11-wireless':
+                continue
+            priority = 0
+            try:
+                shown = subprocess.run(
+                    ['nmcli', '-t', '-f', 'connection.autoconnect-priority',
+                     'connection', 'show', name],
+                    capture_output=True, text=True, timeout=10
+                )
+                if shown.returncode == 0 and ':' in shown.stdout:
+                    priority = int(shown.stdout.strip().rpartition(':')[2] or 0)
+            except (ValueError, subprocess.TimeoutExpired):
+                pass
+            profiles.append((name, priority))
+    except Exception as e:
+        logger.warning(f"Could not list WiFi profile priorities: {e}")
+    return profiles
+
+
+def _set_wifi_profile_priority(connection_name: str, priority: int) -> bool:
+    """Persist connection.autoconnect-priority on one saved profile."""
+    try:
+        result = subprocess.run(
+            ['nmcli', 'connection', 'modify', connection_name,
+             'connection.autoconnect-priority', str(priority)],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Could not set priority {priority} on '{connection_name}': "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Could not set priority on '{connection_name}': {e}")
+        return False
+
+
+def promote_wifi_connection_priority(connection_name: str) -> None:
+    """
+    Make `connection_name` the top autoconnect candidate among saved WiFi
+    profiles, preserving the relative order of all the others.
+
+    Called after every successful user-driven connect (new network, saved
+    network, or re-selecting the current one), so "the network you chose
+    last" is always "the network the player comes back to on its own".
+
+    Best-effort by design: the device is already connected by the time this
+    runs, and a priority we failed to write must never turn a successful
+    connect into a reported failure. Every problem is logged, none raised.
+    """
+    if not connection_name:
+        return
+    try:
+        profiles = _list_wifi_profile_priorities()
+        others = [(n, p) for n, p in profiles if n != connection_name]
+        top = max((p for _, p in others), default=0)
+
+        if top + 1 <= _AUTOCONNECT_PRIORITY_CEILING:
+            # Common case: one write, everyone else untouched.
+            if _set_wifi_profile_priority(connection_name, top + 1):
+                logger.info(
+                    f"WiFi autoconnect priority: '{connection_name}' -> {top + 1} "
+                    f"(top of {len(profiles)} saved profile(s))"
+                )
+            return
+
+        # Ceiling reached after many switches: renumber compactly, keeping
+        # the existing order, then put the chosen profile above them all.
+        logger.info("WiFi autoconnect priorities at ceiling - renumbering saved profiles")
+        ordered = sorted(others, key=lambda np: np[1])
+        for index, (name, _) in enumerate(ordered):
+            _set_wifi_profile_priority(name, index)
+        _set_wifi_profile_priority(connection_name, len(ordered))
+        logger.info(
+            f"WiFi autoconnect priority: '{connection_name}' -> {len(ordered)} "
+            f"after renumbering {len(ordered)} other profile(s)"
+        )
+    except Exception as e:
+        # Never let priority bookkeeping affect the connect result.
+        logger.warning(f"WiFi priority promotion skipped for '{connection_name}': {e}")
+
+
+def _promote_active_wifi_connection() -> None:
+    """Promote whichever WiFi profile is active right now (name resolved live)."""
+    try:
+        active = _get_active_wifi_connection()
+        if active and active.get('name'):
+            promote_wifi_connection_priority(active['name'])
+        else:
+            logger.warning("Connected, but no active WiFi profile found to promote")
+    except Exception as e:
+        logger.warning(f"Could not resolve active WiFi profile for promotion: {e}")
+
+
 def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
     """
     Connect to a WiFi network, preserving existing connection if new attempt fails.
@@ -620,6 +751,9 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
             connected, _ = check_nm_connection_state()
             if connected:
                 logger.info(f"Already connected to {ssid} with working connection - skipping reconnect")
+                # The user still chose it explicitly: make it the top
+                # autoconnect candidate so that choice sticks across reboots.
+                _promote_active_wifi_connection()
                 return True, ""
             logger.info(f"Connected to {ssid} but no internet - will attempt reconnect")
 
@@ -637,6 +771,8 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
 
         if result.returncode == 0:
             logger.info(f"Successfully connected to {ssid}")
+            # Newly connected network becomes the top autoconnect candidate.
+            _promote_active_wifi_connection()
             return True, ""
 
         error_msg = result.stderr.strip() or result.stdout.strip()
@@ -770,6 +906,9 @@ def connect_to_saved_wifi(connection_name: str) -> Tuple[bool, str]:
 
         if result.returncode == 0:
             logger.info(f"Connected to saved network: {connection_name}")
+            # Re-selecting a saved network promotes it to the top, so the
+            # player reconnects to the user's latest choice on its own.
+            promote_wifi_connection_priority(connection_name)
             return True, ""
         else:
             error_msg = result.stderr.strip() or "Connection failed"

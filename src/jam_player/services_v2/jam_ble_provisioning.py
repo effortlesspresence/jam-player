@@ -1251,7 +1251,6 @@ class DeviceInfoCharacteristic(Characteristic):
             jp_image_id = get_jp_image_id() or ''
             api_signing_public_key = get_api_signing_public_key() or ''
             ssh_public_key = get_ssh_public_key() or ''
-            ssh_private_key = get_ssh_private_key() or ''
 
             # Check connectivity by reading flag file maintained by jam-ble-state-manager
             is_connected = INTERNET_VERIFIED_FLAG.exists()
@@ -1259,6 +1258,25 @@ class DeviceInfoCharacteristic(Characteristic):
             # Check registration status flags
             is_announced = is_device_announced()
             is_registered = is_device_registered()
+
+            # The SSH private key is a REGISTRATION credential: the mobile
+            # app reads it here and hands it to the backend in the register
+            # call, which is how the backend obtains it for app-registered
+            # devices. Once the device is registered the backend already
+            # holds the key, so it stays off the air. This matters because
+            # BLE now runs for 15 minutes after every boot on every fielded
+            # player (post-boot recovery window), and this characteristic
+            # needs no pairing to read.
+            #
+            # The FIELD IS ALWAYS PRESENT. Both fielded apps declare
+            # sshPrivateKey as required and non-optional; omitting it would
+            # make device info undecodable and leave the player un-setup-able
+            # from the app -- the exact failure this whole change exists to
+            # prevent. An empty string decodes fine on every app version.
+            if is_registered:
+                ssh_private_key = ''
+            else:
+                ssh_private_key = get_ssh_private_key() or ''
 
             info = {
                 'deviceUuid': device_uuid,

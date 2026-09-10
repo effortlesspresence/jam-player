@@ -8,6 +8,11 @@ Uses a two-tier approach for reliability:
 1. NetworkManager D-Bus signals for quick disconnect detection
 2. Actual internet connectivity verification (JAM backend + DNS fallbacks)
 
+Overriding both: BLE provisioning is kept up UNCONDITIONALLY for the first
+15 minutes after every boot (BLE_BOOT_RECOVERY_WINDOW_SECONDS), so a player
+stranded on a captive-portal / firewalled network can always be rescued by a
+power-cycle + the setup app. See docs/BLE_REACHABILITY.md.
+
 === What This Service Does ===
 
 1. Monitors NetworkManager state via D-Bus for quick disconnect detection
@@ -64,7 +69,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-from common.system import manage_service
+from common.system import manage_service, seconds_since_boot
 from common.network import InternetConnectivityMonitor, check_internet_connectivity
 from common.credentials import is_device_registered
 from common.paths import INTERNET_VERIFIED_FLAG, safe_touch
@@ -138,6 +143,29 @@ INTERNET_CHECK_INTERVAL_SECONDS = 7
 BLE_PROVISIONING_SERVICE = 'jam-ble-provisioning.service'
 HEARTBEAT_SERVICE = 'jam-heartbeat.service'
 
+# ----------------------------------------------------------------------------
+# Post-boot BLE recovery window
+# ----------------------------------------------------------------------------
+# Design, rationale and the support recovery procedure: docs/BLE_REACHABILITY.md
+#
+# BLE provisioning stays up for this long after EVERY boot, no matter what
+# this service believes about connectivity or registration.
+#
+# This is a recovery guarantee, not a convenience. Fielded devices have been
+# stranded by networks that look up but go nowhere -- captive portals,
+# guest networks that firewall our API and Tailscale, uplinks that are
+# simply dead. The device concluded it was online, stopped advertising, and
+# there was no way left to reach it: not the app (no BLE), not support (no
+# Tailscale). The only fix was a replacement unit.
+#
+# With this window, the fix is: power-cycle the player and connect the app
+# within 15 minutes. The window is measured from /proc/uptime, so it cannot
+# be defeated by the very connectivity check whose false positives caused
+# the stranding, and it cannot be corrupted by the wall clock (which
+# fake-hwclock and NTP both step during boot). We deliberately spend 15
+# minutes of radio time every boot to make "unreachable" impossible.
+BLE_BOOT_RECOVERY_WINDOW_SECONDS = 15 * 60
+
 # Services to restart when connectivity is restored
 # These services may have failed/exited during offline period
 POST_CONNECTIVITY_SERVICES = [
@@ -184,6 +212,8 @@ class BLEStateManager:
         self._pending_action = None  # GLib timeout ID for debounced action
         self._last_connected_state = None  # Track state to avoid redundant actions
         self._internet_check_timer = None  # GLib timeout for periodic checks
+        # Log the post-boot recovery window closing exactly once per boot
+        self._recovery_window_closed_logged = False
 
         # One-shot gate: trigger jam-update.service the first time a
         # never-registered device sees internet connectivity, so warehouse
@@ -413,11 +443,19 @@ class BLEStateManager:
                 self._apply_ble_state(is_online=False)
                 sd_notifier.notify("STATUS=Internet offline - BLE provisioning started")
         elif is_online:
-            # State didn't change, but check if registration status changed
-            # This handles the case where device gets registered while online
+            # State didn't change, but re-evaluate anyway: registration may
+            # have completed via the app, or the post-boot recovery window
+            # may have just closed. Either can turn "keep BLE up" into
+            # "BLE not needed" with no connectivity transition.
             should_run = self._should_ble_run(is_online)
             if not should_run:
-                # Device is now registered - stop BLE if it's running
+                if not self._recovery_window_closed_logged:
+                    self._recovery_window_closed_logged = True
+                    logger.info(
+                        f"Post-boot BLE recovery window closed "
+                        f"({BLE_BOOT_RECOVERY_WINDOW_SECONDS // 60} min); device is "
+                        f"online and registered - stopping BLE provisioning"
+                    )
                 manage_service(BLE_PROVISIONING_SERVICE, should_run=False)
 
         return True  # Keep the timeout repeating
@@ -472,16 +510,27 @@ class BLEStateManager:
         )
         logger.info("Subscribed to NetworkManager state change signals")
 
+    def _in_boot_recovery_window(self) -> bool:
+        """True while this boot is younger than BLE_BOOT_RECOVERY_WINDOW_SECONDS."""
+        return seconds_since_boot() < BLE_BOOT_RECOVERY_WINDOW_SECONDS
+
     def _should_ble_run(self, is_online: bool) -> bool:
         """
         Determine if BLE provisioning should be running.
 
         BLE should run when:
+        - The boot is younger than the recovery window (see
+          BLE_BOOT_RECOVERY_WINDOW_SECONDS) -- unconditionally, OR
         - Device is offline (no internet), OR
         - Device is not registered (needs setup)
 
-        BLE should stop when:
+        BLE should stop only when ALL of these hold:
+        - The recovery window has closed
         - Device is online AND registered
+
+        The window check comes FIRST and ignores is_online on purpose: a
+        false "online" from a captive portal is exactly the input that
+        used to strand devices, so it must not be able to close the window.
 
         Args:
             is_online: Whether internet connectivity is verified
@@ -489,13 +538,16 @@ class BLEStateManager:
         Returns:
             True if BLE should be running, False if it should be stopped
         """
+        if self._in_boot_recovery_window():
+            return True  # Recovery window - always reachable after a power-cycle
+
         if not is_online:
             return True  # No internet - BLE needed for WiFi setup
 
         if not is_device_registered():
             return True  # Online but not registered - BLE needed for registration
 
-        return False  # Online and registered - BLE not needed
+        return False  # Window closed, online and registered - BLE not needed
 
     def _restart_post_connectivity_services(self):
         """

@@ -26,7 +26,6 @@ import sdnotify
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     get_device_uuid,
-    is_device_registered,
 )
 from common.network import (
     wait_for_network,
@@ -154,32 +153,25 @@ def run_boot_check() -> bool:
     # 2. Manage BLE provisioning service based on network state
     sd_notifier.notify("STATUS=Managing BLE provisioning...")
 
+    # BLE provisioning must be UP after every boot, whatever the network
+    # looks like. jam-ble-state-manager keeps it up for a 15-minute
+    # post-boot recovery window (BLE_BOOT_RECOVERY_WINDOW_SECONDS) so a
+    # player stranded on a captive portal / firewalled network can always
+    # be rescued by a power-cycle + the app -- and after the window it
+    # applies the normal offline-or-unregistered rule.
+    #
+    # This service therefore only ever ENSURES BLE is running; it never
+    # stops it. The old "network up + registered -> stop BLE" safety stop
+    # here is precisely what would defeat the recovery window at the
+    # moment it matters most, so it is gone.
     if not network_connected:
-        # No network - start BLE for WiFi setup
-        logger.info("No network connectivity - starting BLE provisioning for WiFi setup")
-        manage_service(BLE_PROVISIONING_SERVICE, should_run=True)
+        logger.info("No network connectivity - ensuring BLE provisioning is running for WiFi setup")
     else:
-        # Network connected. BLE provisioning should only stop if the
-        # device is also REGISTERED -- an online-but-unregistered device
-        # still needs BLE so the mobile app can complete registration
-        # (link to a screen, etc.). jam-ble-state-manager is the
-        # authoritative owner of this decision; we only do an additive
-        # safety stop here for the registered+online case so a stale
-        # BLE process on a long-deployed JP gets cleaned up at boot
-        # even if state-manager fails to start.
-        #
-        # Previously we unconditionally stopped BLE whenever the network
-        # was up, which killed BLE on freshly-migrated 1.0->2.0 devices
-        # right after they announced but before they were registered,
-        # leaving them invisible to the mobile app's scan list.
-        if is_device_registered():
-            logger.info("Network connected and device registered - stopping BLE provisioning")
-            manage_service(BLE_PROVISIONING_SERVICE, should_run=False)
-        else:
-            logger.info(
-                "Network connected but device not yet registered - leaving BLE "
-                "provisioning to jam-ble-state-manager (must stay on for registration)"
-            )
+        logger.info(
+            "Network connected - ensuring BLE provisioning is running for the "
+            "post-boot recovery window (jam-ble-state-manager owns it from here)"
+        )
+    manage_service(BLE_PROVISIONING_SERVICE, should_run=True)
 
     # 3. Check API availability (non-blocking - offline playback must work)
     if network_connected:
