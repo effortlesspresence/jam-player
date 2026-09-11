@@ -542,9 +542,21 @@ def on_message(ws, message):
         logger.error(f"Error handling WebSocket message: {e}")
 
 
+# Consecutive WebSocket errors since the last successful connection. The
+# reconnect backoff caps at 60 s, so an offline player used to write one
+# ERROR line to the SD card every minute, indefinitely. Keep the first one
+# (that is the signal that the link broke) and ship the rest.
+_ws_consecutive_errors = 0
+
+
 def on_error(ws, error):
     """Handle WebSocket errors."""
-    logger.error(f"WebSocket error: {error}")
+    global _ws_consecutive_errors
+    _ws_consecutive_errors += 1
+    if _ws_consecutive_errors == 1:
+        logger.warning(f"WebSocket error: {error}")
+    else:
+        logger.debug(f"WebSocket error: {error} (consecutive #{_ws_consecutive_errors})")
     # TODO: call report-jp-error with JAM_WEBSOCKET_COMMANDS service arg
 
 
@@ -555,6 +567,10 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     """Handle WebSocket connection open."""
+    global _ws_consecutive_errors
+    if _ws_consecutive_errors:
+        logger.info(f"WebSocket reconnected after {_ws_consecutive_errors} consecutive error(s)")
+        _ws_consecutive_errors = 0
     logger.info("WebSocket connection established")
     # NOTE: The app-level pinger thread is currently DISABLED on the
     # device side as a safety measure. The backend `ping` Lambda's

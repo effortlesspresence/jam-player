@@ -265,7 +265,10 @@ class HealthMonitor:
         """
         # Map systemd service name to SystemService enum value
         system_service = SYSTEMD_TO_SYSTEM_SERVICE.get(service, SystemService.OTHER)
-        report_error(system_service, message, severity)
+        # check_connectivity=True: without it this blocks ~20 s per call while
+        # offline and writes four WARNING lines each time, every 30 s, on a
+        # player that cannot reach the backend anyway.
+        report_error(system_service, message, severity, check_connectivity=True)
 
     def _should_attempt_restart(self, service: str) -> bool:
         """

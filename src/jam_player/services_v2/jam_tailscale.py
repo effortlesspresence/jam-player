@@ -42,6 +42,7 @@ from common.credentials import (
     get_jp_image_id,
 )
 from common.api import api_request, get_api_base_url, report_error, ErrorSeverity, SystemService
+from common.network import device_is_offline
 
 logger = setup_service_logging('jam-tailscale')
 
@@ -501,6 +502,15 @@ def main():
     if not is_tailscale_installed():
         logger.error("Tailscale is not installed - cannot configure remote access")
         sys.exit(1)
+
+    if device_is_offline():
+        # An announced player whose Tailscale was never provisioned loops
+        # here roughly every two minutes while offline, ~11 WARNING/ERROR
+        # lines a time (~300 card writes an hour). Nothing here can succeed
+        # without internet; jam-ble-state-manager restarts this unit on the
+        # next online transition (POST_CONNECTIVITY_SERVICES).
+        logger.debug("Offline - deferring Tailscale setup until connectivity returns")
+        sys.exit(0)
 
     # Wait for existing connection (may reconnect after boot)
     if wait_for_existing_connection():

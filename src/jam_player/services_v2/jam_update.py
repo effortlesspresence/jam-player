@@ -1459,21 +1459,24 @@ def install_chrony_peering_config():
 
 def install_journald_config():
     """
-    Install the systemd-journald drop-in that caps journal disk usage.
+    Install the systemd-journald drop-in that keeps the SD card alive.
 
-    Without an explicit cap, journald defaults to ~10% of the filesystem
-    (up to 4 GB), which on our 16 GB SD cards is large enough that
-    runaway logging can crowd out the migration script's temporary disk
-    headroom and block updates -- we hit exactly this during the JAM 1.0
-    to 2.0 migration wave. The drop-in caps persistent journal size at
-    1 GB and vacuums aggressively when free disk falls below 500 MB.
+    The drop-in (etc/systemd/journald.conf.d/jam.conf) sets
+    MaxLevelStore=warning so journald never writes anything below WARNING
+    to disk, from any unit, and caps the persistent journal at 64 MB. The
+    JAM services' INFO/DEBUG output goes to the backend instead (see
+    docs/LOGGING.md). Originally this file only capped the journal at 1 GB
+    because uncapped journals blocked the 1.0 -> 2.0 migration.
 
-    systemd automatically loads /etc/systemd/journald.conf.d/*.conf on
-    journald startup; no manual wiring required. We do NOT restart
-    systemd-journald here because (a) a restart briefly detaches every
-    service's stdout/stderr and (b) the config takes effect naturally on
-    the device's nightly 3 AM reboot anyway. Not worth the disruption
-    for a non-urgent change.
+    systemd loads /etc/systemd/journald.conf.d/*.conf when journald starts;
+    no manual wiring required. We do NOT restart systemd-journald here
+    because (a) a restart briefly detaches every service's stdout/stderr
+    and (b) the config takes effect on the device's nightly 3 AM reboot
+    anyway. Not worth the disruption.
+
+    The copy is skipped when the installed file is already identical, so a
+    routine update run does not rewrite it (every avoided write matters on
+    an SD card).
     """
     logger.info("Installing systemd-journald config...")
 
@@ -1485,6 +1488,9 @@ def install_journald_config():
         return
 
     try:
+        if journald_dest.exists() and journald_dest.read_bytes() == journald_src.read_bytes():
+            logger.info(f"  {journald_dest} already up to date")
+            return
         journald_dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(journald_src, journald_dest)
         os.chown(journald_dest, 0, 0)  # root:root

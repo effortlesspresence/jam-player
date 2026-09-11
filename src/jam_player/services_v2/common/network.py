@@ -25,7 +25,9 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Callable
+
+from .paths import INTERNET_VERIFIED_FLAG, STATE_MANAGER_ALIVE_FLAG
 
 logger = logging.getLogger(__name__)
 
@@ -607,39 +609,61 @@ def _stop_comitup_hotspot() -> bool:
 _AUTOCONNECT_PRIORITY_CEILING = 900
 
 
+def _unescape_nmcli_field(value: str) -> str:
+    """nmcli -t escapes ':' and '\\' in field values with a backslash."""
+    return value.replace('\\:', ':').replace('\\\\', '\\')
+
+
+def _split_nmcli_fields(line: str, count: int) -> Optional[List[str]]:
+    """Split a `nmcli -t` line on UNESCAPED colons into exactly `count` fields."""
+    fields, cur, esc = [], '', False
+    for ch in line:
+        if esc:
+            cur += ch; esc = False
+        elif ch == '\\':
+            cur += ch; esc = True
+        elif ch == ':':
+            fields.append(cur); cur = ''
+        else:
+            cur += ch
+    fields.append(cur)
+    if len(fields) != count:
+        return None
+    return [_unescape_nmcli_field(f) for f in fields]
+
+
 def _list_wifi_profile_priorities() -> List[Tuple[str, int]]:
     """
     All saved 802-11-wireless profiles with their autoconnect priority.
 
+    ONE nmcli call for the whole list (it used to be one per profile, each
+    with a 10 s timeout, on the thread that reports "connected" to the app;
+    with many saved networks that pushed past the app's 60 s wait).
+
     Returns:
-        List of (connection_name, priority). Profiles whose priority cannot
-        be read are reported as 0 (NM's default).
+        List of (connection_name, priority). Unparseable priorities read as 0.
     """
     profiles: List[Tuple[str, int]] = []
     try:
         listing = subprocess.run(
-            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+            ['nmcli', '-t', '-f', 'NAME,TYPE,AUTOCONNECT-PRIORITY', 'connection', 'show'],
             capture_output=True, text=True, timeout=10
         )
         if listing.returncode != 0:
             return profiles
         for line in listing.stdout.strip().split('\n'):
-            if not line or ':' not in line:
+            if not line:
                 continue
-            name, _, ctype = line.rpartition(':')
+            fields = _split_nmcli_fields(line, 3)
+            if not fields:
+                continue
+            name, ctype, prio = fields
             if ctype != '802-11-wireless':
                 continue
-            priority = 0
             try:
-                shown = subprocess.run(
-                    ['nmcli', '-t', '-f', 'connection.autoconnect-priority',
-                     'connection', 'show', name],
-                    capture_output=True, text=True, timeout=10
-                )
-                if shown.returncode == 0 and ':' in shown.stdout:
-                    priority = int(shown.stdout.strip().rpartition(':')[2] or 0)
-            except (ValueError, subprocess.TimeoutExpired):
-                pass
+                priority = int(prio or 0)
+            except ValueError:
+                priority = 0
             profiles.append((name, priority))
     except Exception as e:
         logger.warning(f"Could not list WiFi profile priorities: {e}")
@@ -723,6 +747,21 @@ def _promote_active_wifi_connection() -> None:
         logger.warning(f"Could not resolve active WiFi profile for promotion: {e}")
 
 
+def _promote_in_background(target: Callable[[], None]) -> None:
+    """
+    Run a priority promotion on its own daemon thread.
+
+    The connect functions return "connected" to the BLE handler, which is
+    what the app is polling for with a 60 s deadline; the promotion's nmcli
+    calls must not sit in front of that. The device is already connected
+    when this runs, so nothing waits on the result.
+    """
+    try:
+        threading.Thread(target=target, name='wifi-priority-promotion', daemon=True).start()
+    except Exception as e:
+        logger.warning(f"Could not start priority promotion thread: {e}")
+
+
 def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
     """
     Connect to a WiFi network, preserving existing connection if new attempt fails.
@@ -753,7 +792,7 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
                 logger.info(f"Already connected to {ssid} with working connection - skipping reconnect")
                 # The user still chose it explicitly: make it the top
                 # autoconnect candidate so that choice sticks across reboots.
-                _promote_active_wifi_connection()
+                _promote_in_background(_promote_active_wifi_connection)
                 return True, ""
             logger.info(f"Connected to {ssid} but no internet - will attempt reconnect")
 
@@ -772,7 +811,7 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
         if result.returncode == 0:
             logger.info(f"Successfully connected to {ssid}")
             # Newly connected network becomes the top autoconnect candidate.
-            _promote_active_wifi_connection()
+            _promote_in_background(_promote_active_wifi_connection)
             return True, ""
 
         error_msg = result.stderr.strip() or result.stdout.strip()
@@ -908,7 +947,7 @@ def connect_to_saved_wifi(connection_name: str) -> Tuple[bool, str]:
             logger.info(f"Connected to saved network: {connection_name}")
             # Re-selecting a saved network promotes it to the top, so the
             # player reconnects to the user's latest choice on its own.
-            promote_wifi_connection_priority(connection_name)
+            _promote_in_background(lambda: promote_wifi_connection_priority(connection_name))
             return True, ""
         else:
             error_msg = result.stderr.strip() or "Connection failed"
@@ -1085,6 +1124,78 @@ def _check_tls_connectivity(host: str, port: int, timeout: float) -> bool:
     except Exception as e:
         logger.debug(f"Unexpected error in TLS connectivity check to {host}: {e}")
         return False
+
+
+# How old the state manager's liveness stamp may be before its flag is
+# treated as unknown. The manager stamps every 7 s; 60 s allows a slow tick
+# (a connectivity check can take ~15 s) plus a service restart without a
+# false "unknown", and bounds how long a dead manager can freeze the answer.
+CONNECTIVITY_STATE_MAX_AGE_SECONDS = 60
+
+
+def connectivity_state_is_fresh(max_age: float = CONNECTIVITY_STATE_MAX_AGE_SECONDS) -> bool:
+    """True while jam-ble-state-manager has stamped its liveness within max_age."""
+    try:
+        age = time.time() - STATE_MANAGER_ALIVE_FLAG.stat().st_mtime
+        return age <= max_age
+    except FileNotFoundError:
+        return False  # never stamped this boot (manager not up yet, or not running)
+    except Exception:
+        return False
+
+
+def is_internet_verified(unreadable_means: bool = False) -> bool:
+    """
+    Do we have VERIFIED internet right now? Cheap and non-blocking.
+
+    This is the one place that reads the .internet_verified flag, which
+    jam-ble-state-manager owns: it clears it at the start of every boot and
+    writes it only once check_internet_connectivity() has actually passed.
+    Every other service asks this function instead of probing the network
+    itself, so "online" means the same thing everywhere.
+
+    THE FLAG IS A CACHE, AND IT LAGS. Going online it is written on the first
+    passing check, BEFORE the manager restarts the services that depend on
+    it, so a fresh "online" is never missed. Going offline it can linger for
+    roughly 20 seconds (link drop) to two minutes (link up, internet dead,
+    dead resolvers) while the manager collects three consecutive failures.
+    Callers must tolerate acting on a stale "online" for that long; none of
+    them should treat this as a real-time probe.
+
+    THE FLAG CAN ALSO BE FROZEN. It is maintained by one process; if that
+    process dies or wedges, the flag stops changing. The manager therefore
+    stamps its liveness every tick, and a stale stamp makes the answer
+    "unknown" here rather than a confident stale value.
+
+    Args:
+        unreadable_means: the answer for "unknown" -- the flag cannot be read
+            (I/O error) OR nobody is maintaining it (stale liveness stamp).
+            Callers choose the safe direction for THEM: the display and the
+            BLE Device Info treat unknown as offline (the user is steered to
+            WiFi setup); the oneshot gates treat unknown as online so a dead
+            manager can never silently disable a service. Default False.
+    """
+    if not connectivity_state_is_fresh():
+        logger.debug("Connectivity state not being maintained (state manager stamp stale); answering 'unknown'")
+        return unreadable_means
+    try:
+        return INTERNET_VERIFIED_FLAG.exists()
+    except Exception as e:
+        logger.warning(f"Could not read internet-verified flag ({e}); assuming {'online' if unreadable_means else 'offline'}")
+        return unreadable_means
+
+
+def device_is_offline() -> bool:
+    """
+    The oneshot services' gate: `not is_internet_verified(...)`, failing OPEN.
+
+    A per-minute timer or a Restart=on-failure unit that runs its whole retry
+    ladder while offline writes a burst of WARNING/ERROR lines to the SD card
+    on every run. Those services exit quietly when this is True. If the flag
+    is unreadable this returns False ("not known to be offline") so the
+    service still runs: a broken flag must never disable anything.
+    """
+    return not is_internet_verified(unreadable_means=True)
 
 
 def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT) -> Tuple[bool, str]:

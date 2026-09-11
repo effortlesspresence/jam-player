@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 
 import requests
+import threading
 from nacl.signing import SigningKey
 from nacl.encoding import Base64Encoder
 
@@ -163,6 +164,53 @@ def sign_request(method: str, path: str, body: str = "") -> Optional[Dict[str, s
         return None
 
 
+# ----------------------------------------------------------------------------
+# Failure de-duplication
+# ----------------------------------------------------------------------------
+# An offline or backend-down player used to write an ERROR line for EVERY
+# failed request -- one per heartbeat, one per poll, one per shipper flush --
+# and each of those lines was an SD-card write. The offline transition itself
+# is already recorded once by jam-ble-state-manager. So: the first failure of
+# a given endpoint is logged at WARNING (kept on the card), every repeat while
+# it keeps failing is logged at DEBUG (shipped to the backend when that is
+# possible, never written locally), and the first success afterwards logs
+# one INFO line with the failure count. State is per process; a service
+# restart simply starts the pattern over.
+
+_failure_lock = threading.Lock()
+_consecutive_failures: Dict[str, int] = {}
+
+
+def _endpoint_key(method: str, path: str) -> str:
+    return f"{method.upper()} {path}"
+
+
+def _log_request_failure(method: str, path: str, message: str) -> None:
+    """Log a failed request: WARNING the first time, DEBUG while it repeats."""
+    key = _endpoint_key(method, path)
+    with _failure_lock:
+        count = _consecutive_failures.get(key, 0) + 1
+        _consecutive_failures[key] = count
+    if count == 1:
+        logger.warning(message)
+    else:
+        logger.debug(f"{message} (consecutive failure #{count}, first was logged at WARNING)")
+
+
+def _note_request_success(method: str, path: str) -> None:
+    """Log recovery once after a run of failures, then reset the counter."""
+    key = _endpoint_key(method, path)
+    with _failure_lock:
+        count = _consecutive_failures.pop(key, 0)
+    if count:
+        logger.info(f"API request recovered after {count} consecutive failure(s): {key}")
+
+
+def _reset_failure_state_for_tests() -> None:
+    with _failure_lock:
+        _consecutive_failures.clear()
+
+
 def api_request(
     method: str,
     path: str,
@@ -218,19 +266,20 @@ def api_request(
         # Log response: successes are debug (expected, noisy), client/server
         # errors are warning (actionable signal during incidents).
         if response.status_code >= 400:
-            logger.warning(f"API response: {response.status_code} for {method} {path}")
+            _log_request_failure(method, path, f"API response: {response.status_code} for {method} {path}")
         else:
             logger.debug(f"API response: {response.status_code}")
+            _note_request_success(method, path)
         return response
 
     except requests.exceptions.Timeout:
-        logger.error(f"API request timed out after {timeout}s: {method} {url}")
+        _log_request_failure(method, path, f"API request timed out after {timeout}s: {method} {url}")
         return None
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"Could not connect to API: {method} {url} - {e}")
+        _log_request_failure(method, path, f"Could not connect to API: {method} {url} - {e}")
         return None
     except Exception as e:
-        logger.error(f"API request error: {method} {url} - {type(e).__name__}: {e}")
+        _log_request_failure(method, path, f"API request error: {method} {url} - {type(e).__name__}: {e}")
         return None
 
 
@@ -274,6 +323,16 @@ class SystemService:
     BLUETOOTH = 'BLUETOOTH'
     CHRONY = 'CHRONY'
     TAILSCALE = 'TAILSCALE'
+    # Our own services that used to be reported as OTHER (or conflated with
+    # the system daemons above). Additive, 2026-09-10.
+    JAM_DISPLAY_CACHE_PREWARM = 'JAM_DISPLAY_CACHE_PREWARM'
+    JAM_DISPLAY_HOTPLUG_MONITOR = 'JAM_DISPLAY_HOTPLUG_MONITOR'
+    JAM_DISPLAY_WAIT_FOR_HDMI = 'JAM_DISPLAY_WAIT_FOR_HDMI'
+    JAM_INSTALLED_VERSION_REPORTER = 'JAM_INSTALLED_VERSION_REPORTER'
+    JAM_OUTLET_STATUS_POLLER = 'JAM_OUTLET_STATUS_POLLER'
+    JAM_VENV_REPAIR = 'JAM_VENV_REPAIR'
+    JAM_TAILSCALE = 'JAM_TAILSCALE'
+    JAM_CHRONY_PEERING = 'JAM_CHRONY_PEERING'
     OTHER = 'OTHER'
 
 

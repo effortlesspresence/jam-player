@@ -5,6 +5,14 @@ Documentation=https://github.com/anthropics/jam-player
 # Wait for Bluetooth to be ready
 After=bluetooth.target
 Requires=bluetooth.target
+# Follow bluetoothd itself, not just the target: bluetooth.target stays
+# active when bluetooth.service crashes or is restarted, and this process
+# then sits "active" advertising nothing (its adapter proxy is dead). With
+# PartOf=, systemd stops/restarts us whenever bluetooth.service is stopped or
+# restarted, and After= orders us behind it on the way back up.
+After=bluetooth.service
+Requires=bluetooth.service
+PartOf=bluetooth.service
 
 # Wait for first boot to complete (credentials generated)
 After=jam-first-boot.service

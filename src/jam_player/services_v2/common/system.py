@@ -94,7 +94,12 @@ def setup_glib_watchdog(interval_seconds: int = 30) -> None:
     notifier = get_systemd_notifier()
 
     def ping_watchdog() -> bool:
-        notifier.notify("WATCHDOG=1")
+        # A raising GLib callback is silently removed by PyGObject; a removed
+        # pinger means systemd's WatchdogSec kills the service. Never raise.
+        try:
+            notifier.notify("WATCHDOG=1")
+        except Exception:
+            pass
         return True  # Return True to keep the timeout active
 
     GLib.timeout_add_seconds(interval_seconds, ping_watchdog)
@@ -293,6 +298,14 @@ def start_service(service_name: str) -> bool:
     """
     try:
         logger.info(f"Starting {service_name}...")
+        # A unit that hit StartLimitBurst stays 'failed' and refuses `start` until
+        # reset. BLE provisioning must come back once whatever crashed it is fixed,
+        # so clear that state first (harmless when the unit is not failed).
+        try:
+            subprocess.run(['systemctl', 'reset-failed', service_name],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
         result = subprocess.run(
             ['systemctl', 'start', service_name],
             capture_output=True,
@@ -758,3 +771,34 @@ def seconds_since_boot() -> float:
     except Exception as e:
         logger.warning(f"Could not read /proc/uptime ({e}); treating as just-booted")
         return 0.0
+
+
+def unit_active_since_boot_seconds(unit_name: str, timeout: int = 5) -> Optional[float]:
+    """
+    Seconds after boot at which `unit_name` most recently became active.
+
+    Read from systemd's ActiveEnterTimestampMonotonic, which is on the same
+    clock as /proc/uptime on a device that never suspends (every JAM Player),
+    so the two can be compared directly. Lets a caller measure "N minutes
+    after this service actually came up" instead of "N minutes after
+    power-on", which matters whenever boot is slow or the unit was delayed.
+
+    Returns:
+        Seconds since boot, or None if the unit has never been active in
+        this boot, does not exist, or systemd cannot be asked. None means
+        "unknown" -- callers must fall back to their boot-relative rule,
+        never treat it as zero.
+    """
+    try:
+        result = subprocess.run(
+            ['systemctl', 'show', '-p', 'ActiveEnterTimestampMonotonic', '--value', unit_name],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            return None
+        raw = result.stdout.strip()
+        if not raw or raw == '0':
+            return None  # never active this boot
+        return int(raw) / 1_000_000.0  # microseconds -> seconds
+    except Exception:
+        return None

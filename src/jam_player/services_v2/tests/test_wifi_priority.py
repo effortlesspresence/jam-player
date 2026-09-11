@@ -30,16 +30,13 @@ class FakeNmcli:
 
     def __call__(self, argv, **kwargs):
         cp = subprocess.CompletedProcess(argv, 0, stdout='', stderr='')
-        if argv[:2] == ['nmcli', '-t'] and argv[-2:] == ['connection', 'show']:
+        if argv[:2] == ['nmcli', '-t'] and 'NAME,TYPE,AUTOCONNECT-PRIORITY' in argv:
             lines = []
             for name, prio in self.profiles.items():
                 ctype = '802-3-ethernet' if prio is None else '802-11-wireless'
-                lines.append(f'{name}:{ctype}')
+                esc = name.replace('\\', '\\\\').replace(':', '\\:')
+                lines.append(f'{esc}:{ctype}:{prio or 0}')
             cp.stdout = '\n'.join(lines) + '\n'
-            return cp
-        if argv[:2] == ['nmcli', '-t'] and 'connection.autoconnect-priority' in argv:
-            name = argv[-1]
-            cp.stdout = f'connection.autoconnect-priority:{self.profiles.get(name) or 0}\n'
             return cp
         if argv[:3] == ['nmcli', 'connection', 'modify']:
             name, prio = argv[3], int(argv[-1])
@@ -68,6 +65,10 @@ class PromotePriorityTests(unittest.TestCase):
     def test_reselecting_current_top_stays_top_with_one_write(self):
         fake = self._promote({'a': 0, 'b': 5, 'c': 2}, 'b')
         self.assertEqual(fake.modified, [('b', 3)])  # above max(others)=2
+
+    def test_names_with_colons_round_trip_through_nmcli_escaping(self):
+        fake = self._promote({'Cafe: Guest': 0, 'other': 4}, 'Cafe: Guest')
+        self.assertEqual(fake.modified, [('Cafe: Guest', 5)])
 
     def test_ethernet_profiles_are_ignored(self):
         fake = self._promote({'wired': None, 'only': 0}, 'only')
@@ -100,16 +101,16 @@ class ConnectPathsPromoteTests(unittest.TestCase):
         with mock.patch.object(network, '_get_active_wifi_connection', return_value=None), \
              mock.patch.object(network, '_stop_comitup_hotspot', return_value=False), \
              mock.patch.object(network.subprocess, 'run', return_value=ok), \
-             mock.patch.object(network, 'promote_wifi_connection_priority') as promote:
+             mock.patch.object(network, '_promote_in_background') as promote:
             self.assertEqual(network.connect_to_saved_wifi('cafe'), (True, ''))
-        promote.assert_called_once_with('cafe')
+        promote.assert_called_once()  # background promotion of 'cafe'
 
     def test_saved_network_failure_does_not_promote(self):
         bad = subprocess.CompletedProcess(['nmcli'], 4, stdout='', stderr='no secrets')
         with mock.patch.object(network, '_get_active_wifi_connection', return_value=None), \
              mock.patch.object(network, '_stop_comitup_hotspot', return_value=False), \
              mock.patch.object(network.subprocess, 'run', return_value=bad), \
-             mock.patch.object(network, 'promote_wifi_connection_priority') as promote:
+             mock.patch.object(network, '_promote_in_background') as promote:
             ok, _ = network.connect_to_saved_wifi('cafe')
         self.assertFalse(ok)
         promote.assert_not_called()
@@ -120,7 +121,7 @@ class ConnectPathsPromoteTests(unittest.TestCase):
              mock.patch.object(network, '_log_network_diagnostic_info'), \
              mock.patch.object(network, '_stop_comitup_hotspot', return_value=False), \
              mock.patch.object(network, '_connect_wifi_secure', return_value=ok), \
-             mock.patch.object(network, '_promote_active_wifi_connection') as promote:
+             mock.patch.object(network, '_promote_in_background') as promote:
             self.assertEqual(network.connect_to_wifi('Cafe', 'pw'), (True, ''))
         promote.assert_called_once()
 
@@ -128,7 +129,7 @@ class ConnectPathsPromoteTests(unittest.TestCase):
         current = {'name': 'jam-wifi-abc', 'ssid': 'Cafe'}
         with mock.patch.object(network, '_get_active_wifi_connection', return_value=current), \
              mock.patch.object(network, 'check_nm_connection_state', return_value=(True, 'wifi')), \
-             mock.patch.object(network, '_promote_active_wifi_connection') as promote:
+             mock.patch.object(network, '_promote_in_background') as promote:
             self.assertEqual(network.connect_to_wifi('Cafe', 'pw'), (True, ''))
         promote.assert_called_once()
 

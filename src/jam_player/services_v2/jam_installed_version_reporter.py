@@ -35,6 +35,7 @@ from common.installed_version import (
     read_installed_version,
     report_installed_version_to_backend,
 )
+from common.network import device_is_offline
 from common.logging_config import setup_service_logging
 
 logger = setup_service_logging("jam-installed-version-reporter")
@@ -65,6 +66,16 @@ def main() -> int:
         )
         return 0
 
+    if device_is_offline():
+        # Offline: the retry ladder below would fail, write a burst of
+        # WARNING/ERROR lines to the SD card and exit non-zero, which made
+        # systemd restart this unit every ~2 minutes forever (hundreds of
+        # card writes an hour on any player that boots without internet).
+        # Exit success; jam-ble-state-manager re-runs this unit when
+        # connectivity returns.
+        logger.debug("Offline - skipping installed-version report until connectivity returns")
+        return 0
+
     logger.info(f"Reporting installed version {version}")
 
     backoff = INITIAL_BACKOFF_SEC
@@ -74,19 +85,21 @@ def main() -> int:
             return 0
 
         if attempt < MAX_ATTEMPTS:
-            logger.warning(
+            # DEBUG, not WARNING: shipped to the backend, never written to
+            # the card. The single summary below is the line worth keeping.
+            logger.debug(
                 f"Attempt {attempt}/{MAX_ATTEMPTS} failed -- "
                 f"retrying in {backoff}s"
             )
             time.sleep(backoff)
             backoff *= 2  # exponential: 5, 10, 20, 40s
         else:
-            logger.error(f"All {MAX_ATTEMPTS} attempts failed")
+            logger.warning(f"All {MAX_ATTEMPTS} attempts failed while the device believes it is online")
 
-    # Exit non-zero so systemd's `Restart=on-failure` policy kicks in
-    # for one more pass after RestartSec. After StartLimitBurst is hit,
-    # systemd stops retrying -- the next boot will start fresh.
-    return 1
+    # Exit 0 even on failure: the unit no longer carries Restart=on-failure
+    # (a failed report is not worth a restart loop on an SD card), and
+    # jam-ble-state-manager re-runs this unit on the next online transition.
+    return 0
 
 
 if __name__ == "__main__":

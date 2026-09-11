@@ -38,8 +38,9 @@ ExecStart=/opt/jam/venv/bin/python /opt/jam/services/jam_installed_version_repor
 # Retry on failure with a 30s gap. The script also has internal retries
 # with exponential backoff (5s -> 40s), so by the time systemd restarts
 # us we've already given the network ~75s to recover.
-Restart=on-failure
-RestartSec=30
+# No Restart=: a failed report is not worth a restart loop on an SD card.
+# The service exits 0 when offline, and jam-ble-state-manager re-runs this
+# unit on the next online transition.
 
 # Bounded total time. The script's internal retries take up to ~75s; a
 # 5-minute hard limit gives plenty of headroom while ensuring a stuck

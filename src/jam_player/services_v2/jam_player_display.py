@@ -85,6 +85,7 @@ from datetime import datetime, time as dt_time
 # Add the services directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from common.network import is_internet_verified
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     is_device_registered,
@@ -2020,7 +2021,7 @@ class JamPlayerDisplayManager:
 
         # 2a. No playable content and no verified internet -> we can't
         # make progress on setup until WiFi is (re)configured.
-        if not INTERNET_VERIFIED_FLAG.exists():
+        if not is_internet_verified():
             return DisplayMode.AWAITING_NETWORK
 
         # 2b. Online but not yet registered to a Location. Registration
@@ -2671,6 +2672,9 @@ class JamPlayerDisplayManager:
 
         self._current_speed = SPEED_NORMAL
         self._current_scene_index = -1
+        # (scene id, media path) pairs already reported missing, so a missing
+        # file is one ERROR rather than two per second. See the playback loop.
+        self._missing_media_reported = set()
         self._last_sync_check = 0
         self._last_sync_log = 0
         self._last_schedule_check = 0
@@ -2880,7 +2884,19 @@ class JamPlayerDisplayManager:
             # Check if we need to switch scenes
             if scene_index != self._current_scene_index:
                 if not media_path.exists():
-                    logger.error(f"Media file not found: {media_path}")
+                    # This loop is wall-clock driven: it recomputes the scene
+                    # that SHOULD be showing every 0.5 s, so a missing file
+                    # used to log an ERROR twice a second for the whole of
+                    # that scene's slot (7200/h, all of it written to the SD
+                    # card). Report each missing file once and stay quiet
+                    # until it changes; the screen keeps showing the previous
+                    # scene and the schedule moves on by itself.
+                    missing_key = (scene.get('id'), str(media_path))
+                    if missing_key not in self._missing_media_reported:
+                        self._missing_media_reported.add(missing_key)
+                        logger.error(f"Media file not found: {media_path}")
+                    else:
+                        logger.debug(f"Media file still missing: {media_path}")
                     time.sleep(0.5)
                     continue
 

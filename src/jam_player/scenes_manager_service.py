@@ -53,6 +53,30 @@ POLL_INTERVAL_SECONDS = 300
 refresh_event = threading.Event()
 
 
+_poll_failures = {}
+
+
+def _log_poll_failure(key: str, message: str) -> None:
+    """
+    First failure of a poll site is a WARNING (kept on the SD card); repeats
+    are DEBUG (shipped to the backend only). A registered player polls every
+    300 s, so an offline week used to be a steady drip of card writes with no
+    new information after the first line.
+    """
+    count = _poll_failures.get(key, 0) + 1
+    _poll_failures[key] = count
+    if count == 1:
+        logger.warning(message)
+    else:
+        logger.debug(f"{message} (consecutive failure #{count})")
+
+
+def _note_poll_success(key: str) -> None:
+    count = _poll_failures.pop(key, 0)
+    if count:
+        logger.info(f"{key} recovered after {count} consecutive failure(s)")
+
+
 def handle_refresh_signal(signum, frame):
     """
     Handle SIGUSR1 signal to trigger immediate content refresh.
@@ -93,13 +117,14 @@ def check_for_updates() -> bool:
         )
 
         if not response:
-            logger.warning("No response from update-poll endpoint")
+            _log_poll_failure("update-poll", "No response from update-poll endpoint")
             return False
 
         if response.status_code != 200:
-            logger.warning(f"update-poll returned {response.status_code}: {response.text}")
+            _log_poll_failure("update-poll", f"update-poll returned {response.status_code}: {response.text}")
             return False
 
+        _note_poll_success("update-poll")
         data = response.json()
         has_updates = data.get('hasUnpulledUpdates', False)
 
@@ -138,13 +163,14 @@ def fetch_content() -> Optional[Tuple[List[Dict[str, Any]], Optional[int]]]:
         )
 
         if not response:
-            logger.error("No response from content endpoint")
+            _log_poll_failure("content", "No response from content endpoint")
             return None
 
         if response.status_code != 200:
-            logger.error(f"content endpoint returned {response.status_code}: {response.text}")
+            _log_poll_failure("content", f"content endpoint returned {response.status_code}: {response.text}")
             return None
 
+        _note_poll_success("content")
         data = response.json()
         scenes = data.get('jamPlayerScenes', [])
         # numScreens: how many screens are in this JP's layout (added additively

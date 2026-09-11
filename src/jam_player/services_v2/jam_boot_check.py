@@ -35,6 +35,7 @@ from common.api import (
 )
 import subprocess
 from common.system import (
+    seconds_since_boot,
     check_chrony_sync,
     check_required_services,
     manage_service,
@@ -122,6 +123,11 @@ def run_boot_check() -> bool:
     Returns True if boot check completed (even with warnings).
     """
     log_service_start(logger, 'JAM Boot Check Service')
+    # One deliberate WARNING per boot. The card stores WARNING+ only, so a
+    # healthy boot would otherwise leave no journal entries at all, and boots
+    # with no entries vanish from `journalctl --list-boots`, which the
+    # dark-period forensics rely on. One line per boot is the cheapest marker.
+    logger.warning(f"BOOT MARKER: JAM Player boot check starting (uptime {seconds_since_boot():.0f}s)")
 
     # Notify systemd we're starting
     sd_notifier.notify("STATUS=Running boot checks...")
@@ -171,7 +177,15 @@ def run_boot_check() -> bool:
             "Network connected - ensuring BLE provisioning is running for the "
             "post-boot recovery window (jam-ble-state-manager owns it from here)"
         )
-    manage_service(BLE_PROVISIONING_SERVICE, should_run=True)
+    # --no-block: jam-ble-provisioning is Type=notify and reaches READY only
+    # after rfkill unblock, adapter reset and a WiFi scan (10-30 s). Waiting
+    # here held up jam-announce and jam-content-manager (ordered after us)
+    # on every boot. The state manager owns the service from here anyway.
+    try:
+        subprocess.run(['systemctl', 'start', '--no-block', BLE_PROVISIONING_SERVICE],
+                       capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        logger.warning(f"Could not request start of {BLE_PROVISIONING_SERVICE}: {e}")
 
     # 3. Check API availability (non-blocking - offline playback must work)
     if network_connected:

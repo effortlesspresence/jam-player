@@ -172,11 +172,30 @@ class ChronyPeeringService:
 
     def _announce_loop(self):
         """Periodically announce our presence."""
+        # With no IPv4 route the multicast send raises ENETUNREACH every
+        # 10 s. At WARNING that was 360 SD-card writes an hour, and a
+        # 10-second period dirties the journal in every kernel writeback
+        # window -- the worst possible shape for card wear. Keep the first
+        # failure and the recovery; ship everything in between.
+        send_failures = 0
         while self.running:
             try:
                 self._send_announcement()
+                if send_failures:
+                    logger.info(f"Peer announcements resumed after {send_failures} failure(s)")
+                    send_failures = 0
+            except OSError as e:
+                send_failures += 1
+                if send_failures == 1:
+                    logger.warning(f"Error sending announcement: {e}")
+                else:
+                    logger.debug(f"Error sending announcement: {e} (consecutive #{send_failures})")
             except Exception as e:
-                logger.warning(f"Error sending announcement: {e}")
+                send_failures += 1
+                if send_failures == 1:
+                    logger.warning(f"Error sending announcement: {e}")
+                else:
+                    logger.debug(f"Error sending announcement: {e} (consecutive #{send_failures})")
 
             time.sleep(ANNOUNCE_INTERVAL_SEC)
 

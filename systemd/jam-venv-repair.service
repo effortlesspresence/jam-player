@@ -15,6 +15,13 @@ After=jam-first-boot.service
 # offline-playback devices on every boot. The repair script does its own fast
 # connectivity probe, and only when a repair is actually needed.
 Before=jam-update.service
+# Deliberately NOT ordered before the BLE units. Before= only orders, so a
+# repair that fails does not block them -- but one that hangs, or a genuine
+# repair that runs long, holds them for up to TimeoutStartSec (35 min) while
+# the post-boot BLE recovery window (measured from boot) drains away. BLE
+# must never wait on anything at boot. If a broken venv crash-loops BLE
+# into its start limit, jam-ble-state-manager re-asserts it every 7 s and
+# runs `systemctl reset-failed` first, so it comes back once repair is done.
 Before=jam-player-display.service
 Before=jam-heartbeat.service
 Before=jam-ws-commands.service
@@ -53,6 +60,12 @@ TimeoutStartSec=2100
 
 StandardOutput=journal
 StandardError=journal
+# This unit's script prints() rather than using the JAM logging setup, so
+# its lines carry no <N> priority prefix and journald would tag them info
+# and, under MaxLevelStore=warning, never store them. A venv repair failing
+# is exactly the kind of thing that must survive on the card, so store the
+# whole stream at warning.
+SyslogLevel=warning
 SyslogIdentifier=jam-venv-repair
 
 [Install]

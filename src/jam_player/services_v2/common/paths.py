@@ -37,6 +37,45 @@ from pathlib import Path
 
 # Base directories
 JAM_ETC_DIR = Path('/etc/jam')
+
+# Volatile state: tmpfs, so writing here never touches the SD card and
+# nothing survives a reboot (which is exactly what we want for "is something
+# happening right now" markers).
+JAM_RUN_DIR = Path('/run/jam')
+
+# Set by jam-ble-provisioning while a WiFi connection attempt started over
+# BLE is still running, and cleared when it finishes. jam-ble-state-manager
+# refuses to close the post-boot BLE recovery window while this exists, so a
+# setup session started at minute 14 is never cut off mid-connect.
+BLE_SESSION_ACTIVE_FLAG = JAM_RUN_DIR / 'ble_session_active'
+
+# Touched by jam-ble-state-manager on every 7-second tick (and at the start
+# of its boot-time check). The .internet_verified flag is a CACHE maintained
+# by that one process; readers use this stamp's age to know whether the
+# cache is being maintained at all. A stale stamp means "unknown", and every
+# reader has an explicit fail direction for unknown -- the oneshot gates run,
+# the display and BLE report offline. tmpfs: no SD-card write.
+STATE_MANAGER_ALIVE_FLAG = JAM_RUN_DIR / 'state_manager_alive'
+
+
+def touch_volatile_flag(path: Path) -> bool:
+    """
+    Create or refresh a marker under /run (tmpfs): mkdir parents, touch.
+
+    Deliberately NOT safe_touch(): that one fsyncs because it targets the SD
+    card, and there is nothing to sync on tmpfs. Never raises -- a marker is
+    advisory and its absence has a defined meaning for every reader -- so
+    callers just call it and move on.
+
+    Returns:
+        True if the marker exists afterwards, False if it could not be written.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return True
+    except Exception:
+        return False
 DEVICE_DATA_DIR = JAM_ETC_DIR / 'device_data'
 CREDENTIALS_DIR = JAM_ETC_DIR / 'credentials'
 CONFIG_DIR = JAM_ETC_DIR / 'config'

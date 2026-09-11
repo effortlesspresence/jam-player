@@ -20,6 +20,7 @@ import os
 # Add the services directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from common.network import device_is_offline
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     get_device_uuid,
@@ -99,6 +100,16 @@ def main():
     # Check if already announced (shouldn't happen due to ConditionPathExists, but be safe)
     if is_device_announced():
         logger.info("Device already announced - exiting")
+        sys.exit(0)
+
+    if device_is_offline():
+        # Announce cannot succeed without internet, and failing here costs
+        # three ERROR/WARNING lines per run plus a systemd restart, five
+        # times, until StartLimitBurst trips -- about 45 card writes per
+        # boot on an unannounced offline player. jam-ble-state-manager
+        # restarts this unit on the next online transition
+        # (POST_CONNECTIVITY_SERVICES).
+        logger.debug("Offline - deferring announce until connectivity returns")
         sys.exit(0)
 
     # Gather required credentials

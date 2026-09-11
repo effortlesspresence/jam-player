@@ -132,7 +132,7 @@ def main() -> int:
                 now_connected = current_states.get(name, False)
                 if prev_connected and not now_connected:
                     disconnected_at[name] = now
-                    logger.info(f"HDMI disconnect detected on: {name}")
+                    logger.warning(f"HDMI disconnect detected on: {name}")
 
             # Detect disconnected -> connected transitions.
             for name, now_connected in current_states.items():
@@ -144,7 +144,7 @@ def main() -> int:
                 if down_since is None:
                     # First appearance of this connector (came online
                     # after boot, no prior disconnect timestamp).
-                    logger.info(
+                    logger.warning(
                         f"HDMI connect detected on: {name} "
                         f"(no prior disconnect timestamp)"
                     )
@@ -157,7 +157,7 @@ def main() -> int:
                     # log line to keep the journal readable.
                     continue
 
-                logger.info(
+                logger.warning(
                     f"HDMI reconnect detected on: {name} "
                     f"(was disconnected for {down_duration:.1f}s)"
                 )

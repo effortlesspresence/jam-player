@@ -93,6 +93,7 @@ from common.credentials import (
 )
 from common.api import api_request, get_api_base_url
 from common.network import (
+    is_internet_verified,
     get_available_wifi_networks,
     get_saved_wifi_networks,
     connect_to_wifi,
@@ -100,7 +101,7 @@ from common.network import (
     get_current_connection_info,
     trigger_wifi_scan,
 )
-from common.paths import INTERNET_VERIFIED_FLAG, safe_touch
+from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, safe_touch, touch_volatile_flag
 from common.network import check_internet_connectivity
 
 # ============================================================================
@@ -1050,7 +1051,10 @@ class WiFiCredentialsCharacteristic(Characteristic):
 
             if not ssid and not connection_name:
                 logger.warning("No SSID or connection name provided")
-                self.status_characteristic.set_status('error', 'No network specified')
+                # 'failed' is in every fielded app's ConnectionState enum;
+                # 'error' was not, so the apps dropped it and sat in their
+                # 60-second polling loop before reporting a timeout.
+                self.status_characteristic.set_status('failed', 'No network specified')
                 return
 
             if use_saved and connection_name:
@@ -1060,6 +1064,12 @@ class WiFiCredentialsCharacteristic(Characteristic):
                 logger.info(f"Password length: {len(password)} chars")
 
             self.status_characteristic.set_status('connecting', f'Connecting to {ssid or connection_name}...')
+
+            # Tell jam-ble-state-manager a setup session is in flight, so it
+            # will not close the post-boot recovery window underneath us. The
+            # flag lives on tmpfs: no SD-card write, and it cannot survive a
+            # reboot if we somehow fail to clear it.
+            touch_volatile_flag(BLE_SESSION_ACTIVE_FLAG)
 
             # Run connection in a background thread so we don't block the BLE write.
             # BLE operations should complete quickly; WiFi connection can take 10-30 seconds.
@@ -1096,7 +1106,16 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     logger.error(f"[BLE->WiFi] Sending status '{status_code}' to mobile app")
                     self.status_characteristic.set_status(status_code, error_msg)
 
-            thread = threading.Thread(target=connect_async, daemon=True)
+            def connect_async_guarded():
+                try:
+                    connect_async()
+                finally:
+                    try:
+                        BLE_SESSION_ACTIVE_FLAG.unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.warning(f"Could not clear BLE session flag: {e}")
+
+            thread = threading.Thread(target=connect_async_guarded, daemon=True)
             thread.start()
 
         except json.JSONDecodeError as e:
@@ -1253,7 +1272,7 @@ class DeviceInfoCharacteristic(Characteristic):
             ssh_public_key = get_ssh_public_key() or ''
 
             # Check connectivity by reading flag file maintained by jam-ble-state-manager
-            is_connected = INTERNET_VERIFIED_FLAG.exists()
+            is_connected = is_internet_verified()
 
             # Check registration status flags
             is_announced = is_device_announced()
@@ -1394,6 +1413,14 @@ class ProvisioningConfirmCharacteristic(Characteristic):
                 return
 
             # Mark device as registered (creates .registered flag file)
+            if is_device_registered():
+                # BLE now runs for 15 minutes after every boot on registered,
+                # content-playing players, and this characteristic needs no
+                # pairing. Re-confirming a registered player has no legitimate
+                # use (the apps write it exactly once, before .registered
+                # exists) but used to restart the display. No-op.
+                logger.warning(f"Ignoring provisioning confirmation for already-registered device ({jam_player_id})")
+                return
             success = set_device_registered()
 
             if success:
@@ -1453,6 +1480,14 @@ class ScreenIdCharacteristic(Characteristic):
                 return
 
             # Write screen ID to file
+            # NOT gated on registration, unlike the provisioning-confirm write
+            # above: the apps' link-to-screen step writes this characteristic
+            # AFTER confirm has created .registered (LinkToScreenViewModel ->
+            # sendScreenId), as the fast path while the WebSocket may still be
+            # coming up. Gating it here broke first-time linking. The blast
+            # radius of a rogue write is small anyway: content is fetched by
+            # the backend's screen assignment, not this file, so the worst
+            # case is a refetch and a wrong local "linked" indication.
             success = set_screen_id(screen_id)
 
             if success:
@@ -1529,7 +1564,7 @@ def get_status_flags() -> int:
     flags = 0
 
     # Bit 0: isConnected (internet connectivity verified)
-    if INTERNET_VERIFIED_FLAG.exists():
+    if is_internet_verified():
         flags |= 0x01
 
     # Bit 1: isAnnounced
@@ -1893,6 +1928,13 @@ def main():
         sys.exit(1)
 
     # Find a Bluetooth adapter that supports BLE GATT
+    # Clear any rfkill soft-block on Bluetooth before touching the
+    # adapter. Must happen before reset/configure -- a blocked radio
+    # can't be powered on by any of the downstream calls. See the
+    # 2026-04-22 incident where a customer's JP sat with rfkill
+    # soft-block set, leaving the mobile app with an empty scan list.
+    ensure_bluetooth_not_rfkill_blocked()
+
     adapter_path = find_adapter(bus)
     if not adapter_path:
         logger.error("No Bluetooth adapter found - is Bluetooth enabled?")
@@ -1900,13 +1942,6 @@ def main():
         sys.exit(1)
 
     logger.info(f"Using Bluetooth adapter: {adapter_path}")
-
-    # Clear any rfkill soft-block on Bluetooth before touching the
-    # adapter. Must happen before reset/configure -- a blocked radio
-    # can't be powered on by any of the downstream calls. See the
-    # 2026-04-22 incident where a customer's JP sat with rfkill
-    # soft-block set, leaving the mobile app with an empty scan list.
-    ensure_bluetooth_not_rfkill_blocked()
 
     # Reset adapter to clear any stale state from previous SD card
     reset_bluetooth_adapter(adapter_path)
@@ -2001,16 +2036,26 @@ def main():
     # failure (D-Bus error, property missing, etc.) is treated as "we
     # don't know" -- we return True and let the next tick try again
     # rather than triggering a restart on a transient D-Bus hiccup.
+    dbus_failures = {'count': 0}
+
     def adapter_is_powered() -> bool:
         try:
-            adapter = dbus.Interface(
-                bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
-                DBUS_PROP_IFACE,
-            )
-            return bool(adapter.Get('org.bluez.Adapter1', 'Powered'))
+            powered = bool(adapter.Get('org.bluez.Adapter1', 'Powered'))
+            dbus_failures['count'] = 0
+            return powered
         except Exception as e:
-            logger.warning(f"Failed to read adapter Powered property: {e}")
-            return True  # Unknown -- don't restart on a D-Bus hiccup.
+            # One D-Bus hiccup is not a dead daemon. Three in a row (~10 s)
+            # means bluetoothd is gone or was restarted underneath us: our
+            # adapter proxy is dead and this process is "active" while
+            # advertising nothing. Exit so systemd brings us back on a live
+            # bluetoothd (the unit is Requires=/PartOf=/After= bluetooth.service).
+            dbus_failures['count'] += 1
+            logger.warning(f"Adapter power check failed ({dbus_failures['count']}/3): {e}")
+            if dbus_failures['count'] >= 3:
+                logger.error("Bluetooth daemon unreachable three times in a row; exiting for systemd restart")
+                sd_notifier.notify("STATUS=Bluetooth daemon unreachable")
+                os._exit(1)
+            return True
 
     # Periodic refresh every 30 seconds. Two jobs:
     # 1. Detect silent radio failure (rfkill set mid-run, etc.) and

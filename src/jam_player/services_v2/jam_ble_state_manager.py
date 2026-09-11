@@ -60,6 +60,7 @@ This service runs continuously and must handle:
 """
 
 import sys
+import time
 from pathlib import Path
 
 # Add services directory to path for common module imports
@@ -69,10 +70,10 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 
-from common.system import manage_service, seconds_since_boot
+from common.system import manage_service, seconds_since_boot, unit_active_since_boot_seconds
 from common.network import InternetConnectivityMonitor, check_internet_connectivity
 from common.credentials import is_device_registered
-from common.paths import INTERNET_VERIFIED_FLAG, safe_touch
+from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, STATE_MANAGER_ALIVE_FLAG, safe_touch, touch_volatile_flag
 
 # ============================================================================
 # Logging Configuration
@@ -166,6 +167,25 @@ HEARTBEAT_SERVICE = 'jam-heartbeat.service'
 # minutes of radio time every boot to make "unreachable" impossible.
 BLE_BOOT_RECOVERY_WINDOW_SECONDS = 15 * 60
 
+# The window never closes underneath somebody who is using it. While a phone
+# is connected over BLE, or a WiFi connection started from the app is still
+# running, the window is held open. Without this, a setup session started at
+# minute 14 was cut off mid-connect: the app saw read errors and then its
+# own 60-second timeout, and the player could be left half-configured.
+#
+# There is deliberately NO overall time cap on the hold: a session that is
+# genuinely under way is never cut off, whenever it started. Availability
+# beats tidiness here -- being unreachable is the failure we are paying to
+# avoid. Both signals are self-limiting instead, so the hold cannot become
+# permanent:
+#   - the BlueZ answer clears itself when the phone disconnects or the link
+#     times out, with no cooperation from us;
+#   - the WiFi-connect marker is ignored once it is older than this, because
+#     a connect attempt is bounded by nmcli's own timeouts (~60 s worst
+#     case). A marker older than that means the attempt died without
+#     clearing it, not that somebody is still waiting.
+BLE_SESSION_FLAG_MAX_AGE_SECONDS = 5 * 60
+
 # Services to restart when connectivity is restored
 # These services may have failed/exited during offline period
 POST_CONNECTIVITY_SERVICES = [
@@ -173,6 +193,10 @@ POST_CONNECTIVITY_SERVICES = [
     'jam-ws-commands.service',
     'jam-heartbeat.service',
     'jam-announce.service',
+    # Oneshots that now exit 0 when offline instead of failing and being
+    # restarted by systemd (which cost hundreds of SD-card writes an hour).
+    # They need this nudge to run once connectivity is back.
+    'jam-installed-version-reporter.service',
 ]
 
 # Watchdog interval (seconds)
@@ -214,6 +238,8 @@ class BLEStateManager:
         self._internet_check_timer = None  # GLib timeout for periodic checks
         # Log the post-boot recovery window closing exactly once per boot
         self._recovery_window_closed_logged = False
+        # Log the session hold once rather than on every 7-second tick
+        self._session_hold_logged = False
 
         # One-shot gate: trigger jam-update.service the first time a
         # never-registered device sees internet connectivity, so warehouse
@@ -423,11 +449,30 @@ class BLEStateManager:
         Returns:
             True (to keep the GLib timeout repeating)
         """
-        # Only check if NM thinks we have a connection
+        self._stamp_alive()
+        try:
+            self._periodic_connectivity_check_body()
+        except Exception:
+            # PyGObject silently REMOVES a timeout source whose callback
+            # raises. One stray exception here (a dying SD card making
+            # Path.exists() raise EIO, a D-Bus hiccup) would end this loop
+            # for the rest of the boot: offline would never be detected
+            # again and BLE never restarted. Log it and keep the loop alive.
+            logger.exception("Periodic connectivity check failed; continuing")
+        return True  # Keep the timeout repeating
+
+    def _periodic_connectivity_check_body(self) -> None:
+        # Re-assert BLE every tick, not only on transitions. A BLE exit that
+        # systemd did not restart (StartLimitBurst tripped during a
+        # half-installed venv, a manual stop, the exit-0 path) used to stay
+        # down until the next connectivity transition or reboot.
+        # manage_service() is a no-op when the unit is already in the state
+        # we ask for, so this costs one `systemctl is-active` per tick.
         nm_state = self._get_current_state()
         if not self._nm_has_connection(nm_state):
-            # NM says disconnected, skip the check
-            return True
+            # NM says disconnected: offline, BLE must run. Nothing else to check.
+            manage_service(BLE_PROVISIONING_SERVICE, should_run=True)
+            return
 
         is_online = self._connectivity_monitor.check()
 
@@ -446,19 +491,19 @@ class BLEStateManager:
             # State didn't change, but re-evaluate anyway: registration may
             # have completed via the app, or the post-boot recovery window
             # may have just closed. Either can turn "keep BLE up" into
-            # "BLE not needed" with no connectivity transition.
-            should_run = self._should_ble_run(is_online)
-            if not should_run:
-                if not self._recovery_window_closed_logged:
-                    self._recovery_window_closed_logged = True
-                    logger.info(
-                        f"Post-boot BLE recovery window closed "
-                        f"({BLE_BOOT_RECOVERY_WINDOW_SECONDS // 60} min); device is "
-                        f"online and registered - stopping BLE provisioning"
-                    )
-                manage_service(BLE_PROVISIONING_SERVICE, should_run=False)
-
-        return True  # Keep the timeout repeating
+            # "BLE not needed" with no connectivity transition -- and the
+            # reverse (a crashed BLE that must come back) needs the same tick.
+            should_run = self._should_ble_run(is_online, self._connectivity_monitor.last_success_method())
+            if not should_run and not self._recovery_window_closed_logged:
+                self._recovery_window_closed_logged = True
+                logger.info(
+                    f"Post-boot BLE recovery window closed "
+                    f"({BLE_BOOT_RECOVERY_WINDOW_SECONDS // 60} min); device is "
+                    f"online via our backend and registered - stopping BLE provisioning"
+                )
+            manage_service(BLE_PROVISIONING_SERVICE, should_run=should_run)
+        else:
+            manage_service(BLE_PROVISIONING_SERVICE, should_run=True)
 
     def _state_to_name(self, state: int) -> str:
         """Convert NetworkManager state integer to human-readable name."""
@@ -510,11 +555,113 @@ class BLEStateManager:
         )
         logger.info("Subscribed to NetworkManager state change signals")
 
-    def _in_boot_recovery_window(self) -> bool:
-        """True while this boot is younger than BLE_BOOT_RECOVERY_WINDOW_SECONDS."""
-        return seconds_since_boot() < BLE_BOOT_RECOVERY_WINDOW_SECONDS
+    def _stamp_alive(self) -> None:
+        """
+        Prove to the flag's readers that this process is still maintaining it.
 
-    def _should_ble_run(self, is_online: bool) -> bool:
+        common.network.is_internet_verified() treats a stamp older than its
+        freshness limit as "unknown" and lets each caller fail in its own
+        safe direction, so a dead or wedged state manager can never freeze
+        the fleet's idea of "online" for longer than that limit. tmpfs, so
+        this costs no SD-card write.
+        """
+        if not touch_volatile_flag(STATE_MANAGER_ALIVE_FLAG):
+            logger.debug("Could not stamp state-manager liveness")
+
+    def _in_boot_recovery_window(self) -> bool:
+        """
+        True while the recovery window is open.
+
+        The window runs for BLE_BOOT_RECOVERY_WINDOW_SECONDS from the LATER
+        of two moments: power-on, and the moment jam-ble-provisioning most
+        recently became active. Measuring from power-on alone let anything
+        that delayed BLE's start -- a slow filesystem check, a bluetoothd
+        restart, BLE crash-looping into its start limit and being brought
+        back -- quietly shorten the guarantee, so a player could come up
+        with the window already gone. The guarantee is "fifteen minutes in
+        which a phone can reach this player", so it has to count from when
+        the player can actually be reached.
+
+        If systemd cannot say when BLE came up, the power-on rule stands on
+        its own: unknown must never shrink the window.
+        """
+        uptime = seconds_since_boot()
+        if uptime < BLE_BOOT_RECOVERY_WINDOW_SECONDS:
+            return True
+        ble_active_since = self._ble_active_since_cached(uptime)
+        if ble_active_since is None:
+            return False
+        return uptime < ble_active_since + BLE_BOOT_RECOVERY_WINDOW_SECONDS
+
+    # systemd is asked at most this often; a fork every 7-second tick for the
+    # life of the device would be a waste, and BLE's activation time only
+    # changes when BLE restarts.
+    _BLE_ACTIVE_SINCE_CACHE_SECONDS = 60
+
+    def _ble_active_since_cached(self, uptime: float):
+        cached = getattr(self, '_ble_active_since_cache', None)
+        if cached is not None and uptime - cached[0] < self._BLE_ACTIVE_SINCE_CACHE_SECONDS:
+            return cached[1]
+        value = unit_active_since_boot_seconds(BLE_PROVISIONING_SERVICE)
+        self._ble_active_since_cache = (uptime, value)
+        return value
+
+    def _wifi_setup_in_flight(self) -> bool:
+        """
+        True while jam-ble-provisioning is running a WiFi connect for the app.
+
+        A marker older than BLE_SESSION_FLAG_MAX_AGE_SECONDS is treated as
+        stale rather than active: the attempt that raised it is long over,
+        and a marker nobody cleared must not hold the radio open for the
+        rest of the boot. Measured against the file's own mtime, which the
+        tmpfs filesystem keeps for us.
+        """
+        try:
+            if not BLE_SESSION_ACTIVE_FLAG.exists():
+                return False
+            age = time.time() - BLE_SESSION_ACTIVE_FLAG.stat().st_mtime
+            if age > BLE_SESSION_FLAG_MAX_AGE_SECONDS:
+                logger.debug(f"Ignoring stale BLE session marker ({age:.0f}s old)")
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _ble_central_connected(self) -> bool:
+        """
+        True while a phone is connected to our GATT server.
+
+        Asked of BlueZ directly (any org.bluez.Device1 with Connected=true)
+        rather than tracked in our own process, so it stays correct across a
+        restart of either service. Any failure answers False: a D-Bus problem
+        must not be able to hold BLE open indefinitely.
+        """
+        try:
+            manager = dbus.Interface(
+                self.bus.get_object('org.bluez', '/'),
+                'org.freedesktop.DBus.ObjectManager'
+            )
+            for _path, interfaces in manager.GetManagedObjects().items():
+                device = interfaces.get('org.bluez.Device1')
+                if device and bool(device.get('Connected', False)):
+                    return True
+        except Exception as e:
+            logger.debug(f"Could not query BlueZ for connected devices: {e}")
+        return False
+
+    def _setup_session_in_progress(self) -> bool:
+        """
+        Hold the recovery window open for an active setup session.
+
+        No overall deadline: a real session is never cut off, whenever it
+        started. Each signal expires on its own instead (see the constants),
+        so this cannot become a permanent hold.
+        """
+        if self._wifi_setup_in_flight():
+            return True
+        return self._ble_central_connected()
+
+    def _should_ble_run(self, is_online: bool, method: str = 'unknown') -> bool:
         """
         Determine if BLE provisioning should be running.
 
@@ -541,13 +688,30 @@ class BLEStateManager:
         if self._in_boot_recovery_window():
             return True  # Recovery window - always reachable after a power-cycle
 
+        if self._setup_session_in_progress():
+            # Somebody is mid-setup right now. Closing the window here would
+            # cut the session off at exactly the wrong moment.
+            if not self._session_hold_logged:
+                self._session_hold_logged = True
+                logger.info("Holding BLE provisioning open: a setup session is in progress")
+            return True
+
         if not is_online:
             return True  # No internet - BLE needed for WiFi setup
 
         if not is_device_registered():
             return True  # Online but not registered - BLE needed for registration
 
-        return False  # Window closed, online and registered - BLE not needed
+        # "Online" via the Cloudflare/Google TLS fallbacks means the general
+        # internet answers but OUR backend did not. A guest network that
+        # firewalls api.justamenu.com and Tailscale looks exactly like this,
+        # and it is one of the stranding cases this file exists for: the
+        # player can reach neither the backend nor support. Treat it as
+        # degraded and keep BLE up; only a reachable backend may stop BLE.
+        if method != 'jam_backend':
+            return True
+
+        return False  # Window closed, online via our backend, registered - BLE not needed
 
     def _restart_post_connectivity_services(self):
         """
@@ -649,7 +813,7 @@ class BLEStateManager:
             is_online: Whether internet connectivity is verified
             method: Which connectivity check succeeded (for logging)
         """
-        should_run = self._should_ble_run(is_online)
+        should_run = self._should_ble_run(is_online, method)
 
         # Maintain the internet verified flag for jam-ble-provisioning
         # This allows fast BLE reads without doing slow connectivity checks
@@ -666,21 +830,34 @@ class BLEStateManager:
             # only while .registered is absent.
             self._maybe_trigger_first_connect_update()
 
+            registered = is_device_registered()
+            if registered:
+                # Registered and online: make sure heartbeat runs regardless of
+                # what we decide about BLE (its ConditionPathExists was evaluated
+                # at boot, before a BLE registration could have created .registered).
+                manage_service(HEARTBEAT_SERVICE, should_run=True)
+
             if should_run:
-                logger.info(
-                    f"Internet online (via {method}) but device not registered - "
-                    f"keeping BLE provisioning running"
-                )
+                if registered and self._in_boot_recovery_window():
+                    logger.info(
+                        f"Internet online (via {method}), device registered - keeping BLE "
+                        f"provisioning running for the post-boot recovery window"
+                    )
+                elif registered:
+                    logger.info(
+                        f"Internet online only via {method} (backend unreachable) - "
+                        f"keeping BLE provisioning running (degraded network)"
+                    )
+                else:
+                    logger.info(
+                        f"Internet online (via {method}) but device not registered - "
+                        f"keeping BLE provisioning running"
+                    )
             else:
                 logger.info(
                     f"Internet online (via {method}) and device registered - "
                     f"stopping BLE provisioning"
                 )
-                # Device is registered and online - ensure heartbeat service is running
-                # This handles the case where device was registered via BLE after boot
-                # (the heartbeat service's ConditionPathExists was checked at boot when
-                # the .registered flag didn't exist yet, so it needs to be started now)
-                manage_service(HEARTBEAT_SERVICE, should_run=True)
         else:
             try:
                 INTERNET_VERIFIED_FLAG.unlink(missing_ok=True)
@@ -705,6 +882,20 @@ class BLEStateManager:
         2. The monitor starts with _is_online=True by default
         3. At startup, we need the ACTUAL connectivity state, not hysteresis
         """
+        # .internet_verified is a persistent file that only the OFFLINE
+        # path deletes. After a power-cycle onto a captive portal it still
+        # says "online" for the 40-90 s these checks take (or forever, if
+        # this service dies), and the fielded apps route a registered
+        # player that reports isConnected straight to its detail screen --
+        # never to WiFi setup. Nothing about the previous boot's network
+        # is evidence about this one: clear it before the first check.
+        try:
+            INTERNET_VERIFIED_FLAG.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not clear stale internet-verified flag: {e}")
+        # From here on the flag is being maintained: readers may trust "absent".
+        self._stamp_alive()
+
         nm_state = self._get_current_state()
         nm_connected = self._nm_has_connection(nm_state)
         state_name = self._state_to_name(nm_state)
@@ -722,6 +913,12 @@ class BLEStateManager:
             # NM says connected - verify with actual connectivity test
             # Use raw check_internet_connectivity() to get actual state (no hysteresis)
             logger.info("NetworkManager reports connected - verifying internet connectivity...")
+            # READY=1 was already sent, so WatchdogSec (90 s) is armed, but the
+            # GLib pinger only runs once the main loop does -- after this
+            # synchronous method returns. With black-holed resolvers three
+            # rounds of DNS + TLS timeouts can exceed 90 s and get us killed.
+            # Feed the watchdog by hand before each check.
+            sd_notifier.notify("WATCHDOG=1")
             is_online, method = check_internet_connectivity()
 
             if is_online:
@@ -729,6 +926,16 @@ class BLEStateManager:
                 # Sync the monitor state with reality
                 self._connectivity_monitor.reset(assume_online=True)
                 self._apply_ble_state(is_online=True, method=method)
+                # The post-connectivity oneshots (tailscale, announce,
+                # installed-version) exit quietly when they see no verified
+                # flag, and at boot they race this check: if they started
+                # before the flag existed they have already exited 0 and, with
+                # RemainAfterExit=yes, now sit "active (exited)" having done
+                # nothing. Nothing else re-runs them until the next
+                # offline->online transition or the nightly reboot. Coming up
+                # online IS such a transition; run them now. (Same for a
+                # restart of this service while the device is online.)
+                self._restart_post_connectivity_services()
             else:
                 # First check failed - try a couple more times before declaring offline
                 logger.info("Initial connectivity check failed - performing additional checks...")
@@ -736,11 +943,13 @@ class BLEStateManager:
                 for i in range(2):  # 2 more checks = 3 total
                     import time
                     time.sleep(2)
+                    sd_notifier.notify("WATCHDOG=1")
                     is_online, method = check_internet_connectivity()
                     if is_online:
                         self._last_connected_state = True
                         self._connectivity_monitor.reset(assume_online=True)
                         self._apply_ble_state(is_online=True, method=method)
+                        self._restart_post_connectivity_services()  # see above
                         return
 
                 # Still failing after 3 checks - start BLE but keep checking

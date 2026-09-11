@@ -20,6 +20,7 @@ from typing import Optional
 # Add the services directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from common.network import device_is_offline
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     get_device_uuid,
@@ -86,6 +87,16 @@ def main():
         logger.info("Device already registered - exiting")
         sys.exit(0)
 
+    if device_is_offline():
+        # This runs from a one-minute timer, so every failed poll used to
+        # write three WARNING/ERROR lines to the SD card every minute for as
+        # long as an unregistered player sat without internet. The per-process
+        # de-duplication in common.api cannot help a process that lives for
+        # one poll. Exit quietly; the timer retries and the device cannot
+        # become registered without connectivity anyway.
+        logger.debug("Offline - skipping registration poll until connectivity returns")
+        sys.exit(0)
+
     # Get device UUID
     device_uuid = get_device_uuid()
     if not device_uuid:
@@ -98,6 +109,9 @@ def main():
     status = check_registration_status(device_uuid)
 
     if status is None:
+        # WARNING only when we believed we were online: then it is a real
+        # backend problem worth keeping on the card. (The offline case
+        # already returned above.)
         logger.warning("Could not determine registration status - will retry later")
         sys.exit(0)  # Exit cleanly, timer will retry
 

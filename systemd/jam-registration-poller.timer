@@ -13,7 +13,10 @@ OnBootSec=30sec
 OnUnitActiveSec=1min
 
 # Persist timer across reboots
-Persistent=true
+# Persistent=false: with Persistent=true systemd writes a timestamp file to the
+# SD card on every elapse (every minute while unregistered). OnBootSec already
+# covers catch-up after a reboot.
+Persistent=false
 
 [Install]
 WantedBy=timers.target
