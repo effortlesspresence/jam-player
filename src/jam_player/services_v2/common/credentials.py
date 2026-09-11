@@ -73,6 +73,45 @@ def get_device_uuid_short(length: int = 5) -> Optional[str]:
     return None
 
 
+BLE_DEVICE_NAME_PREFIX = 'JAM-PLAYER-'
+
+
+def get_ble_device_name() -> str:
+    """
+    The name this player advertises over Bluetooth: JAM-PLAYER-XXXXX.
+
+    XXXXX is get_device_uuid_short(5): the last five characters of the
+    device UUID, uppercased. Both mobile apps derive the same five
+    characters from the full UUID (takeLast(5).uppercased), so anything
+    shown to a user under this name must come from HERE, never from a
+    second derivation that could drift. jam-ble-provisioning advertises it;
+    the display prints it so a user can match the screen to the phone's
+    Bluetooth list without reading a whole UUID.
+    """
+    suffix = get_device_uuid_short(5) or 'XXXXX'
+    return f"{BLE_DEVICE_NAME_PREFIX}{suffix}"
+
+
+def device_identity_lines(device_uuid: Optional[str]) -> list:
+    """
+    The identity block every non-content screen prints, top to bottom.
+
+    Users could not match the last five characters of a printed UUID to the
+    JAM-PLAYER-XXXXX entry in their phone's Bluetooth list, so the screen
+    now says both things outright. The full UUID stays for support.
+
+    Returns [] when there is no UUID (nothing to identify yet).
+    """
+    if not device_uuid:
+        return []
+    short = device_uuid.replace('-', '')[-5:].upper()
+    return [
+        f"Device ID: {short}",
+        f"Setup network: {BLE_DEVICE_NAME_PREFIX}{short}",
+        f"Device: {device_uuid}",
+    ]
+
+
 def get_jp_image_id() -> Optional[str]:
     """
     Read the JP Image ID from file.

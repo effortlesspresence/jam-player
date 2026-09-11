@@ -88,6 +88,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common.network import is_internet_verified
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
+    device_identity_lines,
     is_device_registered,
     get_device_uuid,
     get_screen_id,
@@ -517,6 +518,37 @@ def get_font(size: int, bold: bool = True):
     return ImageFont.load_default()
 
 
+def _draw_device_identity(draw, width: int, height: int, device_uuid) -> None:
+    """
+    The identity block at the bottom of every non-content screen.
+
+    Three lines, top to bottom, from common.credentials.device_identity_lines:
+
+        Device ID: XXXXX                      <- what a person actually matches
+        Setup network: JAM-PLAYER-XXXXX       <- the phone's Bluetooth list entry
+        Device: <full uuid>                   <- for support, deliberately muted
+
+    Users could not match the last five characters of a printed UUID to the
+    JAM-PLAYER-XXXXX name in their phone's Bluetooth list, so the screen now
+    says both outright. The five characters come from the same derivation
+    the BLE service advertises, so the two can never disagree. Sits above the
+    "v2" marker at height - 25; draws nothing when there is no UUID yet.
+    """
+    lines = device_identity_lines(device_uuid)
+    if not lines:
+        return
+    center_x = width // 2
+    big = get_font(_scaled(FONT_SIZE_URL, height), bold=True)
+    small = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
+    big_px = _scaled(FONT_SIZE_URL, height)
+    y_uuid = height - 50
+    y_network = y_uuid - int(big_px * 1.6)
+    y_device_id = y_network - int(big_px * 1.4)
+    draw.text((center_x, y_device_id), lines[0], font=big, fill=TEXT_COLOR, anchor="mm")
+    draw.text((center_x, y_network), lines[1], font=big, fill=TEXT_COLOR, anchor="mm")
+    draw.text((center_x, y_uuid), lines[2], font=small, fill=SECONDARY_COLOR, anchor="mm")
+
+
 def create_mesh_gradient_background(width: int, height: int, theme: str = "vibrant") -> Image.Image:
     """
     Create a vibrant mesh gradient background with multiple color points.
@@ -719,7 +751,6 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height))
     instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
     tagline_font = get_font(_scaled(FONT_SIZE_TAGLINE, height))
-    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
@@ -808,15 +839,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     )
 
     # Device UUID at bottom (small, subtle)
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        draw.text(
-            (center_x, height - 50),
-            device_text,
-            font=device_font,
-            fill=TEXT_COLOR,
-            anchor="mm"
-        )
+    _draw_device_identity(draw, width, height, device_uuid)
 
     # Version indicator in bottom-right corner
     version_font = get_font(_scaled(14, height), bold=False)
@@ -863,7 +886,6 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     # Fonts (scaled to display resolution)
     title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
     subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
-    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
     center_y = height // 2
@@ -917,15 +939,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     # Device UUID at bottom (every non-content screen shows device UUID
     # so support can identify the physical JAM Player regardless of
     # setup state).
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        draw.text(
-            (center_x, height - 50),
-            device_text,
-            font=device_font,
-            fill=TEXT_COLOR,
-            anchor="mm"
-        )
+    _draw_device_identity(draw, width, height, device_uuid)
 
     # Version indicator
     version_font = get_font(_scaled(14, height), bold=False)
@@ -963,7 +977,6 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
     title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
     subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
     instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
-    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
@@ -1044,15 +1057,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
 
     # Device UUID at the bottom so support / users can identify this JP
     # in the app / web UI when linking.
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        draw.text(
-            (center_x, height - 50),
-            device_text,
-            font=device_font,
-            fill=TEXT_COLOR,
-            anchor="mm"
-        )
+    _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
@@ -1092,7 +1097,6 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
     title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
     subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
     instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
-    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
@@ -1181,15 +1185,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         img.paste(qr_img, (qr_x, qr_y))
 
     # Device UUID at the bottom
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        draw.text(
-            (center_x, height - 50),
-            device_text,
-            font=device_font,
-            fill=TEXT_COLOR,
-            anchor="mm"
-        )
+    _draw_device_identity(draw, width, height, device_uuid)
 
     # Version indicator
     version_font = get_font(_scaled(14, height), bold=False)
@@ -1238,7 +1234,6 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
     title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
     subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
     instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
-    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
@@ -1298,15 +1293,7 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
     # Device UUID at bottom (every non-content screen shows device UUID
     # so support can identify the physical JAM Player regardless of
     # setup state).
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        draw.text(
-            (center_x, height - 50),
-            device_text,
-            font=device_font,
-            fill=TEXT_COLOR,
-            anchor="mm"
-        )
+    _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
@@ -1379,6 +1366,10 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
         anchor="mm",
     )
 
+    # This screen never printed the device identity; a user stuck on "no
+    # scheduled content" needs to find their player like on every other screen.
+    _draw_device_identity(draw, width, height, device_uuid)
+
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
         (width - 30, height - 25),
@@ -1420,7 +1411,6 @@ def create_outlet_inactive_screen(width: int, height: int, device_uuid: str = No
     title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
     subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
     instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
-    device_font = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
 
     center_x = width // 2
 
@@ -1492,15 +1482,7 @@ def create_outlet_inactive_screen(width: int, height: int, device_uuid: str = No
 
     # Device UUID at bottom (same convention as other non-content
     # screens, lets support identify the JP in the dashboard).
-    if device_uuid:
-        device_text = f"Device: {device_uuid}"
-        draw.text(
-            (center_x, height - 50),
-            device_text,
-            font=device_font,
-            fill=TEXT_COLOR,
-            anchor="mm",
-        )
+    _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(

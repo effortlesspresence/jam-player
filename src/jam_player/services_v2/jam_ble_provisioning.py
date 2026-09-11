@@ -79,6 +79,7 @@ import dbus.service
 from gi.repository import GLib
 
 from common.credentials import (
+    get_ble_device_name,
     get_device_uuid,
     get_device_uuid_short,
     get_jp_image_id,
@@ -1534,17 +1535,9 @@ class JAMProvisioningService(Service):
 # ============================================================================
 
 def get_device_name() -> str:
-    """
-    Generate the BLE device name from the device UUID.
-
-    Format: JAM-PLAYER-XXXXX (last 5 characters of UUID, uppercased)
-
-    This name is shown when users scan for Bluetooth devices.
-    The last 5 characters help identify which JAM Player is which
-    when multiple are in range.
-    """
-    suffix = get_device_uuid_short(5) or 'XXXXX'
-    return f"JAM-PLAYER-{suffix}"
+    """The advertised BLE name. One derivation, shared with the display: see
+    common.credentials.get_ble_device_name()."""
+    return get_ble_device_name()
 
 
 def get_status_flags() -> int:
