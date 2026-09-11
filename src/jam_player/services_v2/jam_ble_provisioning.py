@@ -1017,7 +1017,7 @@ class WiFiCredentialsCharacteristic(Characteristic):
     Characteristic to write WiFi credentials.
 
     When the mobile app writes to this characteristic, we:
-    1. Parse the JSON credentials (ssid + password)
+    1. Parse the JSON credentials (ssid + password [+ optional hidden])
     2. Attempt to connect to the network
     3. Update the connection status characteristic with the result
 
@@ -1049,6 +1049,11 @@ class WiFiCredentialsCharacteristic(Characteristic):
             password = credentials.get('password', '')
             use_saved = credentials.get('useSaved', False)
             connection_name = credentials.get('connectionName', '')
+            # A network the user typed by hand (hidden or not): the app sends
+            # hidden=true so NetworkManager actively probes for the SSID. Old
+            # apps never send it -> False -> byte-identical visible-network
+            # behavior. Harmless if the network turns out to be visible.
+            hidden = bool(credentials.get('hidden', False))
 
             if not ssid and not connection_name:
                 logger.warning("No SSID or connection name provided")
@@ -1082,7 +1087,7 @@ class WiFiCredentialsCharacteristic(Characteristic):
                 else:
                     # Connect with password (new network or updating saved network password)
                     logger.info(f"[BLE->WiFi] Starting WiFi connection attempt for SSID: {ssid}")
-                    success, error_msg = connect_to_wifi(ssid, password)
+                    success, error_msg = connect_to_wifi(ssid, password, hidden=hidden)
 
                 if success:
                     logger.info(f"[BLE->WiFi] SUCCESS - Connected to {ssid or connection_name}")

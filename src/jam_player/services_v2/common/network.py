@@ -382,7 +382,7 @@ def _log_network_diagnostic_info():
     logger.info("=== END DIAGNOSTIC INFO ===")
 
 
-def _connect_wifi_secure(ssid: str, password: str) -> subprocess.CompletedProcess:
+def _connect_wifi_secure(ssid: str, password: str, hidden: bool = False) -> subprocess.CompletedProcess:
     """
     Connect to a WiFi network securely without exposing the password in process list.
 
@@ -454,6 +454,15 @@ def _connect_wifi_secure(ssid: str, password: str) -> subprocess.CompletedProces
     else:
         security_section = ""
 
+    # A truly hidden AP never broadcasts its SSID, so NetworkManager will not
+    # see it in a scan; it must actively probe by name, which it only does
+    # when the profile says hidden=true. Setting this on a network that turns
+    # out to be VISIBLE is harmless -- it still connects, the radio just sends
+    # a directed probe for the name -- so manual entry can always set it.
+    # Omitted for visible-network connects (the default), whose keyfile stays
+    # byte-identical to before.
+    hidden_section = "hidden=true\n" if hidden else ""
+
     keyfile_content = f"""[connection]
 id={conn_name}
 type=wifi
@@ -462,7 +471,7 @@ autoconnect=true
 [wifi]
 ssid={ssid}
 mode=infrastructure
-{security_section}
+{hidden_section}{security_section}
 [ipv4]
 method=auto
 
@@ -762,7 +771,7 @@ def _promote_in_background(target: Callable[[], None]) -> None:
         logger.warning(f"Could not start priority promotion thread: {e}")
 
 
-def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
+def connect_to_wifi(ssid: str, password: str, hidden: bool = False) -> Tuple[bool, str]:
     """
     Connect to a WiFi network, preserving existing connection if new attempt fails.
 
@@ -806,7 +815,7 @@ def connect_to_wifi(ssid: str, password: str) -> Tuple[bool, str]:
         # Try to connect using nmcli with secure password handling
         # We use a connection file to avoid exposing password in process list
         logger.info(f"Connecting to WiFi network: {ssid}")
-        result = _connect_wifi_secure(ssid, password)
+        result = _connect_wifi_secure(ssid, password, hidden=hidden)
 
         if result.returncode == 0:
             logger.info(f"Successfully connected to {ssid}")
