@@ -1207,6 +1207,38 @@ def device_is_offline() -> bool:
     return not is_internet_verified(unreadable_means=True)
 
 
+def forget_active_wifi_connection() -> bool:
+    """
+    Delete the profile of whatever WiFi network is active right now.
+
+    Used when a network associated but has no usable internet (captive
+    portal, firewall, dead uplink): we do not want the device to keep the
+    profile and auto-reconnect to a network it can never work on. After this
+    the device has no active WiFi and falls back to offline -- BLE provisioning
+    stays up so the user can pick another network. Best-effort; never raises.
+
+    Returns:
+        True if a profile was deleted, False otherwise.
+    """
+    try:
+        active = _get_active_wifi_connection()
+        if not active or not active.get('name'):
+            return False
+        name = active['name']
+        result = subprocess.run(
+            ['nmcli', 'connection', 'delete', name],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            logger.info(f"Forgot unusable WiFi profile: {name}")
+            return True
+        logger.warning(f"Could not delete WiFi profile {name}: {result.stderr.strip()}")
+        return False
+    except Exception as e:
+        logger.warning(f"Error forgetting active WiFi profile: {e}")
+        return False
+
+
 def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT) -> Tuple[bool, str]:
     """
     Verify actual internet connectivity by testing real endpoints.
@@ -1253,6 +1285,52 @@ def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT)
     # Nothing verifiable - no internet (or a captive portal, which is
     # operationally the same thing for us).
     return False, 'none'
+
+
+def classify_connectivity(
+    attempts: int = 3,
+    delay: float = 3.0,
+    timeout: float = 3.0,
+) -> str:
+    """
+    Classify a just-connected network into what actually matters for setup.
+
+    Returns one of:
+      'backend'       -- our backend is reachable over verified TLS. Fully
+                         usable; setup can proceed.
+      'internet_only' -- the public internet answers (verified TLS to
+                         Cloudflare/Google) but our backend does NOT. Either a
+                         customer firewall blocking our servers, or one of our
+                         own outages -- the device cannot tell which, so the
+                         caller must NOT forget the profile or treat it as a
+                         permanent dead network.
+      'none'          -- nothing verifiable answers: captive portal, dead
+                         uplink, or a network that firewalls everything we
+                         probe. Genuinely unusable.
+
+    Each phase RETRIES (attempts, delay apart) so a settling connection right
+    after association is never misclassified: a good-backend network passes
+    the backend phase on the first probe (<1s) and pays no retry cost; only a
+    genuinely blocked/absent path exhausts the retries. Backend is checked
+    first and in full BEFORE concluding 'internet_only', so a single transient
+    backend miss on an otherwise-good network never gets mislabelled a
+    firewall. Worst case stays under the app's ~60s status-poll window.
+    """
+    from .api import check_api_availability
+    # Phase 1: our backend, retried. This is the only endpoint that lets a
+    # JAM Player actually be set up, so it is the success criterion.
+    for i in range(max(1, attempts)):
+        if check_api_availability(timeout=int(timeout)):
+            return 'backend'
+        if i < attempts - 1:
+            time.sleep(delay)
+    # Phase 2: backend unreachable after retries. Is there ANY real internet?
+    # One verified-TLS pass to each public resolver is enough to tell
+    # "firewalled/our-outage" (internet works) from "no internet at all".
+    for host, port in FALLBACK_TLS_HOSTS:
+        if _check_tls_connectivity(host, port, timeout):
+            return 'internet_only'
+    return 'none'
 
 
 class InternetConnectivityMonitor:

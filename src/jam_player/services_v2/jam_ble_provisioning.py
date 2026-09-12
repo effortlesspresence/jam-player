@@ -94,6 +94,8 @@ from common.credentials import (
 )
 from common.api import api_request, get_api_base_url
 from common.network import (
+    forget_active_wifi_connection,
+    classify_connectivity,
     is_internet_verified,
     get_available_wifi_networks,
     get_saved_wifi_networks,
@@ -206,6 +208,13 @@ WATCHDOG_INTERVAL = 30
 # tick is a D-Bus property read + a status-flag recompute, both sub-ms)
 # and the customer-facing benefit is large.
 ADVERTISEMENT_REFRESH_INTERVAL_SECONDS = 3
+
+# After reporting the new 'no_internet' status we wait this long before also
+# reporting 'failed'. New apps read 'no_internet' (terminal) within this window
+# and stop; older apps that do not know the code keep polling and then see
+# 'failed', so they fail gracefully instead of timing out. Long enough to cover
+# the app's 2s status poll plus a missed notification.
+NO_INTERNET_FALLBACK_DELAY_SECONDS = 3
 
 # ============================================================================
 # D-Bus Exception Classes
@@ -1090,13 +1099,45 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     success, error_msg = connect_to_wifi(ssid, password, hidden=hidden)
 
                 if success:
-                    logger.info(f"[BLE->WiFi] SUCCESS - Connected to {ssid or connection_name}")
-                    self.status_characteristic.set_status('connected', f'Connected to {ssid or connection_name}')
-
-                    # Trigger announce + Tailscale setup in another background thread
-                    # This runs 10 seconds after WiFi connects to ensure connection is stable
-                    announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
-                    announce_thread.start()
+                    # WiFi ASSOCIATED, but association is not usability: a
+                    # captive portal, a guest login, a firewalled or dead uplink
+                    # all associate fine. Reporting 'connected' here would send
+                    # the app on to registration and strand the device. So
+                    # classify what the network can actually REACH -- with
+                    # retries, so a good network still settling (DHCP/route/DNS
+                    # warmup) is never mislabelled. Three outcomes, three
+                    # behaviours; each NEW status code is followed ~3s later by
+                    # 'failed' so app builds that do not know the code still fail
+                    # gracefully instead of timing out (the status characteristic
+                    # sends only the code over BLE, never the human message).
+                    logger.info(f"[BLE->WiFi] Associated to {ssid or connection_name}; classifying connectivity...")
+                    reachability = classify_connectivity()
+                    if reachability == 'backend':
+                        logger.info(f"[BLE->WiFi] SUCCESS - {ssid or connection_name} can reach the JAM backend")
+                        self.status_characteristic.set_status('connected', f'Connected to {ssid or connection_name}')
+                        announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
+                        announce_thread.start()
+                    elif reachability == 'internet_only':
+                        # Real internet, but our backend is unreachable: a customer
+                        # firewall OR one of our own outages -- the device cannot
+                        # tell which. So do NOT forget the profile and do NOT treat
+                        # it as dead; it may work once the block lifts or we recover,
+                        # and the state manager keeps BLE up meanwhile. Just tell the
+                        # user their network cannot reach us.
+                        logger.warning(f"[BLE->WiFi] {ssid or connection_name} has internet but CANNOT reach the JAM backend (firewall or backend outage) - profile kept")
+                        self.status_characteristic.set_status('backend_unreachable', 'Internet OK but JAM servers unreachable')
+                        time.sleep(NO_INTERNET_FALLBACK_DELAY_SECONDS)
+                        self.status_characteristic.set_status('failed', 'JAM servers unreachable from this network')
+                    else:
+                        # Nothing verifiable answers: captive portal, dead uplink, or
+                        # a network firewalling everything we probe. Genuinely
+                        # unusable -- forget the profile so the device does not cling
+                        # to it, then report it.
+                        logger.warning(f"[BLE->WiFi] {ssid or connection_name} associated but has NO usable internet (captive portal / dead uplink)")
+                        forget_active_wifi_connection()
+                        self.status_characteristic.set_status('no_internet', 'Network has no usable internet (captive portal?)')
+                        time.sleep(NO_INTERNET_FALLBACK_DELAY_SECONDS)
+                        self.status_characteristic.set_status('failed', 'No usable internet on this network')
                 else:
                     logger.error(f"[BLE->WiFi] FAILED - Could not connect to {ssid or connection_name}")
                     logger.error(f"[BLE->WiFi] Raw error message: {error_msg}")
