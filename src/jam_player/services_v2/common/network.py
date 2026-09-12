@@ -1080,6 +1080,81 @@ def get_current_connection_info() -> Optional[Dict[str, str]]:
 # Internet Connectivity Verification
 # ============================================================================
 
+
+def get_reported_network_status() -> Dict[str, Optional[str]]:
+    """
+    Summarise the network this device is actually using, for the backend.
+
+    Returns {'connectionType': 'ethernet' | 'wifi' | 'other',
+             'ssid': <str> | None}.
+
+    Ethernet wins when both are active: it carries the default route on our
+    devices (lower metric), so it is what the device is really using for the
+    internet, and it has no SSID. Only WiFi carries an SSID. 'other' covers
+    anything else (a tether, a bridge) so the field is always meaningful.
+
+    Returns connectionType 'other' with ssid None when nothing is active --
+    but note the reporter only runs while the device is online (it is a signed
+    HTTP call), so in practice the backend stores the last ONLINE network and
+    treats it as "last known" once the device stops reporting.
+    """
+    ethernet_active = False
+    wifi_ssid: Optional[str] = None
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'TYPE', 'connection', 'show', '--active'],
+            capture_output=True, text=True, timeout=DEFAULT_COMMAND_TIMEOUT
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                t = line.strip().lower()
+                if t in ('802-3-ethernet', 'ethernet'):
+                    ethernet_active = True
+                elif t in ('802-11-wireless', 'wifi'):
+                    active = _get_active_wifi_connection()
+                    if active:
+                        wifi_ssid = active.get('ssid') or None
+    except Exception as e:
+        logger.warning(f"Could not read network status: {e}")
+
+    if ethernet_active:
+        return {'connectionType': 'ethernet', 'ssid': None}
+    if wifi_ssid is not None:
+        return {'connectionType': 'wifi', 'ssid': wifi_ssid}
+    return {'connectionType': 'other', 'ssid': None}
+
+
+def report_network_status() -> bool:
+    """
+    Tell the backend which network this device is on (POST /jam-players/network-status).
+
+    The one implementation shared by every caller: jam-heartbeat calls it after
+    each successful heartbeat (periodic refresh), and jam-announce calls it once
+    right after announce succeeds so the backend has the network from the moment
+    the JamPlayer row exists -- without waiting for the first heartbeat.
+
+    Best-effort and non-fatal: only meaningful while the device is online (it is
+    a signed HTTP call), swallows every error, and never raises into its caller.
+    The backend keeps the last reported value once the device stops reporting,
+    which is how "current when online" doubles as "last known when offline".
+
+    Returns True if the report was sent and accepted, False otherwise (callers
+    ignore it; the return is for tests).
+    """
+    try:
+        from .api import api_request  # lazy import: avoid a load-time cycle
+        status = get_reported_network_status()
+        response = api_request(
+            method='POST',
+            path='/jam-players/network-status',
+            body={'connectionType': status['connectionType'], 'ssid': status['ssid']},
+            signed=True,
+        )
+        return bool(response is not None and getattr(response, 'status_code', 500) < 300)
+    except Exception as e:
+        logger.debug(f"Network-status report skipped: {e}")
+        return False
+
 def _check_tls_connectivity(host: str, port: int, timeout: float) -> bool:
     """
     Prove real end-to-end internet by completing a TLS handshake with FULL
