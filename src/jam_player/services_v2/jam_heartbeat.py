@@ -44,7 +44,7 @@ from common.credentials import (
     get_location_timezone,
 )
 from common.api import api_request
-from common.network import report_network_status
+from common.network import report_network_status, report_mac_addresses
 
 logger = setup_service_logging('jam-heartbeat')
 
@@ -169,6 +169,10 @@ def main():
 
     consecutive_failures = 0
     current_retry_delay = INITIAL_RETRY_DELAY
+    # Permanent MACs are reported once per boot (on the first successful beat),
+    # not every beat -- they never change. Local to main() because main() runs
+    # for the life of the process; a fresh process each boot re-asserts them.
+    mac_reported = False
 
     while running:
         # Send heartbeat
@@ -182,6 +186,13 @@ def main():
             # Report which network we're on (best-effort; the device is online
             # here since the heartbeat just succeeded).
             report_network_status()
+            # Permanent MACs: report ONCE per boot, on the first successful
+            # beat (not every beat -- they never change). This re-asserts them
+            # each boot so they reach the backend even if the announce-time
+            # report failed, the device was announced on older firmware, or
+            # the backend lost the value.
+            if not mac_reported and report_mac_addresses():
+                mac_reported = True
 
             # Update screen_id if changed
             if update_screen_id_if_changed(screen_id):

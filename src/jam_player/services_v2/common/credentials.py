@@ -112,6 +112,28 @@ def device_identity_lines(device_uuid: Optional[str]) -> list:
     ]
 
 
+def mac_identity_lines(wifi_mac: Optional[str], eth_mac: Optional[str]) -> list:
+    """
+    The permanent-MAC lines appended to the identity block on setup screens,
+    top to bottom:
+
+        Wi-Fi MAC: AA:BB:CC:DD:EE:FF          <- omitted if unknown
+        Ethernet MAC: AA:BB:CC:DD:EE:11       <- omitted if the device has none
+
+    Pure formatter (no I/O): the caller reads the MACs (common.network.
+    get_mac_addresses) and passes them in, so this stays trivially testable
+    and independent of nmcli. A None address contributes no line -- a device
+    with no ethernet simply shows only the Wi-Fi line, which is the permanent
+    truth for that device and safe to cache.
+    """
+    lines = []
+    if wifi_mac:
+        lines.append(f"Wi-Fi MAC: {wifi_mac}")
+    if eth_mac:
+        lines.append(f"Ethernet MAC: {eth_mac}")
+    return lines
+
+
 def get_jp_image_id() -> Optional[str]:
     """
     Read the JP Image ID from file.

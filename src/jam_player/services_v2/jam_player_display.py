@@ -85,10 +85,11 @@ from datetime import datetime, time as dt_time
 # Add the services directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common.network import is_internet_verified
+from common.network import is_internet_verified, get_mac_addresses
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     device_identity_lines,
+    mac_identity_lines,
     is_device_registered,
     get_device_uuid,
     get_screen_id,
@@ -518,35 +519,80 @@ def get_font(size: int, bold: bool = True):
     return ImageFont.load_default()
 
 
-def _draw_device_identity(draw, width: int, height: int, device_uuid) -> None:
+# The device's permanent MACs are an immutable hardware fact, read at most
+# once per process and reused by every setup-screen render. A module-level memo
+# is the right scope here (unlike a per-call flag): it is shared across the
+# many render functions that draw the identity block and lives for the process.
+# Only a SUCCESSFUL read (at least one MAC) is cached, so a rare read before
+# NetworkManager is ready is retried on the next render rather than stuck.
+_cached_display_macs = None  # type: Optional[Dict[str, Optional[str]]]
+
+
+def _get_display_macs() -> Dict[str, Optional[str]]:
+    """Memoized permanent WiFi/ethernet MACs for the identity block."""
+    global _cached_display_macs
+    if _cached_display_macs is not None:
+        return _cached_display_macs
+    macs = get_mac_addresses()
+    if macs.get('wifiMac') or macs.get('ethernetMac'):
+        _cached_display_macs = macs  # cache only a successful read
+    return macs
+
+
+def _draw_device_identity(draw, width: int, height: int, device_uuid) -> bool:
     """
     The identity block at the bottom of every non-content screen.
 
-    Three lines, top to bottom, from common.credentials.device_identity_lines:
+    Prominent (big), then muted support lines (small/secondary), top to bottom:
 
         Device ID: XXXXX                      <- what a person actually matches
         Setup network: JAM-PLAYER-XXXXX       <- the phone's Bluetooth list entry
         Device: <full uuid>                   <- for support, deliberately muted
+        Wi-Fi MAC: AA:BB:CC:DD:EE:FF          <- support; omitted if unknown
+        Ethernet MAC: AA:BB:CC:DD:EE:11       <- support; omitted if none
 
     Users could not match the last five characters of a printed UUID to the
-    JAM-PLAYER-XXXXX name in their phone's Bluetooth list, so the screen now
-    says both outright. The five characters come from the same derivation
-    the BLE service advertises, so the two can never disagree. Sits above the
+    JAM-PLAYER-XXXXX name in their phone's Bluetooth list, so the screen says
+    both outright. The five characters come from the same derivation the BLE
+    service advertises, so the two can never disagree. The MAC lines let support
+    tie a screen to the addresses the backend/dashboards report. Sits above the
     "v2" marker at height - 25; draws nothing when there is no UUID yet.
+
+    Returns whether this render is safe to CACHE. It is not when the device has
+    a UUID but the MACs could not be read at all (NetworkManager not ready yet):
+    persisting a MAC-less PNG to /var/cache would show it until the next commit.
+    Callers fold the result into their cacheable flag, mirroring the qrcode
+    fallback. A device that legitimately has no ethernet still returns True --
+    its single Wi-Fi line is the permanent truth and safe to cache.
     """
     lines = device_identity_lines(device_uuid)
     if not lines:
-        return
+        return True  # nothing to identify yet; nothing MAC-dependent to gate
+    macs = _get_display_macs()
+    mac_lines = mac_identity_lines(macs.get('wifiMac'), macs.get('ethernetMac'))
+    cacheable = bool(macs.get('wifiMac') or macs.get('ethernetMac'))
+
     center_x = width // 2
     big = get_font(_scaled(FONT_SIZE_URL, height), bold=True)
     small = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
     big_px = _scaled(FONT_SIZE_URL, height)
-    y_uuid = height - 50
-    y_network = y_uuid - int(big_px * 1.6)
-    y_device_id = y_network - int(big_px * 1.4)
-    draw.text((center_x, y_device_id), lines[0], font=big, fill=TEXT_COLOR, anchor="mm")
-    draw.text((center_x, y_network), lines[1], font=big, fill=TEXT_COLOR, anchor="mm")
-    draw.text((center_x, y_uuid), lines[2], font=small, fill=SECONDARY_COLOR, anchor="mm")
+    small_px = _scaled(FONT_SIZE_DEVICE_ID, height)
+
+    # Muted support block (small/secondary): the full UUID plus any MAC lines,
+    # stacked upward from just above the "v2" marker so it grows with the
+    # number of readable MACs without colliding with the corner text.
+    muted = [lines[2]] + mac_lines
+    y = height - 45
+    for text in reversed(muted):
+        draw.text((center_x, y), text, font=small, fill=SECONDARY_COLOR, anchor="mm")
+        y -= int(small_px * 1.5)
+
+    # Prominent lines above the muted block, with a little extra separation.
+    y -= int(big_px * 0.2)
+    draw.text((center_x, y), lines[1], font=big, fill=TEXT_COLOR, anchor="mm")
+    y -= int(big_px * 1.6)
+    draw.text((center_x, y), lines[0], font=big, fill=TEXT_COLOR, anchor="mm")
+    return cacheable
 
 
 def create_mesh_gradient_background(width: int, height: int, theme: str = "vibrant") -> Image.Image:
@@ -839,7 +885,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     )
 
     # Device UUID at bottom (small, subtle)
-    _draw_device_identity(draw, width, height, device_uuid)
+    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
 
     # Version indicator in bottom-right corner
     version_font = get_font(_scaled(14, height), bold=False)
@@ -860,7 +906,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     # service with deps installed) re-renders with a real QR. Without
     # this, the placeholder PNG would be cached under the current commit
     # hash and served forever until the commit changed.
-    return img, HAS_QRCODE
+    return img, (HAS_QRCODE and identity_cacheable)
 
 
 def create_waiting_for_content_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -939,7 +985,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     # Device UUID at bottom (every non-content screen shows device UUID
     # so support can identify the physical JAM Player regardless of
     # setup state).
-    _draw_device_identity(draw, width, height, device_uuid)
+    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
 
     # Version indicator
     version_font = get_font(_scaled(14, height), bold=False)
@@ -951,7 +997,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
         anchor="mm"
     )
 
-    return img
+    return img, identity_cacheable
 
 
 def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -1057,7 +1103,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
 
     # Device UUID at the bottom so support / users can identify this JP
     # in the app / web UI when linking.
-    _draw_device_identity(draw, width, height, device_uuid)
+    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
@@ -1068,7 +1114,7 @@ def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str
         anchor="mm"
     )
 
-    return img
+    return img, identity_cacheable
 
 
 def create_awaiting_registration_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -1185,7 +1231,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         img.paste(qr_img, (qr_x, qr_y))
 
     # Device UUID at the bottom
-    _draw_device_identity(draw, width, height, device_uuid)
+    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
 
     # Version indicator
     version_font = get_font(_scaled(14, height), bold=False)
@@ -1202,7 +1248,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
     # the `qrcode` Python package isn't yet installed, we fall back to
     # a text-only "QR Code" placeholder. Flag the render uncacheable so
     # the next call re-renders once jam-update has installed deps.
-    return img, HAS_QRCODE
+    return img, (HAS_QRCODE and identity_cacheable)
 
 
 def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -1293,7 +1339,7 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
     # Device UUID at bottom (every non-content screen shows device UUID
     # so support can identify the physical JAM Player regardless of
     # setup state).
-    _draw_device_identity(draw, width, height, device_uuid)
+    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
@@ -1304,7 +1350,7 @@ def create_no_active_scenes_screen(width: int, height: int, device_uuid: str = N
         anchor="mm"
     )
 
-    return img
+    return img, identity_cacheable
 
 
 def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -1368,7 +1414,7 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
 
     # This screen never printed the device identity; a user stuck on "no
     # scheduled content" needs to find their player like on every other screen.
-    _draw_device_identity(draw, width, height, device_uuid)
+    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)
     draw.text(
@@ -1379,7 +1425,7 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
         anchor="mm",
     )
 
-    return img
+    return img, identity_cacheable
 
 
 def create_outlet_inactive_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
@@ -1482,6 +1528,8 @@ def create_outlet_inactive_screen(width: int, height: int, device_uuid: str = No
 
     # Device UUID at bottom (same convention as other non-content
     # screens, lets support identify the JP in the dashboard).
+    # (Rendered inline, never cached -- so the cacheable signal is irrelevant
+    # here; we ignore it and return a bare Image for the direct feh caller.)
     _draw_device_identity(draw, width, height, device_uuid)
 
     version_font = get_font(_scaled(14, height), bold=False)

@@ -1155,6 +1155,79 @@ def report_network_status() -> bool:
         logger.debug(f"Network-status report skipped: {e}")
         return False
 
+
+def get_mac_addresses() -> Dict[str, Optional[str]]:
+    """
+    Read this device's WiFi and ethernet hardware (MAC) addresses.
+
+    Returns {'wifiMac': <str|None>, 'ethernetMac': <str|None>}, uppercased.
+
+    We pin cloned-mac-address=permanent for both interfaces (see
+    etc/NetworkManager/conf.d/mac-address-permanent.conf), so the CURRENT
+    hwaddr NetworkManager reports IS the permanent one -- no ethtool needed.
+    Parsed from `nmcli device show` by interface TYPE rather than a hardcoded
+    interface name, so it is robust to wlan0/eth0 vs predictable names. A
+    device that has no ethernet (or no wifi) simply reports None for it.
+    """
+    wifi_mac: Optional[str] = None
+    eth_mac: Optional[str] = None
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'GENERAL.TYPE,GENERAL.HWADDR', 'device', 'show'],
+            capture_output=True, text=True, timeout=DEFAULT_COMMAND_TIMEOUT
+        )
+        if result.returncode == 0:
+            cur_type = None
+            for line in result.stdout.split('\n'):
+                # nmcli -t escapes the ':' inside a MAC as '\:'; split only on
+                # the FIRST unescaped ':' that separates key from value.
+                if line.startswith('GENERAL.TYPE:'):
+                    cur_type = line.split(':', 1)[1].strip().lower()
+                elif line.startswith('GENERAL.HWADDR:'):
+                    hwaddr = line.split(':', 1)[1].strip().replace('\\:', ':').upper()
+                    if not hwaddr:
+                        continue
+                    if cur_type == 'wifi' and wifi_mac is None:
+                        wifi_mac = hwaddr
+                    elif cur_type == 'ethernet' and eth_mac is None:
+                        eth_mac = hwaddr
+    except Exception as e:
+        logger.warning(f"Could not read MAC addresses: {e}")
+    return {'wifiMac': wifi_mac, 'ethernetMac': eth_mac}
+
+
+def report_mac_addresses() -> bool:
+    """
+    Report the device's permanent WiFi + ethernet MACs to the backend
+    (POST /jam-players/mac-addresses).
+
+    MACs are permanent, so this is NOT reported on an interval. It is called
+    once right after announce succeeds and once per boot on the first
+    successful heartbeat -- boot-triggered re-assertion that reaches the
+    backend reliably (surviving a failed first attempt, a device that pinned
+    its MACs in a firmware update, or backend data loss) without polling.
+
+    Best-effort: only meaningful while online, swallows every error, never
+    raises into its caller. Skips the call entirely if neither MAC could be
+    read. Returns True only when the report was sent and accepted (for tests).
+    """
+    try:
+        macs = get_mac_addresses()
+        if not macs['wifiMac'] and not macs['ethernetMac']:
+            logger.debug("No MAC addresses readable; skipping report")
+            return False
+        from .api import api_request  # lazy import: avoid a load-time cycle
+        response = api_request(
+            method='POST',
+            path='/jam-players/mac-addresses',
+            body={'wifiMac': macs['wifiMac'], 'ethernetMac': macs['ethernetMac']},
+            signed=True,
+        )
+        return bool(response is not None and getattr(response, 'status_code', 500) < 300)
+    except Exception as e:
+        logger.debug(f"MAC-address report skipped: {e}")
+        return False
+
 def _check_tls_connectivity(host: str, port: int, timeout: float) -> bool:
     """
     Prove real end-to-end internet by completing a TLS handshake with FULL

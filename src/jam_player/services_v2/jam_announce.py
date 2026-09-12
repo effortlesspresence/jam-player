@@ -20,7 +20,7 @@ import os
 # Add the services directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common.network import device_is_offline, report_network_status
+from common.network import device_is_offline, report_network_status, report_mac_addresses
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     get_device_uuid,
@@ -155,6 +155,10 @@ def main():
             # right away instead of waiting for jam-heartbeat's first beat.
             # Best-effort; never blocks announce completion.
             report_network_status()
+            # And the permanent WiFi/ethernet MACs, once, now that the row
+            # exists. MACs never change, so they are not reported on an
+            # interval; the first heartbeat of each boot re-asserts them.
+            report_mac_addresses()
 
             # Start services that depend on .announced flag
             # These services have ConditionPathExists=/etc/jam/device_data/.announced

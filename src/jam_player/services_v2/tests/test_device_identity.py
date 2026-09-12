@@ -54,6 +54,33 @@ class DeviceIdentityTests(unittest.TestCase):
         self.assertEqual(credentials.device_identity_lines(''), [])
 
 
+class MacIdentityLinesTests(unittest.TestCase):
+    """The permanent-MAC lines appended to the identity block. Pure text; the
+    caller supplies the addresses, so no nmcli/PIL here."""
+
+    def test_both_macs_render_labeled_lines(self):
+        self.assertEqual(
+            credentials.mac_identity_lines('AA:BB:CC:DD:EE:01', 'AA:BB:CC:DD:EE:02'),
+            ['Wi-Fi MAC: AA:BB:CC:DD:EE:01', 'Ethernet MAC: AA:BB:CC:DD:EE:02'],
+        )
+
+    def test_wifi_only_device_shows_just_the_wifi_line(self):
+        self.assertEqual(
+            credentials.mac_identity_lines('AA:BB:CC:DD:EE:01', None),
+            ['Wi-Fi MAC: AA:BB:CC:DD:EE:01'],
+        )
+
+    def test_ethernet_only_shows_just_the_ethernet_line(self):
+        self.assertEqual(
+            credentials.mac_identity_lines(None, 'AA:BB:CC:DD:EE:02'),
+            ['Ethernet MAC: AA:BB:CC:DD:EE:02'],
+        )
+
+    def test_no_macs_means_no_lines(self):
+        self.assertEqual(credentials.mac_identity_lines(None, None), [])
+        self.assertEqual(credentials.mac_identity_lines('', ''), [])
+
+
 class ScreenRenderSmokeTests(unittest.TestCase):
     """Every non-content screen must still render with the identity block.
     Imports the display module (GTK/PIL), so this runs on a player only."""
@@ -86,6 +113,54 @@ class ScreenRenderSmokeTests(unittest.TestCase):
             with_id = self._render(name, UUID).crop((0, 900, 1920, 1060)).tobytes()
             without = self._render(name, None).crop((0, 900, 1920, 1060)).tobytes()
             self.assertNotEqual(with_id, without, f'{name} draws nothing for the device identity')
+
+    def test_mac_read_is_memoized_only_on_success(self):
+        """A failed read (NetworkManager not ready) is retried; a good read is
+        cached so nmcli is spawned at most once per process."""
+        import jam_player_display as display
+        display._cached_display_macs = None
+        try:
+            with mock.patch.object(display, 'get_mac_addresses',
+                                   return_value={'wifiMac': None, 'ethernetMac': None}) as m:
+                display._get_display_macs()
+                display._get_display_macs()
+                self.assertEqual(m.call_count, 2, 'failed read must not be cached')
+            with mock.patch.object(display, 'get_mac_addresses',
+                                   return_value={'wifiMac': 'AA:BB:CC:DD:EE:01',
+                                                 'ethernetMac': None}) as m:
+                display._get_display_macs()
+                display._get_display_macs()
+                self.assertEqual(m.call_count, 1, 'successful read must be cached')
+        finally:
+            display._cached_display_macs = None
+
+    def test_render_is_uncacheable_when_no_mac_is_readable(self):
+        """A UUID present but MACs unreadable must NOT persist to /var/cache --
+        else a MAC-less PNG shows until the next commit. Mirrors the qrcode
+        fallback."""
+        import jam_player_display as display
+        display._cached_display_macs = None
+        try:
+            with mock.patch.object(display, 'get_mac_addresses',
+                                   return_value={'wifiMac': None, 'ethernetMac': None}):
+                result = display.create_awaiting_registration_screen(1920, 1080, UUID)
+            self.assertIsInstance(result, tuple)
+            self.assertFalse(result[1], 'MAC-less render must be flagged uncacheable')
+        finally:
+            display._cached_display_macs = None
+
+    def test_render_is_cacheable_when_macs_are_readable(self):
+        import jam_player_display as display
+        display._cached_display_macs = None
+        try:
+            with mock.patch.object(display, 'get_mac_addresses',
+                                   return_value={'wifiMac': 'AA:BB:CC:DD:EE:01',
+                                                 'ethernetMac': 'AA:BB:CC:DD:EE:02'}):
+                result = display.create_awaiting_registration_screen(1920, 1080, UUID)
+            self.assertIsInstance(result, tuple)
+            self.assertTrue(result[1], 'readable MACs -> cacheable render')
+        finally:
+            display._cached_display_macs = None
 
 
 if __name__ == '__main__':
