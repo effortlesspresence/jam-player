@@ -382,6 +382,43 @@ def _log_network_diagnostic_info():
     logger.info("=== END DIAGNOSTIC INFO ===")
 
 
+def _discard_failed_wifi_profile(conn_name: str, keyfile_path: Path) -> None:
+    """
+    Remove the profile created for a connection attempt that did NOT activate.
+
+    _connect_wifi_secure persists the keyfile (autoconnect=true, with the psk)
+    BEFORE it knows whether the credentials work. If activation then fails --
+    most commonly a wrong password -- that profile must not be left behind:
+    NetworkManager would keep re-attempting the bad password on its own
+    (autoconnect) and, because it lives on disk, again on every reboot. That is
+    exactly the fielded (7440d2d) "entered a wrong password and the JP kept
+    saving and retrying it" bug. Only a profile that actually authenticated is
+    worth persisting.
+
+    `nmcli connection delete` is the proper removal (drops it from
+    NetworkManager AND deletes its keyfile). If nmcli can't (e.g. NM never
+    loaded it), fall back to unlinking the file and reloading. Best-effort:
+    never raises into the connect path. Deleting by the per-attempt unique
+    conn_name can only ever touch THIS attempt's profile, never a good one.
+    """
+    try:
+        subprocess.run(
+            ['nmcli', 'connection', 'delete', conn_name],
+            capture_output=True, text=True, timeout=10
+        )
+    except Exception as e:
+        logger.debug(f"nmcli delete of failed profile {conn_name} skipped: {e}")
+    try:
+        if keyfile_path.exists():
+            keyfile_path.unlink()
+            subprocess.run(
+                ['nmcli', 'connection', 'reload'],
+                capture_output=True, text=True, timeout=10
+            )
+    except Exception as e:
+        logger.debug(f"Keyfile cleanup for failed profile {conn_name} skipped: {e}")
+
+
 def _connect_wifi_secure(ssid: str, password: str, hidden: bool = False) -> subprocess.CompletedProcess:
     """
     Connect to a WiFi network securely without exposing the password in process list.
@@ -532,16 +569,21 @@ method=auto
             else:
                 logger.info(f"stderr: {stderr_sanitized}")
 
+        if result.returncode != 0:
+            # Activation failed (wrong password, AP rejected us, ...). Do NOT
+            # leave the just-written profile behind: with autoconnect=true NM
+            # would keep retrying the bad credentials on its own and on every
+            # reboot. Discard it so a failed attempt leaves nothing to retry.
+            logger.info(f"Activation failed; discarding connection profile {conn_name}")
+            _discard_failed_wifi_profile(conn_name, keyfile_path)
+
         return result
 
     except Exception as e:
         logger.error(f"Error creating connection profile: {e}")
-        # Clean up on error
-        if keyfile_path.exists():
-            try:
-                keyfile_path.unlink()
-            except:
-                pass
+        # Clean up on error -- same discard as a failed activation, so NM
+        # never keeps an in-memory profile whose keyfile we removed.
+        _discard_failed_wifi_profile(conn_name, keyfile_path)
         # Return a fake failed result
         return subprocess.CompletedProcess(
             args=['nmcli'],
