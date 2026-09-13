@@ -1505,6 +1505,72 @@ def device_is_offline() -> bool:
     return not is_internet_verified(unreadable_means=True)
 
 
+# How long the connect flow will wait for chrony to step a stale clock before
+# classifying connectivity. Zero cost when already synced. Budget: the mobile
+# apps poll for a terminal status for 60 s; nmcli up (<=30 s) + this wait +
+# classification (<=~18 s when everything fails) stays inside that except in
+# the pathological slow-DHCP-AND-stale-clock-AND-all-probes-failing case.
+CLOCK_SYNC_WAIT_SECONDS = 15
+
+
+def _clock_is_synced() -> bool:
+    """chrony reports 'Leap status: Normal'. Lazy import: common.system pulls in
+    sdnotify at load, which would break this module's stdlib-only import."""
+    try:
+        from .system import check_chrony_sync
+        return bool(check_chrony_sync())
+    except Exception:
+        return False
+
+
+def wait_for_clock_sync(max_wait: int = CLOCK_SYNC_WAIT_SECONDS) -> bool:
+    """
+    Give chrony a bounded chance to step the clock; return whether it is synced.
+
+    Why: every connectivity probe is a VERIFIED TLS handshake, and validity is
+    judged against the device clock. A Pi with no RTC that sat boxed for
+    months boots with a months-old fake-hwclock time, so certificates issued
+    since then read "not yet valid" and EVERY probe fails -- a perfectly good
+    network gets classified 'none'. Waiting a few seconds for chrony's first
+    step turns that into an accurate verdict. Returns immediately (no cost)
+    when the clock is already synced.
+    """
+    if _clock_is_synced():
+        return True
+    try:  # nudge chrony to measure now rather than on its own schedule
+        subprocess.run(['chronyc', 'burst', '4/4'], capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+    for _ in range(int(max_wait)):
+        time.sleep(1)
+        if _clock_is_synced():
+            return True
+    return False
+
+
+def none_verdict_blames_wifi(clock_synced: bool) -> Tuple[bool, str]:
+    """
+    May a 'none' classification be blamed on the WiFi network itself?
+
+    Forgetting a profile is the one outcome the customer cannot undo from the
+    app, so it needs corroboration. Two ways the verdict is NOT about the WiFi:
+      - the clock is not NTP-synced: TLS verification cannot be trusted, the
+        failure may be entirely the device's own stale time;
+      - ethernet holds the default route: the probes went out the cable, so a
+        dead ethernet uplink (WAN down, isolated VLAN) fails them, not the WiFi.
+    Fail-safe: if the route cannot be determined, do not blame the WiFi.
+    Returns (blame_wifi, reason_not_to).
+    """
+    if not clock_synced:
+        return False, 'clock is not NTP-synced, so TLS verification failures may be the clock, not the network'
+    try:
+        if get_reported_network_status().get('connectionType') == 'ethernet':
+            return False, 'ethernet holds the default route, so the probes never tested the WiFi path'
+    except Exception as e:
+        return False, f'could not determine the default route ({e})'
+    return True, ''
+
+
 def forget_active_wifi_connection() -> bool:
     """
     Delete the profile of whatever WiFi network is active right now.

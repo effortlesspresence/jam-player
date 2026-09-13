@@ -96,6 +96,8 @@ from common.api import api_request, get_api_base_url
 from common.network import (
     forget_active_wifi_connection,
     classify_connectivity,
+    wait_for_clock_sync,
+    none_verdict_blames_wifi,
     is_internet_verified,
     get_available_wifi_networks,
     get_saved_wifi_networks,
@@ -1111,6 +1113,12 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     # gracefully instead of timing out (the status characteristic
                     # sends only the code over BLE, never the human message).
                     logger.info(f"[BLE->WiFi] Associated to {ssid or connection_name}; classifying connectivity...")
+                    # A months-stale clock (warehouse device, no RTC) makes every
+                    # verified TLS probe fail and would brand a good network a
+                    # captive portal. Give chrony a bounded moment to step the
+                    # clock first; free when already synced. See
+                    # network.wait_for_clock_sync for the 60 s app budget.
+                    clock_synced = wait_for_clock_sync()
                     reachability = classify_connectivity()
                     if reachability == 'backend':
                         logger.info(f"[BLE->WiFi] SUCCESS - {ssid or connection_name} can reach the JAM backend")
@@ -1130,11 +1138,20 @@ class WiFiCredentialsCharacteristic(Characteristic):
                         self.status_characteristic.set_status('failed', 'JAM servers unreachable from this network')
                     else:
                         # Nothing verifiable answers: captive portal, dead uplink, or
-                        # a network firewalling everything we probe. Genuinely
-                        # unusable -- forget the profile so the device does not cling
-                        # to it, then report it.
-                        logger.warning(f"[BLE->WiFi] {ssid or connection_name} associated but has NO usable internet (captive portal / dead uplink)")
-                        forget_active_wifi_connection()
+                        # a network firewalling everything we probe. Forget the
+                        # profile ONLY when the verdict can actually be blamed on
+                        # the WiFi: not while the clock is unsynced (TLS failures
+                        # may be the clock) and not while ethernet holds the
+                        # default route (the probes never used the WiFi). Deleting
+                        # a live profile is the one thing the customer cannot undo
+                        # from the app; keeping a dead one costs nothing. Fielded
+                        # 7440d2d never forgot at all -- this must not regress it.
+                        blame_wifi, why_not = none_verdict_blames_wifi(clock_synced)
+                        if blame_wifi:
+                            logger.warning(f"[BLE->WiFi] {ssid or connection_name} associated but has NO usable internet (captive portal / dead uplink) - forgetting profile")
+                            forget_active_wifi_connection()
+                        else:
+                            logger.warning(f"[BLE->WiFi] {ssid or connection_name} associated but nothing verifiable answered; KEEPING the profile: {why_not}")
                         self.status_characteristic.set_status('no_internet', 'Network has no usable internet (captive portal?)')
                         time.sleep(NO_INTERNET_FALLBACK_DELAY_SECONDS)
                         self.status_characteristic.set_status('failed', 'No usable internet on this network')

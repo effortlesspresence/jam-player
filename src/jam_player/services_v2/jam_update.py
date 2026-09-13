@@ -25,6 +25,7 @@ import sys
 import os
 import subprocess
 import shutil
+import json
 import time
 from pathlib import Path
 from typing import Optional, List, Callable, TypeVar
@@ -36,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.api import report_error as api_report_error, ErrorSeverity, SystemService
-from common.paths import ENVIRONMENT_FILE, DEVICE_UUID_FILE
+from common.paths import ENVIRONMENT_FILE, DEVICE_UUID_FILE, BLE_SESSION_ACTIVE_FLAG, safe_copy
 from common.system import set_unique_hostname
 
 # Try to import PIL for update screen display
@@ -1614,58 +1615,112 @@ def install_wifi_stability_configs():
         logger.warning(f"  Failed to install WiFi stability configs: {e}")
 
 
-def install_ble_configs():
+# Destinations as module constants so tests can point them at a temp dir.
+_DBUS_POLICY_DEST = Path('/etc/dbus-1/system.d/jam-ble-provisioning.conf')
+_BLUEZ_MAIN_CONF_DEST = Path('/etc/bluetooth/main.conf')
+
+# How long a live BLE setup session may hold off the BLE/bluetoothd restarts.
+# Registration is a BLE write that lands 30 s-3 min after WiFi connects; five
+# minutes covers a slow customer without holding the update hostage.
+BLE_SESSION_RESTART_WAIT_SEC = 5 * 60
+_BLE_SESSION_FLAG_MAX_AGE_SEC = 5 * 60   # mirrors jam_ble_state_manager
+
+
+def _install_if_changed(src: Path, dest: Path, label: str) -> bool:
+    """Copy src over dest atomically, only if the bytes differ. Returns changed."""
+    if not src.exists():
+        logger.debug(f"  {label} not found: {src}")
+        return False
+    try:
+        if dest.exists() and dest.read_bytes() == src.read_bytes():
+            logger.debug(f"  {label} unchanged: {dest}")
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # tmp + fsync + rename: a power cut here must never leave a 0-byte
+        # file -- an empty D-Bus policy takes the whole system bus down.
+        safe_copy(src, dest)
+        os.chown(dest, 0, 0)  # root:root
+        os.chmod(dest, 0o644)
+        logger.info(f"  Installed {dest}")
+        return True
+    except Exception as e:
+        logger.warning(f"  Failed to install {label}: {e}")
+        return False
+
+
+def install_ble_configs() -> bool:
     """
     Install D-Bus and BlueZ configuration files for BLE provisioning.
 
     These configs are required for the NoInputNoOutput pairing agent to work
     properly, preventing Bluetooth pairing popups on both the Pi and mobile devices.
 
-    Installs:
+    Installs (only when the bytes actually differ, atomically):
     - /etc/dbus-1/system.d/jam-ble-provisioning.conf: D-Bus permissions for agent
     - /etc/bluetooth/main.conf: BlueZ configuration for JustWorks pairing
+
+    Does NOT restart bluetoothd here. Returns whether main.conf changed so
+    restart_services() can restart bluetooth -- once, only when needed, and
+    never underneath a live BLE setup session (the unconditional restart that
+    used to live here cut customers off mid-registration on every update).
     """
     logger.info("Installing BLE configuration files...")
+    _install_if_changed(ETC_SRC / 'dbus-1' / 'system.d' / 'jam-ble-provisioning.conf',
+                        _DBUS_POLICY_DEST, 'D-Bus config')
+    return _install_if_changed(ETC_SRC / 'bluetooth' / 'main.conf',
+                               _BLUEZ_MAIN_CONF_DEST, 'BlueZ config')
 
-    # Install D-Bus config for BLE agent
-    dbus_config_src = ETC_SRC / 'dbus-1' / 'system.d' / 'jam-ble-provisioning.conf'
-    dbus_config_dest = Path('/etc/dbus-1/system.d/jam-ble-provisioning.conf')
 
-    if dbus_config_src.exists():
-        try:
-            dbus_config_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(dbus_config_src, dbus_config_dest)
-            os.chown(dbus_config_dest, 0, 0)  # root:root
-            os.chmod(dbus_config_dest, 0o644)
-            logger.info(f"  Installed {dbus_config_dest}")
-        except Exception as e:
-            logger.warning(f"  Failed to install D-Bus config: {e}")
-    else:
-        logger.debug(f"  D-Bus config not found: {dbus_config_src}")
+def _ble_central_connected() -> bool:
+    """
+    True while a phone is connected to our GATT server, asked of BlueZ via
+    busctl (no python-dbus in the updater: it must stay importable no matter
+    what). Any failure answers False -- if D-Bus is unreachable there is no
+    session to protect, and a busctl problem must not stall updates.
+    """
+    try:
+        success, stdout, _ = run_command(
+            ['busctl', '--system', '--json=short', 'call', 'org.bluez', '/',
+             'org.freedesktop.DBus.ObjectManager', 'GetManagedObjects'],
+            timeout=10,
+        )
+        if not success or not stdout:
+            return False
+        objects = json.loads(stdout).get('data', [{}])[0]
+        for interfaces in objects.values():
+            device = interfaces.get('org.bluez.Device1')
+            if device and bool(device.get('Connected', {}).get('data', False)):
+                return True
+    except Exception as e:
+        logger.debug(f"  Could not query BlueZ for connected centrals: {e}")
+    return False
 
-    # Install BlueZ main.conf
-    bluetooth_config_src = ETC_SRC / 'bluetooth' / 'main.conf'
-    bluetooth_config_dest = Path('/etc/bluetooth/main.conf')
 
-    if bluetooth_config_src.exists():
-        try:
-            bluetooth_config_dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(bluetooth_config_src, bluetooth_config_dest)
-            os.chown(bluetooth_config_dest, 0, 0)  # root:root
-            os.chmod(bluetooth_config_dest, 0o644)
-            logger.info(f"  Installed {bluetooth_config_dest}")
+def _ble_session_active() -> bool:
+    """A WiFi connect is in flight (fresh session flag) or a phone is connected."""
+    try:
+        if BLE_SESSION_ACTIVE_FLAG.exists():
+            if time.time() - BLE_SESSION_ACTIVE_FLAG.stat().st_mtime <= _BLE_SESSION_FLAG_MAX_AGE_SEC:
+                return True
+    except Exception:
+        pass
+    return _ble_central_connected()
 
-            # Restart bluetooth service to pick up new config
-            success, _, stderr = run_command(['systemctl', 'restart', 'bluetooth'], timeout=30)
-            if success:
-                logger.info("  Restarted bluetooth service to apply config")
-            else:
-                logger.warning(f"  Failed to restart bluetooth: {stderr}")
-        except Exception as e:
-            logger.warning(f"  Failed to install BlueZ config: {e}")
-    else:
-        logger.debug(f"  BlueZ config not found: {bluetooth_config_src}")
 
+def _wait_for_ble_session_to_end(max_wait: float = BLE_SESSION_RESTART_WAIT_SEC) -> bool:
+    """Poll until no BLE setup session is active. True if clear, False if still
+    active when the budget runs out."""
+    if not _ble_session_active():
+        return True
+    logger.info(f"  A BLE setup session is in progress; deferring BLE restarts up to {int(max_wait)}s")
+    waited = 0.0
+    while waited < max_wait:
+        time.sleep(5)
+        waited += 5
+        if not _ble_session_active():
+            logger.info(f"  BLE setup session ended after {int(waited)}s; proceeding")
+            return True
+    return False
 
 def install_lightdm_cursor_config():
     """
@@ -2205,7 +2260,7 @@ DISPLAY_RESTART_WAIT_TIMEOUT_SEC = 45
 _SYNCHRONOUS_RESTART_SERVICE = 'jam-player-display.service'
 
 
-def restart_services():
+def restart_services(bluetooth_conf_changed: bool = False):
     """
     Restart JAM services to pick up new code.
 
@@ -2244,6 +2299,31 @@ def restart_services():
         # backend. Skipping the systemctl-restart of the reporter avoids
         # a redundant POST.
     ]
+
+    # Never tear down a live BLE setup session. The first-connect auto-update
+    # starts seconds after the customer joins WiFi from the app and reached this
+    # point right as they were registering (a BLE write); restarting bluetoothd
+    # (jam-ble-provisioning is PartOf= it) or the BLE units dropped their link
+    # and looked like a broken device. Wait for the session to end; if it does
+    # not within the budget, leave the BLE units and bluetoothd on their current
+    # code -- they pick up the new code at the next boot, and the state manager
+    # re-asserts BLE on its own tick regardless.
+    ble_units = {'jam-ble-provisioning.service', 'jam-ble-state-manager.service'}
+    if not _wait_for_ble_session_to_end():
+        logger.warning(
+            f"  BLE setup session still active after {BLE_SESSION_RESTART_WAIT_SEC}s; "
+            f"leaving BLE units (and bluetoothd) untouched until next boot"
+        )
+        services_to_restart = [svc for svc in services_to_restart if svc not in ble_units]
+        bluetooth_conf_changed = False
+    if bluetooth_conf_changed:
+        # PartOf= means this also restarts jam-ble-provisioning; the loop below
+        # restarting it again is harmless.
+        success, _, stderr = run_command(['systemctl', 'restart', 'bluetooth'], timeout=30)
+        if success:
+            logger.info("  Restarted bluetooth service to apply new main.conf")
+        else:
+            logger.warning(f"  Failed to restart bluetooth: {stderr}")
 
     logger.info("  Triggering service restarts...")
     for service in services_to_restart:
@@ -2642,7 +2722,7 @@ def main():
     install_wifi_stability_configs()
 
     # Install BLE configuration (D-Bus and BlueZ) for pairing-free provisioning
-    install_ble_configs()
+    bluetooth_conf_changed = install_ble_configs()
 
     # Configure lightdm to hide cursor on desktop
     install_lightdm_cursor_config()
@@ -2668,7 +2748,7 @@ def main():
         logger.warning(f"Display cache pre-warm raised (non-fatal): {e}")
 
     # Restart services to pick up changes
-    restart_services()
+    restart_services(bluetooth_conf_changed=bluetooth_conf_changed)
 
     # Forcibly terminate any in-progress lightdm restart storm.  Only
     # runs on updates that newly install or change the jam-no-restart
