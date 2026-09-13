@@ -2075,6 +2075,19 @@ def main():
     # failure (D-Bus error, property missing, etc.) is treated as "we
     # don't know" -- we return True and let the next tick try again
     # rather than triggering a restart on a transient D-Bus hiccup.
+    # One long-lived Properties proxy for the adapter. adapter_is_powered()
+    # deliberately reuses it rather than rebuilding it per tick: if bluetoothd
+    # dies or is restarted underneath us this proxy's Get() fails, which is
+    # exactly the "active while advertising nothing" condition the 3-strike
+    # exit below exists to catch. (After 69b46b6 this binding was missing --
+    # `adapter` was an unbound name, so EVERY tick raised NameError and the
+    # service exited every ~9 s, crash-looping BLE. tests/test_no_undefined_
+    # names.py now guards against this class of bug.)
+    adapter = dbus.Interface(
+        bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
+        DBUS_PROP_IFACE,
+    )
+
     dbus_failures = {'count': 0}
 
     def adapter_is_powered() -> bool:

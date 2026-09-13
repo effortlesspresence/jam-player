@@ -20,7 +20,7 @@ import os
 # Add the services directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common.network import device_is_offline, report_network_status, report_mac_addresses
+from common.network import device_is_offline, report_network_status, report_mac_addresses, stamp_api_ok
 from common.logging_config import setup_service_logging, log_service_start
 from common.credentials import (
     get_device_uuid,
@@ -147,6 +147,7 @@ def main():
         if set_device_announced():
             logger.info(f"Created {ANNOUNCED_FLAG}")
             logger.info("Announcement complete!")
+            stamp_api_ok()  # first signed API success of this device's life
 
             # Report the current network once, now. The announce call just
             # created this device's row in the backend and the device is

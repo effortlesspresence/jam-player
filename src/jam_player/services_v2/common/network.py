@@ -18,6 +18,8 @@ This handles cases where:
 """
 
 import subprocess
+import threading
+from urllib.parse import urlparse
 import socket
 import ssl
 import time
@@ -27,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Callable
 
-from .paths import INTERNET_VERIFIED_FLAG, STATE_MANAGER_ALIVE_FLAG
+from .paths import INTERNET_VERIFIED_FLAG, STATE_MANAGER_ALIVE_FLAG, API_LAST_OK_FLAG, touch_volatile_flag
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +131,7 @@ def wait_for_network(timeout_seconds: int = DEFAULT_NETWORK_WAIT_TIMEOUT) -> Tup
 # Global cache for WiFi networks - used to avoid blocking BLE thread
 _wifi_networks_cache: List[Dict[str, str]] = []
 _wifi_scan_in_progress = False
-_wifi_cache_lock = __import__('threading').Lock()
+_wifi_cache_lock = threading.Lock()
 
 
 def get_available_wifi_networks() -> List[Dict[str, str]]:
@@ -382,6 +384,71 @@ def _log_network_diagnostic_info():
     logger.info("=== END DIAGNOSTIC INFO ===")
 
 
+def _find_wifi_profiles_for_ssid(ssid: str) -> List[str]:
+    """
+    Names of saved WiFi profiles whose SSID is EXACTLY `ssid`.
+
+    Exact, parsed comparison -- never a substring test. The old sweep used
+    `ssid in stdout`, so connecting to "Shop" matched (and deleted) the
+    profile for "Shop-5G"; dual-band "X"/"X-5G"/"X-Guest" naming made that
+    common. nmcli -t escapes ':' inside values as '\\:', so the SSID is taken
+    after the FIRST ':' and unescaped; the NAME,TYPE listing is split on the
+    LAST ':' because TYPE never contains one. Best-effort: [] on any error.
+    """
+    names: List[str] = []
+    try:
+        listing = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
+            capture_output=True, text=True, timeout=10
+        )
+        if listing.returncode != 0:
+            return names
+        for line in listing.stdout.strip().split('\n'):
+            if not line or ':' not in line:
+                continue
+            raw_name, conn_type = line.rsplit(':', 1)
+            if conn_type != '802-11-wireless':
+                continue
+            name = _unescape_nmcli_field(raw_name)
+            ssid_result = subprocess.run(
+                ['nmcli', '-t', '-f', '802-11-wireless.ssid', 'connection', 'show', name],
+                capture_output=True, text=True, timeout=5
+            )
+            if ssid_result.returncode != 0 or ':' not in ssid_result.stdout:
+                continue
+            profile_ssid = _unescape_nmcli_field(
+                ssid_result.stdout.strip().split(':', 1)[1]
+            )
+            if profile_ssid == ssid:
+                names.append(name)
+    except Exception as e:
+        logger.warning(f"Could not enumerate saved profiles for '{ssid}': {e}")
+    return names
+
+
+def _connection_is_activating_or_active(conn_name: str) -> bool:
+    """
+    True if NetworkManager reports `conn_name` as activating or activated.
+
+    Used when nmcli's CLIENT-side `connection up` timeout fires: NM may still
+    be mid-activation (slow DHCP / 802.1X), so the profile must not be thrown
+    away. GENERAL.STATE is empty for a profile that is not active at all.
+    Fail-safe: if NM cannot be asked, answer True (keep) -- an orphan profile
+    is recoverable, a destroyed valid activation is not.
+    """
+    try:
+        r = subprocess.run(
+            ['nmcli', '-g', 'GENERAL.STATE', 'connection', 'show', conn_name],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            return True  # could not ask -> keep
+        return r.stdout.strip().lower().startswith('activat')  # activating|activated
+    except Exception as e:
+        logger.debug(f"Could not query activation state of {conn_name}: {e}")
+        return True
+
+
 def _discard_failed_wifi_profile(conn_name: str, keyfile_path: Path) -> None:
     """
     Remove the profile created for a connection attempt that did NOT activate.
@@ -437,39 +504,15 @@ def _connect_wifi_secure(ssid: str, password: str, hidden: bool = False) -> subp
     # Generate a unique connection name
     conn_name = f"jam-wifi-{uuid.uuid4().hex[:8]}"
 
-    # First, delete any existing connection with the same SSID to avoid conflicts
-    try:
-        # Find existing connections for this SSID
-        list_result = subprocess.run(
-            ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if list_result.returncode == 0:
-            for line in list_result.stdout.strip().split('\n'):
-                if not line:
-                    continue
-                parts = line.split(':')
-                if len(parts) >= 2 and parts[1] == '802-11-wireless':
-                    existing_name = parts[0]
-                    # Check if this connection is for our SSID
-                    ssid_result = subprocess.run(
-                        ['nmcli', '-t', '-f', '802-11-wireless.ssid',
-                         'connection', 'show', existing_name],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    if ssid_result.returncode == 0 and ssid in ssid_result.stdout:
-                        logger.info(f"Removing existing connection profile: {existing_name}")
-                        subprocess.run(
-                            ['nmcli', 'connection', 'delete', existing_name],
-                            capture_output=True,
-                            timeout=5
-                        )
-    except Exception as e:
-        logger.warning(f"Error cleaning up existing connections: {e}")
+    # Profiles that already exist for this EXACT SSID. Deliberately NOT deleted
+    # here: if this attempt fails (typo'd password, slow network) the old
+    # profile may be the device's working connection, and deleting it first is
+    # how a single typo used to knock a working player offline -- and left
+    # connect_to_wifi's _restore_wifi_connection() pointing at a name that no
+    # longer existed. They are removed only AFTER the new profile has actually
+    # activated (below). Two profiles for one SSID coexisting briefly is fine:
+    # `nmcli connection up <name>` activates by name, so there is no conflict.
+    superseded = _find_wifi_profiles_for_ssid(ssid)
 
     # Create a NetworkManager keyfile (connection profile) with the
     # credentials. This avoids passing the password as a command-line
@@ -551,12 +594,34 @@ method=auto
 
         # Activate the connection
         logger.info(f"Activating connection: {conn_name}")
-        result = subprocess.run(
-            ['nmcli', 'connection', 'up', conn_name],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        try:
+            result = subprocess.run(
+                ['nmcli', 'connection', 'up', conn_name],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        except subprocess.TimeoutExpired as e:
+            # This is nmcli's CLIENT-side timeout, not a verdict from NM. On a
+            # slow network (802.1X/MAB ports, DHCP snooping, some ISP gateways)
+            # NM may still be activating -- its own ceiling is ~90 s -- with
+            # perfectly good credentials: a wrong password fails FAST with
+            # "Secrets were required"; it does not time out. Discarding here
+            # would abort a valid activation and turn a slow network into a
+            # permanently failing one (a regression vs 7440d2d). Keep the
+            # profile while NM says it is activating/active; discard only when
+            # NM positively says it is not; keep if we cannot even ask.
+            if _connection_is_activating_or_active(conn_name):
+                logger.warning(
+                    f"nmcli timed out after 30 s but {conn_name} is still activating in "
+                    f"NetworkManager; keeping the profile so the connection can complete"
+                )
+            else:
+                logger.info(f"Activation timed out and is not in progress; discarding {conn_name}")
+                _discard_failed_wifi_profile(conn_name, keyfile_path)
+            return subprocess.CompletedProcess(
+                args=e.cmd, returncode=1, stdout='', stderr=str(e)
+            )
 
         logger.info(f"Connection result: returncode={result.returncode}")
         if result.stdout.strip():
@@ -574,8 +639,24 @@ method=auto
             # leave the just-written profile behind: with autoconnect=true NM
             # would keep retrying the bad credentials on its own and on every
             # reboot. Discard it so a failed attempt leaves nothing to retry.
+            # The pre-existing profile(s) for this SSID are untouched.
             logger.info(f"Activation failed; discarding connection profile {conn_name}")
             _discard_failed_wifi_profile(conn_name, keyfile_path)
+        else:
+            # The new profile is live, so any older profile for the same SSID is
+            # now redundant (two autoconnect candidates for one network). Remove
+            # them only now -- never before we know the new one actually works.
+            for old_name in superseded:
+                if old_name == conn_name:
+                    continue
+                try:
+                    subprocess.run(
+                        ['nmcli', 'connection', 'delete', old_name],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    logger.info(f"Removed superseded profile for '{ssid}': {old_name}")
+                except Exception as e:
+                    logger.warning(f"Could not remove superseded profile {old_name}: {e}")
 
         return result
 
@@ -1326,9 +1407,36 @@ def _check_tls_connectivity(host: str, port: int, timeout: float) -> bool:
 
 
 # How old the state manager's liveness stamp may be before its flag is
-# treated as unknown. The manager stamps every 7 s; 60 s allows a slow tick
+# treated as unknown. The manager stamps every 15 s (its check interval); 60 s allows a slow tick
 # (a connectivity check can take ~15 s) plus a service restart without a
 # false "unknown", and bounds how long a dead manager can freeze the answer.
+# API health is a separate question from connectivity and is answered by a
+# different signal: every SUCCESSFUL signed API call (heartbeat every 5 min,
+# announce) stamps API_LAST_OK_FLAG. Anything that must know "is our API
+# actually serving" (not just "is our edge reachable") reads the stamp. 15 min
+# = three missed heartbeats before we stop trusting it.
+API_HEALTH_MAX_AGE_SECONDS = 15 * 60
+
+
+def stamp_api_ok() -> None:
+    """Record that a real, signed API call just succeeded. Best-effort."""
+    touch_volatile_flag(API_LAST_OK_FLAG)
+
+
+def api_recently_ok(max_age: float = API_HEALTH_MAX_AGE_SECONDS) -> Optional[bool]:
+    """
+    True  -> a signed API call succeeded within max_age (API is serving).
+    False -> the last success is older than max_age (API probably down).
+    None  -> no evidence this boot, or the stamp is unreadable.
+    Callers deciding to REDUCE reachability (e.g. stop BLE) must require True.
+    """
+    try:
+        age = time.time() - API_LAST_OK_FLAG.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        return None
+    return age <= max_age
+
+
 CONNECTIVITY_STATE_MAX_AGE_SECONDS = 60
 
 
@@ -1357,7 +1465,7 @@ def is_internet_verified(unreadable_means: bool = False) -> bool:
     passing check, BEFORE the manager restarts the services that depend on
     it, so a fresh "online" is never missed. Going offline it can linger for
     roughly 20 seconds (link drop) to two minutes (link up, internet dead,
-    dead resolvers) while the manager collects three consecutive failures.
+    dead resolvers) while the manager collects two consecutive failures (INTERNET_CHECK_FAILURES_FOR_OFFLINE).
     Callers must tolerate acting on a stale "online" for that long; none of
     them should treat this as a real-time probe.
 
@@ -1429,6 +1537,25 @@ def forget_active_wifi_connection() -> bool:
         return False
 
 
+def _parse_backend_endpoint(base_url: str) -> Optional[Tuple[str, int]]:
+    """(hostname, port) from an API base URL; None if it has no hostname. Pure."""
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        return None
+    return parsed.hostname, parsed.port or 443
+
+
+def _backend_endpoint() -> Optional[Tuple[str, int]]:
+    """(hostname, port) of the configured API base URL, or None if unparseable.
+    Lazy import: common.api imports this module."""
+    try:
+        from .api import get_api_base_url
+        return _parse_backend_endpoint(get_api_base_url())
+    except Exception as e:
+        logger.debug(f"Could not determine backend endpoint: {e}")
+        return None
+
+
 def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT) -> Tuple[bool, str]:
     """
     Verify actual internet connectivity by testing real endpoints.
@@ -1443,9 +1570,17 @@ def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT)
     verified TLS peer -- something a portal cannot fake.
 
     Test order:
-    1. JAM backend health endpoint over HTTPS (what actually matters)
+    1. Verified TLS handshake to OUR backend host (proves DNS + a network
+       path to our edge + our real certificate -- portal-proof). This is
+       deliberately NOT an HTTP request: this function runs every 15 s on
+       every player, and a GET /jam-players/health here was ~92% of all API
+       Gateway requests the fleet made. A handshake that sends no request is
+       not an API call. It also does NOT prove the API behind the edge is
+       serving -- that is a different question, answered by api_recently_ok()
+       from the heartbeat's signed calls. classify_connectivity() keeps the
+       real HTTP check because it is event-driven and needs API health.
     2. Fallback: verified TLS handshake to public resolver IPs on 443,
-       which distinguishes "our backend is down" from "no internet"
+       which distinguishes "our edge is unreachable" from "no internet"
 
     Args:
         timeout: Timeout in seconds for each individual check
@@ -1455,12 +1590,11 @@ def check_internet_connectivity(timeout: float = DEFAULT_INTERNET_CHECK_TIMEOUT)
         check_that_succeeded is one of: 'jam_backend', 'cloudflare_tls',
         'google_tls', or 'none'
     """
-    # Import here to avoid circular dependency
-    from .api import check_api_availability
-
-    # First, try the JAM backend - this is what actually matters.
-    # This is HTTPS with cert validation, so a portal cannot satisfy it.
-    if check_api_availability(timeout=int(timeout)):
+    # First, our own backend edge: a VERIFIED TLS handshake (cert must chain
+    # and match our hostname), so a captive portal cannot satisfy it. No HTTP
+    # request is sent -- see the docstring for why that matters.
+    backend = _backend_endpoint()
+    if backend is not None and _check_tls_connectivity(backend[0], backend[1], timeout):
         return True, 'jam_backend'
 
     # Backend unreachable - could be backend down or no internet.

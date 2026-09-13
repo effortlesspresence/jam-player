@@ -41,7 +41,8 @@ class RecoveryWindowTests(unittest.TestCase):
     def _should_run(self, uptime, is_online, registered, method='jam_backend'):
         with mock.patch.object(sm, 'seconds_since_boot', return_value=uptime), \
              mock.patch.object(sm, 'unit_active_since_boot_seconds', return_value=None), \
-             mock.patch.object(sm, 'is_device_registered', return_value=registered):
+             mock.patch.object(sm, 'is_device_registered', return_value=registered), \
+             mock.patch.object(sm, 'api_recently_ok', return_value=True):
             return _manager()._should_ble_run(is_online, method)
 
     # --- inside the window: ALWAYS on -------------------------------------
@@ -66,7 +67,8 @@ class RecoveryWindowTests(unittest.TestCase):
     def _run_with_activation(self, uptime, ble_active_since):
         with mock.patch.object(sm, 'seconds_since_boot', return_value=uptime), \
              mock.patch.object(sm, 'unit_active_since_boot_seconds', return_value=ble_active_since), \
-             mock.patch.object(sm, 'is_device_registered', return_value=True):
+             mock.patch.object(sm, 'is_device_registered', return_value=True), \
+             mock.patch.object(sm, 'api_recently_ok', return_value=True):
             return _manager()._should_ble_run(True, 'jam_backend')
 
     def test_a_delayed_ble_start_gets_its_full_window(self):
@@ -106,7 +108,8 @@ class SetupSessionHoldTests(unittest.TestCase):
     def _run(self, m, uptime):
         with mock.patch.object(sm, 'seconds_since_boot', return_value=uptime), \
              mock.patch.object(sm, 'unit_active_since_boot_seconds', return_value=None), \
-             mock.patch.object(sm, 'is_device_registered', return_value=True):
+             mock.patch.object(sm, 'is_device_registered', return_value=True), \
+             mock.patch.object(sm, 'api_recently_ok', return_value=True):
             return m._should_ble_run(True, 'jam_backend')
 
     def test_an_active_session_holds_the_window_open_past_its_end(self):
@@ -185,7 +188,7 @@ class SetupSessionHoldTests(unittest.TestCase):
 
 class PeriodicCheckClosesWindowTests(unittest.TestCase):
     """
-    The 7-second periodic check is what actually stops BLE when the window
+    The periodic connectivity check is what actually stops BLE when the window
     closes on an online+registered device (no connectivity transition ever
     happens in that case, so the transition path can't be relied on).
     """
@@ -195,11 +198,15 @@ class PeriodicCheckClosesWindowTests(unittest.TestCase):
         m._connectivity_monitor = mock.MagicMock()
         m._connectivity_monitor.check.return_value = True
         m._connectivity_monitor.state_changed = False
-        m._connectivity_monitor.last_success_method.return_value = 'jam_backend'
+        # A plain str, exactly like the real @property. If the code ever regresses
+        # to CALLING it, 'jam_backend'() raises TypeError and this test fails --
+        # the old `.return_value` mock silently accepted the buggy call form.
+        m._connectivity_monitor.last_success_method = 'jam_backend'
         m._get_current_state = mock.MagicMock(return_value=70)  # NM_STATE_CONNECTED_GLOBAL
         with mock.patch.object(sm, 'seconds_since_boot', return_value=uptime), \
              mock.patch.object(sm, 'unit_active_since_boot_seconds', return_value=None), \
              mock.patch.object(sm, 'is_device_registered', return_value=registered), \
+             mock.patch.object(sm, 'api_recently_ok', return_value=True), \
              mock.patch.object(sm, 'manage_service') as manage:
             keep_going = m._periodic_connectivity_check()
         self.assertTrue(keep_going)
@@ -306,6 +313,52 @@ class PeriodicCheckClosesWindowTests(unittest.TestCase):
              mock.patch.object(sm, 'manage_service') as manage2:
             m._periodic_connectivity_check()
         manage2.assert_called_with(sm.BLE_PROVISIONING_SERVICE, should_run=False)
+
+
+class ApiHealthGatesBleStopTests(unittest.TestCase):
+    """
+    'jam_backend' now means a verified TLS handshake reached our EDGE (the 7 s
+    probe no longer sends an HTTP request). That proves the network path, not
+    that the API is serving. Stopping BLE reduces reachability, so it must
+    also require recent proof from a real signed call (the heartbeat stamps
+    API_LAST_OK_FLAG). No evidence / stale evidence -> BLE stays up, exactly as
+    a failing HTTP /health probe used to keep it up.
+    """
+
+    def _after_window(self, api_state):
+        with mock.patch.object(sm, 'seconds_since_boot', return_value=WINDOW + 600), \
+             mock.patch.object(sm, 'unit_active_since_boot_seconds', return_value=None), \
+             mock.patch.object(sm, 'is_device_registered', return_value=True), \
+             mock.patch.object(sm, 'api_recently_ok', return_value=api_state):
+            return _manager()._should_ble_run(True, 'jam_backend')
+
+    def test_no_api_evidence_this_boot_keeps_ble_up(self):
+        self.assertTrue(self._after_window(None))
+
+    def test_stale_api_evidence_keeps_ble_up(self):
+        """Heartbeats have been failing for >15 min: our API is probably down.
+        BLE stays up -- the old HTTP probe would have fallen back to
+        'cloudflare_tls' and kept it up too."""
+        self.assertTrue(self._after_window(False))
+
+    def test_recent_signed_success_lets_ble_stop(self):
+        self.assertFalse(self._after_window(True))
+
+    def test_periodic_tick_without_api_evidence_never_stops_ble(self):
+        m = _manager()
+        m._connectivity_monitor = mock.MagicMock()
+        m._connectivity_monitor.check.return_value = True
+        m._connectivity_monitor.state_changed = False
+        m._connectivity_monitor.last_success_method = 'jam_backend'
+        m._get_current_state = mock.MagicMock(return_value=70)
+        with mock.patch.object(sm, 'seconds_since_boot', return_value=WINDOW + 600), \
+             mock.patch.object(sm, 'unit_active_since_boot_seconds', return_value=None), \
+             mock.patch.object(sm, 'is_device_registered', return_value=True), \
+             mock.patch.object(sm, 'api_recently_ok', return_value=None), \
+             mock.patch.object(sm, 'manage_service') as manage:
+            self.assertTrue(m._periodic_connectivity_check())
+        self.assertFalse(any(c.kwargs.get('should_run') is False for c in manage.call_args_list),
+                         'edge reachable but no API proof: BLE must not be stopped')
 
 
 if __name__ == '__main__':

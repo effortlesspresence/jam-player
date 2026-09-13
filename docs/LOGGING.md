@@ -338,7 +338,7 @@ first passing check and *before* the manager restarts the services that
 depend on it, so a fresh "online" is never missed. Going offline, it can
 linger for roughly 20 seconds (the link drops) to two minutes (the link
 stays up, the internet behind it is dead, and the resolvers are dark) while
-the manager collects three consecutive failed checks. Every reader tolerates
+the manager collects two consecutive failed checks (30 s at the 15 s cadence). Every reader tolerates
 acting on a stale "online" for that long: for the gated services it means
 one bounded burst of warnings per offline transition rather than a
 per-minute stream.

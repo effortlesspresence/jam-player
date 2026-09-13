@@ -44,7 +44,7 @@ from common.credentials import (
     get_location_timezone,
 )
 from common.api import api_request
-from common.network import report_network_status, report_mac_addresses
+from common.network import report_network_status, report_mac_addresses, stamp_api_ok
 
 logger = setup_service_logging('jam-heartbeat')
 
@@ -183,6 +183,11 @@ def main():
                 logger.info(f"Heartbeat succeeded after {consecutive_failures} failures")
             consecutive_failures = 0
             current_retry_delay = INITIAL_RETRY_DELAY
+            # A signed API call just succeeded: this is the fleet's authoritative
+            # "our API is serving" evidence (the 7 s connectivity probe only proves
+            # our edge is reachable). jam-ble-state-manager reads it before it
+            # will stop BLE on a registered device.
+            stamp_api_ok()
             # Report which network we're on (best-effort; the device is online
             # here since the heartbeat just succeeded).
             report_network_status()

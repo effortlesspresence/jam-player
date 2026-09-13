@@ -48,7 +48,7 @@ class ClassifyConnectivityTests(unittest.TestCase):
     """
 
     def test_backend_reachable_is_backend_no_retry_cost(self):
-        with mock.patch.object(network, "check_api_availability", return_value=True) as api, \
+        with mock.patch("common.api.check_api_availability", return_value=True) as api, \
              mock.patch.object(network, "_check_tls_connectivity") as tls, \
              mock.patch.object(network.time, "sleep") as slept:
             self.assertEqual(network.classify_connectivity(), "backend")
@@ -60,7 +60,7 @@ class ClassifyConnectivityTests(unittest.TestCase):
         # Backend fails the first probe (settling) then succeeds: must NOT be
         # branded a firewall.
         api_results = iter([False, True])
-        with mock.patch.object(network, "check_api_availability",
+        with mock.patch("common.api.check_api_availability",
                                side_effect=lambda *a, **k: next(api_results)), \
              mock.patch.object(network, "_check_tls_connectivity") as tls, \
              mock.patch.object(network.time, "sleep"):
@@ -69,14 +69,14 @@ class ClassifyConnectivityTests(unittest.TestCase):
 
     def test_internet_but_no_backend_is_internet_only(self):
         # Backend never reachable (firewall or our outage); public TLS works.
-        with mock.patch.object(network, "check_api_availability", return_value=False) as api, \
+        with mock.patch("common.api.check_api_availability", return_value=False) as api, \
              mock.patch.object(network, "_check_tls_connectivity", return_value=True), \
              mock.patch.object(network.time, "sleep"):
             self.assertEqual(network.classify_connectivity(attempts=3, delay=0), "internet_only")
         self.assertEqual(api.call_count, 3)   # backend fully retried before concluding
 
     def test_nothing_reachable_is_none(self):
-        with mock.patch.object(network, "check_api_availability", return_value=False), \
+        with mock.patch("common.api.check_api_availability", return_value=False), \
              mock.patch.object(network, "_check_tls_connectivity", return_value=False), \
              mock.patch.object(network.time, "sleep"):
             self.assertEqual(network.classify_connectivity(attempts=3, delay=0), "none")

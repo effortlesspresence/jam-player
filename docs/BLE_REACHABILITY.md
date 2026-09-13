@@ -70,7 +70,7 @@ window *before* consulting `is_online` or registration. A false "online"
 from a captive portal is the precise input that used to strand players; it
 must not be able to close the window.
 
-### The window closes itself through the existing 7-second loop
+### The window closes itself through the existing periodic connectivity loop (15 s)
 `_periodic_connectivity_check()` already re-evaluates `_should_ble_run` on
 every tick while online, because registration can complete via the app
 without any connectivity transition. The window closing is the same kind
@@ -153,7 +153,7 @@ from the `services_v2` directory of the checkout on the device, or
 Each item below closes a way the guarantee could still have failed. All are
 in `jam_ble_state_manager.py` unless noted.
 
-- **BLE is re-asserted on every 7-second tick**, not only on connectivity
+- **BLE is re-asserted on every periodic tick (15 s)**, not only on connectivity
   transitions. A BLE exit that systemd did not restart (a half-installed
   venv tripping `StartLimitBurst`, a manual `systemctl stop`, the exit-0
   path) used to stay down until the next transition or reboot. `start_service`

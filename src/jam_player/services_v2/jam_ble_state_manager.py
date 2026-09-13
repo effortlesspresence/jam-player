@@ -71,7 +71,7 @@ import dbus.mainloop.glib
 from gi.repository import GLib
 
 from common.system import manage_service, seconds_since_boot, unit_active_since_boot_seconds
-from common.network import InternetConnectivityMonitor, check_internet_connectivity
+from common.network import InternetConnectivityMonitor, check_internet_connectivity, api_recently_ok
 from common.credentials import is_device_registered
 from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, STATE_MANAGER_ALIVE_FLAG, safe_touch, touch_volatile_flag
 
@@ -118,27 +118,30 @@ NM_STATE_CONNECTED_LOCAL = 50
 
 # Internet connectivity check settings.
 #
-# Tuning rationale:
-#   - 3 failures × 7 second interval = ~14-21s worst-case offline detection
-#     (the first failure starts the count; flag flips on the 3rd).
-#   - This was 6 × 10s (~60s) historically -- tuned aggressively for
-#     "restaurant flaky WiFi". The original concern was that the display
-#     would flap between PLAYING_CONTENT and AWAITING_NETWORK on brief
-#     blips. That concern doesn't apply: determine_display_mode() in
-#     jam_player_display.py checks PLAYING_CONTENT FIRST, so as long as
-#     content is on disk the display rides through any duration of WiFi
-#     loss. Offline-detection latency only affects the BLE-side
-#     `isConnected` advertisement flag and (rare) setup-flow screens.
-#   - The shorter latency means the mobile app's BLE scan list reflects
-#     the JP's true connectivity state within ~24s of a state change
-#     (offline detection + 3s advertisement refresh tick) instead of
-#     ~90s. This is the load-bearing benefit: customers interacting
-#     with the JP over BLE see fresh status.
-#   - Even with these aggressive numbers, a single transient DNS / TCP
-#     failure doesn't flip the flag -- it takes 3 consecutive failures
-#     spaced ~7s apart.
-INTERNET_CHECK_FAILURES_FOR_OFFLINE = 3
-INTERNET_CHECK_INTERVAL_SECONDS = 7
+# Tuning rationale (2026-09, after the probe became a free TLS handshake):
+#   - 2 failures x 15 s interval = ~15-30 s worst-case offline detection
+#     (the first failure starts the count; the flag flips on the 2nd).
+#   - Why not faster: bringing BLE back IN PLACE after a WiFi loss is now a
+#     convenience, not the guarantee -- every boot advertises BLE for 15 min
+#     (BLE_BOOT_RECOVERY_WINDOW_SECONDS), so a power-cycle always recovers a
+#     player. The display rides through any WiFi loss regardless
+#     (determine_display_mode() checks PLAYING_CONTENT first); this latency
+#     only affects the BLE `isConnected` advertisement bit and the rare
+#     no-content setup screens.
+#   - Why not slower: this same tick stamps STATE_MANAGER_ALIVE_FLAG, and
+#     `.internet_verified` readers treat the state as UNKNOWN once that stamp
+#     is older than CONNECTIVITY_STATE_MAX_AGE_SECONDS (60 s). 15 s leaves
+#     ~2x margin even when every probe times out (~15 s of probe time); 30 s
+#     would not. Do NOT raise this without moving the stamp onto the
+#     watchdog timer or raising that ceiling.
+#   - Transient tolerance is BETTER than the previous 3 x 7 s: a blip had to
+#     span ~14 s to flip the flag then; it must span >= 15 s now.
+#   - History: 6 x 10 s (~60 s), then 3 x 7 s (~21 s) while the probe was a
+#     billed HTTP GET to /jam-players/health. The probe is now a verified TLS
+#     handshake (no API call), so the tick is tuned for reachability margins,
+#     not for cost.
+INTERNET_CHECK_FAILURES_FOR_OFFLINE = 2
+INTERNET_CHECK_INTERVAL_SECONDS = 15
 
 # Services we control
 BLE_PROVISIONING_SERVICE = 'jam-ble-provisioning.service'
@@ -238,7 +241,7 @@ class BLEStateManager:
         self._internet_check_timer = None  # GLib timeout for periodic checks
         # Log the post-boot recovery window closing exactly once per boot
         self._recovery_window_closed_logged = False
-        # Log the session hold once rather than on every 7-second tick
+        # Log the session hold once rather than on every periodic tick
         self._session_hold_logged = False
 
         # One-shot gate: trigger jam-update.service the first time a
@@ -493,7 +496,10 @@ class BLEStateManager:
             # may have just closed. Either can turn "keep BLE up" into
             # "BLE not needed" with no connectivity transition -- and the
             # reverse (a crashed BLE that must come back) needs the same tick.
-            should_run = self._should_ble_run(is_online, self._connectivity_monitor.last_success_method())
+            # last_success_method is a @property (a str), not a method. Calling it
+            # raised TypeError on every steady-state online tick, which silently
+            # skipped the BLE manage step below for the life of an online device.
+            should_run = self._should_ble_run(is_online, self._connectivity_monitor.last_success_method)
             if not should_run and not self._recovery_window_closed_logged:
                 self._recovery_window_closed_logged = True
                 logger.info(
@@ -593,7 +599,7 @@ class BLEStateManager:
             return False
         return uptime < ble_active_since + BLE_BOOT_RECOVERY_WINDOW_SECONDS
 
-    # systemd is asked at most this often; a fork every 7-second tick for the
+    # systemd is asked at most this often; a fork every periodic tick for the
     # life of the device would be a waste, and BLE's activation time only
     # changes when BLE restarts.
     _BLE_ACTIVE_SINCE_CACHE_SECONDS = 60
@@ -711,7 +717,25 @@ class BLEStateManager:
         if method != 'jam_backend':
             return True
 
-        return False  # Window closed, online via our backend, registered - BLE not needed
+        # 'jam_backend' means our EDGE answered a verified TLS handshake (network
+
+        # path proven, portal-proof) -- not that the API behind it is serving.
+
+        # The authoritative API-health signal is the heartbeat: a signed call
+
+        # every 5 min that stamps API_LAST_OK_FLAG on success. Stopping BLE
+
+        # reduces reachability, so it needs positive, recent proof the API is
+
+        # up; no evidence or stale evidence keeps BLE running -- exactly what a
+
+        # failing HTTP /health probe used to do, on a stronger signal.
+
+        if api_recently_ok() is not True:
+
+            return True
+
+        return False  # Window closed, registered, edge reachable, API recently served us - BLE not needed
 
     def _restart_post_connectivity_services(self):
         """

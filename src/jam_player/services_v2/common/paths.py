@@ -49,13 +49,16 @@ JAM_RUN_DIR = Path('/run/jam')
 # setup session started at minute 14 is never cut off mid-connect.
 BLE_SESSION_ACTIVE_FLAG = JAM_RUN_DIR / 'ble_session_active'
 
-# Touched by jam-ble-state-manager on every 7-second tick (and at the start
+# Touched by jam-ble-state-manager on every periodic tick (15 s) (and at the start
 # of its boot-time check). The .internet_verified flag is a CACHE maintained
 # by that one process; readers use this stamp's age to know whether the
 # cache is being maintained at all. A stale stamp means "unknown", and every
 # reader has an explicit fail direction for unknown -- the oneshot gates run,
 # the display and BLE report offline. tmpfs: no SD-card write.
 STATE_MANAGER_ALIVE_FLAG = JAM_RUN_DIR / 'state_manager_alive'
+# mtime = the last time a REAL, signed API call succeeded (heartbeat/announce).
+# tmpfs, so a reboot starts with no evidence. Read via network.api_recently_ok().
+API_LAST_OK_FLAG = JAM_RUN_DIR / 'api_last_ok'
 
 
 def touch_volatile_flag(path: Path) -> bool:
