@@ -298,6 +298,50 @@ Wi-Fi MAC, Ethernet MAC, and Network (SSID / Ethernet) for the bench device.
 Power off the AP for > 10 min. Expected: dashboard flips to offline with the last
 network shown; no false-offline while the device is healthy.
 
+### H — Content pipeline integrity (audit #12, #13, #14)
+
+**H1 · A kill mid-download never publishes a truncated file** `[ ]`
+Setup: publish a layout with a large (>30 MB) video; watch `ls -la /opt/jam/content/live_media/`.
+Steps: while `<hash>.mp4.part` is growing, `sudo systemctl restart jam-content-manager`.
+Expected: the `.part` disappears (SIGTERM handler or startup sweep); no `<hash>.mp4`
+exists until the download completes; after it completes a `<hash>.mp4.size` sidecar
+matches `stat -c %s <hash>.mp4`; the scene plays. Verify:
+`ls -la /opt/jam/content/live_media/ | grep -E "part|size"; journalctl -u jam-content-manager -b --no-pager | grep -cE "Removed stale partial|exiting cleanly"`.
+
+**H2 · A legacy truncated file is healed on the first load** `[ ]`
+Setup: with the manager stopped, truncate a referenced video in place:
+`sudo systemctl stop jam-content-manager && f=$(ls /opt/jam/content/live_media/*.mp4 | head -1) && sudo truncate -s 50% "$f" && sudo rm -f "$f.size" && sudo systemctl start jam-content-manager`
+Expected: journal shows `failed validation ... will re-download`; the file is
+re-downloaded in full and gets a sidecar; mpv plays it without freezing.
+
+**H3 · One failing asset → partial publish, no cleanup, self-retry** `[ ]`
+Setup: block one asset's CDN URL at the router (or `/etc/hosts` the media host to 127.0.0.1
+for ONE load), publish a change touching two scenes.
+Expected: journal `could not be downloaded; published the rest, skipping media cleanup, retry owed`;
+the reachable scene updates; the previous asset of the blocked scene is **still on disk**;
+retries at 30 s, 60 s, 120 s … (`Retrying the content load that did not complete`).
+Unblock → `Owed refresh completed` **without republishing**; cleanup runs. Verify with
+`journalctl -u jam-content-manager -f`.
+
+**H4 · Re-linking the same screen keeps content (offline)** `[ ]`
+Setup: registered player with content, AP powered off. Steps: from the app, re-run the
+link step for the same screen. Expected: content keeps playing; no `Cleared` line in
+`journalctl -u jam-content-manager -b --no-pager | grep -c Cleared`; `screen_id.txt`'s mtime
+did not change (`stat -c %y /etc/jam/device_data/screen_id.txt`). (Pre-fix: the WiFi setup
+screen appeared.)
+
+**H5 · A relink never blanks the board** `[ ]`
+Steps (online): link the player to a different screen. Expected: the old content keeps
+playing until the new set finishes downloading, then swaps in atomically — no "Waiting
+for content" gap, no blank frame. Steps (offline): AP off, relink over BLE. Expected: the
+old content keeps playing indefinitely; when the AP returns, the new screen's content
+downloads and swaps in. Product rule: an offline player never loses its last content.
+
+**H6 · SET_SCREEN_ID no longer restarts the manager** `[ ]`
+Steps: relink via the web dashboard while a download is in flight. Expected:
+`journalctl -u jam-ws-commands -b --no-pager | grep -c "nudging content manager"` ≥ 1 and
+`systemctl show jam-content-manager -p NRestarts` unchanged; the in-flight download finishes.
+
 ### G — Gates
 
 **G1 · On-device unit suites green** `[ ]` — `cd /opt/jam/services && sudo tests/run_on_device.sh`
@@ -311,10 +355,6 @@ network shown; no false-offline while the device is healthy.
 - **Content pipeline CRITICAL (lightdm storm):** delete the first scheduled
   scene's media file while others exist → expected no `systemctl restart lightdm`,
   no watchdog kill, next playable scene plays; restore file → resumes.
-- **Partial download reuse:** interrupt a download (`systemctl restart jam-content-manager`
-  mid-transfer) → truncated file must not be published; re-downloaded.
-- **Failed load retry:** block one asset URL → scene missing → unblock → recovers
-  without republishing.
 - **Timezone applied live:** change the location timezone → schedule flips
   without a reboot.
 - **Updater validate-before-promote, hardware watchdog, health-monitor cooldown.**

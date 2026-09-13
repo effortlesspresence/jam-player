@@ -36,6 +36,7 @@ from jam_player import constants
 
 from common.api import api_request
 from common.credentials import get_device_uuid, is_device_registered
+from common.network import device_is_offline
 from common.logging_config import setup_service_logging
 from common.paths import SCREEN_ID_FILE
 
@@ -48,6 +49,17 @@ STAGED_SCENES_DIR = Path(constants.APP_DATA_STAGED_SCENES_DIR)
 
 # Polling interval in seconds (fallback when WebSocket push fails)
 POLL_INTERVAL_SECONDS = 300
+
+# load_content() outcomes. A PARTIAL load published what it could but at least
+# one asset failed to download; FAILED published nothing new. Both mean the
+# device still OWES a refresh and must retry on its own: the backend consumes
+# hasUnpulledUpdates the moment we poll it, and the WebSocket push already
+# happened, so nothing external will ask again until the customer republishes.
+LOAD_COMPLETE = 'complete'
+LOAD_PARTIAL = 'partial'
+LOAD_FAILED = 'failed'
+REFRESH_RETRY_INITIAL_SECONDS = 30
+REFRESH_RETRY_MAX_SECONDS = POLL_INTERVAL_SECONDS
 
 # Event to signal immediatejam-ha  content refresh (set by SIGUSR1 handler)
 refresh_event = threading.Event()
@@ -186,6 +198,163 @@ def fetch_content() -> Optional[Tuple[List[Dict[str, Any]], Optional[int]]]:
         return None
 
 
+# --- download integrity ---------------------------------------------------
+# Media used to stream straight into its final filename with no fsync and no
+# verification, and the reuse check was "exists and non-empty". The process
+# handled only SIGUSR1, so a `systemctl restart` mid-transfer (SET_SCREEN_ID,
+# an update, the health monitor, a reboot) left a truncated file under the
+# final name that was then reused -- and published -- forever. Now: stream to
+# `<name>.part`, fsync, verify (Content-Length, ffprobe / PIL), rename into
+# place, and record the expected size in `<name>.size` so reuse can check it.
+_inflight_part = {'path': None}  # the .part being written right now (SIGTERM cleanup)
+_VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.webm'}
+_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
+
+
+def _part_path_for(dest_path: Path) -> Path:
+    return dest_path.with_name(dest_path.name + '.part')
+
+
+def _size_path_for(dest_path: Path) -> Path:
+    return dest_path.with_name(dest_path.name + '.size')
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug(f"Could not remove {path.name}: {e}")
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    try:
+        fd = os.open(str(dir_path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def _write_expected_size(dest_path: Path, size: int) -> None:
+    """Record the verified byte count beside the file (tmp + rename)."""
+    size_path = _size_path_for(dest_path)
+    tmp = size_path.with_name(size_path.name + '.tmp')
+    try:
+        with open(tmp, 'w') as f:
+            f.write(str(int(size)))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, size_path)
+    except Exception as e:
+        logger.debug(f"Could not write size sidecar for {dest_path.name}: {e}")
+        _unlink_quiet(tmp)
+
+
+def _read_expected_size(dest_path: Path) -> Optional[int]:
+    try:
+        return int(_size_path_for(dest_path).read_text().strip())
+    except Exception:
+        return None
+
+
+def _media_content_is_valid(file_path: Path, kind_path: Path) -> Tuple[bool, str]:
+    """
+    Content-level check. `kind_path` carries the real extension (file_path may be
+    a .part). Video: ffprobe must parse a video stream. Image: PIL must verify
+    it. Unknown types pass on size alone. Tooling failures (ffprobe timeout,
+    PIL missing) are treated as valid -- same stance as before: never refuse to
+    play content because a validator is unavailable.
+    """
+    suffix = kind_path.suffix.lower()
+    if suffix in _VIDEO_EXTS:
+        try:
+            probe = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'stream=duration', '-of', 'csv=p=0', str(file_path)],
+                capture_output=True, text=True, timeout=20
+            )
+            if probe.returncode != 0:
+                return False, 'ffprobe could not parse the video'
+        except subprocess.TimeoutExpired:
+            logger.warning(f"ffprobe timeout validating {file_path.name}, assuming valid")
+        except Exception as e:
+            logger.warning(f"Could not validate video {file_path.name}: {e}")
+        return True, ''
+    if suffix in _IMAGE_EXTS:
+        try:
+            from PIL import Image  # lazy: optional here
+            with Image.open(file_path) as im:
+                im.verify()
+        except ImportError:
+            return True, ''
+        except Exception as e:
+            return False, f'PIL could not verify the image ({e})'
+    return True, ''
+
+
+def _verify_download(part_path: Path, bytes_written: int, expected_len: Optional[int],
+                     dest_path: Path) -> Tuple[bool, str]:
+    if bytes_written == 0:
+        return False, 'empty response'
+    if expected_len is not None and bytes_written != expected_len:
+        return False, f'received {bytes_written} bytes, Content-Length said {expected_len}'
+    return _media_content_is_valid(part_path, dest_path)
+
+
+def _existing_media_is_trustworthy(media_path: Path) -> bool:
+    """
+    Reuse decision for a file already on disk.
+      - empty -> no.
+      - size sidecar present -> the byte count must match exactly.
+      - no sidecar (downloaded by older firmware) -> validate the CONTENT once;
+        if it passes, adopt it by writing the sidecar so later loads are a
+        cheap size compare. This is what heals a truncated file left behind
+        by fielded 7440d2d on the first load after the update.
+    """
+    try:
+        size = media_path.stat().st_size
+    except Exception:
+        return False
+    if size == 0:
+        return False
+    expected = _read_expected_size(media_path)
+    if expected is not None:
+        return size == expected
+    ok, why = _media_content_is_valid(media_path, media_path)
+    if not ok:
+        logger.warning(f"Existing media {media_path.name} failed validation ({why}); will re-download")
+        return False
+    _write_expected_size(media_path, size)
+    return True
+
+
+def _remove_stale_partials() -> None:
+    """A .part is by definition incomplete; sweep any left by a kill or power loss."""
+    try:
+        for part in LIVE_MEDIA_DIR.glob('*.part'):
+            _unlink_quiet(part)
+            logger.info(f"Removed stale partial download: {part.name}")
+    except Exception as e:
+        logger.debug(f"Could not sweep partial downloads: {e}")
+
+
+def handle_terminate(signum, frame):
+    """
+    SIGTERM (systemctl stop/restart): drop the in-flight .part and exit cleanly.
+    Before this handler existed the process died mid-write and the truncated
+    file -- under its FINAL name -- was reused on the next start.
+    """
+    part = _inflight_part.get('path')
+    if part is not None:
+        _unlink_quiet(part)
+    logger.info("Received SIGTERM - exiting cleanly")
+    raise SystemExit(0)
+
+
 def download_media(url: str, dest_path: Path) -> bool:
     """
     Download media file from URL to destination path using chunked streaming.
@@ -224,61 +393,55 @@ def download_media(url: str, dest_path: Path) -> bool:
     # Ensure parent directory exists before we start downloading
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Retry logic for transient network issues
+    part_path = _part_path_for(dest_path)
     max_retries = 5
     for attempt in range(max_retries):
         try:
+            _inflight_part['path'] = part_path
+            bytes_written = 0
+            expected_len = None
             # Use streaming download with per-chunk timeout
             # timeout=(connect, read) - read timeout applies between chunks
             with requests.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) as response:
                 response.raise_for_status()
-
-                # Write file in chunks as data arrives
-                with open(dest_path, 'wb') as f:
+                # Only trust Content-Length when the body is not transfer-encoded
+                # (a gzip'd response reports the compressed length).
+                content_length = response.headers.get('Content-Length')
+                if content_length and str(content_length).isdigit() and \
+                        response.headers.get('Content-Encoding', 'identity') in ('identity', ''):
+                    expected_len = int(content_length)
+                # Stream into the .part file. dest_path is NEVER opened for
+                # writing: an existing good file survives a failed re-download,
+                # and a kill mid-transfer can only ever leave a .part behind.
+                with open(part_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                         if chunk:  # filter out keep-alive chunks
                             f.write(chunk)
+                            bytes_written += len(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+            _inflight_part['path'] = None
 
-            # Verify file was written and has content
-            if not dest_path.exists():
-                logger.error(f"File not found after write: {dest_path}")
+            ok, why = _verify_download(part_path, bytes_written, expected_len, dest_path)
+            if not ok:
+                logger.error(f"Downloaded media failed verification ({why}): {dest_path.name}")
+                _unlink_quiet(part_path)
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
                 return False
 
-            file_size = dest_path.stat().st_size
-            if file_size == 0:
-                logger.error(f"Downloaded file is empty: {dest_path}")
-                dest_path.unlink()  # Clean up empty file
-                return False
-
-            # For video files, validate with ffprobe
-            if dest_path.suffix.lower() in {'.mp4', '.mov', '.avi', '.webm'}:
-                try:
-                    probe_result = subprocess.run(
-                        ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                         '-show_entries', 'stream=duration', '-of', 'csv=p=0',
-                         str(dest_path)],
-                        capture_output=True, text=True, timeout=20
-                    )
-                    if probe_result.returncode != 0:
-                        logger.error(f"Downloaded video is invalid: {dest_path}")
-                        dest_path.unlink()  # Clean up invalid file
-                        return False
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"ffprobe timeout validating {dest_path}, assuming valid")
-                except Exception as e:
-                    logger.warning(f"Could not validate video {dest_path}: {e}")
-
-            logger.info(f"Downloaded media to {dest_path} ({file_size / 1024 / 1024:.1f}MB)")
+            # Complete-or-absent: the verified bytes become the real file in one
+            # atomic step, then the directory entry is made durable.
+            os.replace(part_path, dest_path)
+            _fsync_dir(dest_path.parent)
+            _write_expected_size(dest_path, bytes_written)
+            logger.info(f"Downloaded media to {dest_path} ({bytes_written / 1024 / 1024:.1f}MB)")
             return True
 
         except (ReqConnectionError, ReadTimeout) as e:
-            # Clean up partial file before retry
-            if dest_path.exists():
-                try:
-                    dest_path.unlink()
-                except Exception:
-                    pass
-
+            _inflight_part['path'] = None
+            _unlink_quiet(part_path)  # never touch dest_path
             if attempt < max_retries - 1:
                 logger.warning(f"Download attempt {attempt + 1} failed, retrying: {e}")
                 time.sleep(5)
@@ -287,13 +450,8 @@ def download_media(url: str, dest_path: Path) -> bool:
                 return False
 
         except Exception as e:
-            # Clean up partial file on unexpected error
-            if dest_path.exists():
-                try:
-                    dest_path.unlink()
-                except Exception:
-                    pass
-
+            _inflight_part['path'] = None
+            _unlink_quiet(part_path)
             logger.error(f"Error downloading media: {e}", exc_info=True)
             return False
 
@@ -377,8 +535,12 @@ def cleanup_unused_media(referenced_files: set) -> int:
 
             filename = file_path.name
 
-            # Skip files that are referenced or should always be kept
-            if filename in referenced_files or filename in always_keep:
+            if filename.endswith('.part') or filename.endswith('.size.tmp'):
+                pass  # an incomplete download or its scratch file: always remove
+            elif filename.endswith('.size'):
+                if filename[:-len('.size')] in referenced_files:
+                    continue  # the size sidecar of a file we keep
+            elif filename in referenced_files or filename in always_keep:
                 continue
 
             # Delete unused file
@@ -400,67 +562,52 @@ def cleanup_unused_media(referenced_files: set) -> int:
     return deleted_count
 
 
-def _invalidate_stale_live_scenes_if_screen_changed() -> None:
+def _clear_empty_live_manifest_before_fetch() -> None:
     """
-    Delete live_scenes/scenes.json if it's older than screen_id.txt.
+    Before a fetch, remove the live manifest ONLY if it is an empty list.
 
-    A newer screen_id.txt means the device has been (re)linked to a
-    Screen since the current live scenes.json was written. That makes
-    the current scenes.json stale: it was written for the previous
-    screen (or for the "no screen linked" state, which produced `[]`).
+    The rule this encodes: a player never stops showing content because of a
+    reload attempt. If live_scenes/scenes.json has scenes, it stays until the
+    atomic swap replaces it with the new set -- whether the device was just
+    linked to a different screen, unlinked, or is offline and cannot fetch at
+    all. An offline player MUST keep playing its last downloaded content; a
+    relink while offline can only come from the app over BLE, is rare, and the
+    person doing it is standing in front of the board. A blank board for as
+    long as the WiFi is down is far worse than last night's menu.
 
-    Deleting it here -- at the very top of load_content(), before we
-    fetch new content -- is what keeps jam-player-display out of the
-    NO_ACTIVE_SCENES state during the fetch + download window. With
-    the stale file removed, _get_content_display_mode() sees no
-    scenes.json and returns DOWNLOADING_CONTENT, which is the
-    accurate user-facing state while we're pulling content.
+    Why remove an EMPTY manifest at all: `[]` is what an unlinked player holds.
+    When it gets linked, leaving `[]` in place makes the display say "nothing
+    scheduled" (NO_ACTIVE_SCENES) for the whole fetch + download window;
+    removing it makes it say "Downloading content", which is true. There is
+    no content to lose. Skipped while offline: no fetch can succeed, so the
+    only effect would be a pointless screen change.
 
-    We only delete scenes.json (not the whole directory) so that any
-    in-progress file operations in LIVE_SCENES_DIR from elsewhere
-    don't get disrupted. Individual scene JSONs in the same dir are
-    irrelevant to the display's state check, which only reads
-    scenes.json.
-
-    All errors are caught and logged -- this is a best-effort UX
-    improvement, not a correctness requirement.
+    History: this used to delete ANY manifest whose mtime was older than
+    screen_id.txt -- a re-link of the SAME screen on an offline player (the
+    BLE path rewrote the file even for an unchanged value) threw away a good
+    cached manifest and dropped the display to the WiFi setup screen with
+    every media file still on disk. Best-effort; never blocks a fetch.
     """
     live_scenes_json = LIVE_SCENES_DIR / "scenes.json"
-    if not live_scenes_json.exists():
-        # Nothing stale to invalidate.
-        return
-
-    if not SCREEN_ID_FILE.exists():
-        # No screen linked. Whatever is in live_scenes.json is either
-        # already `[]` (harmless) or content from a previous link we
-        # no longer care about. Clear it so the display shows the
-        # correct "awaiting screen link" state instead of stale content.
-        try:
-            live_scenes_json.unlink()
-            logger.info("Cleared live_scenes/scenes.json (screen_id.txt missing)")
-        except Exception as e:
-            logger.warning(f"Failed to clear stale live scenes.json: {e}")
-        return
-
     try:
-        screen_id_mtime = SCREEN_ID_FILE.stat().st_mtime
-        live_scenes_mtime = live_scenes_json.stat().st_mtime
+        if not live_scenes_json.exists():
+            return
+        if live_scenes_json.stat().st_size > 4:   # cheap pre-check: `[]` (+ whitespace)
+            with open(live_scenes_json) as f:
+                if json.load(f):
+                    return                          # has scenes: never touch it
+        elif json.loads(live_scenes_json.read_text() or '[]'):
+            return
+        if device_is_offline():
+            return                                  # nothing to gain while offline
+        live_scenes_json.unlink()
+        logger.info("Cleared empty live_scenes/scenes.json ahead of fetch (display shows 'Downloading content')")
     except Exception as e:
-        logger.warning(f"Failed to compare mtimes for stale-scenes check: {e}")
-        return
+        # Unreadable/corrupt manifest: leave it to recover_from_corrupt_live_scenes;
+        # a failure here must never block the fetch.
+        logger.debug(f"Skipping empty-manifest check: {e}")
 
-    if screen_id_mtime > live_scenes_mtime:
-        try:
-            live_scenes_json.unlink()
-            logger.info(
-                "Cleared stale live_scenes/scenes.json "
-                "(screen_id.txt is newer -- device was recently re-linked)"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to clear stale live scenes.json: {e}")
-
-
-def load_content() -> bool:
+def load_content() -> str:
     """
     Fetch content from API and download all media files.
 
@@ -468,28 +615,23 @@ def load_content() -> bool:
     Writes scene configs for jam_player_display to consume.
 
     Returns:
-        True if successful, False otherwise.
+        LOAD_COMPLETE  -- every scene the API returned is live (or the API
+                          returned none and live content was cleared);
+        LOAD_PARTIAL   -- live content was updated but at least one asset could
+                          not be downloaded (its scene is missing; retry owed);
+        LOAD_FAILED    -- nothing new was published (fetch failed, or every
+                          download failed and the previous content was kept).
     """
-    # If the linked screen has changed since the last successful content
-    # write, the current live_scenes/scenes.json is stale for this screen
-    # (it was written for the previous screen, or for the "no screen
-    # linked yet" state which produced `[]`). We invalidate it HERE --
-    # at the top of load_content(), before fetching -- so that during
-    # the ~30-90s fetch + media download window, jam-player-display
-    # sees "no scenes.json present" rather than a stale `[]`.
-    #
-    # Without this, a device that just got linked would stay in
-    # NO_ACTIVE_SCENES ("this screen has nothing scheduled") for the
-    # entire download window even though content is actively arriving.
-    # Once the atomic swap completes below, the correct scenes.json
-    # lands in place and the display transitions to PLAYING_CONTENT.
-    _invalidate_stale_live_scenes_if_screen_changed()
+    # Never delete content ahead of a fetch. Only an EMPTY manifest (`[]`, the
+    # unlinked state) is removed, so a freshly linked player shows "Downloading
+    # content" rather than "nothing scheduled" while the first set arrives.
+    _clear_empty_live_manifest_before_fetch()
 
     # Fetch content from API
     fetch_result = fetch_content()
     if fetch_result is None:
         logger.error("Failed to fetch content from API")
-        return False
+        return LOAD_FAILED
     scenes, num_screens = fetch_result
 
     # Track how many scenes the API returned (before download attempts)
@@ -509,6 +651,7 @@ def load_content() -> bool:
 
     # Process each scene (API returns them in order by Scene.order)
     processed_scenes = []
+    download_failures = 0
     for order_index, scene in enumerate(scenes):
         scene_id = scene.get('id')
 
@@ -552,21 +695,17 @@ def load_content() -> bool:
         media_filename = f"{url_hash}{extension}"
         media_path = LIVE_MEDIA_DIR / media_filename
 
-        # Download if not already present or if existing file is invalid
-        need_download = False
-        if not media_path.exists():
-            need_download = True
-        else:
-            # Verify existing file is valid (non-empty)
-            file_size = media_path.stat().st_size
-            if file_size == 0:
-                logger.warning(f"Existing file is empty, re-downloading: {media_path}")
-                media_path.unlink()
-                need_download = True
+        # Download unless a file is already present AND provably complete
+        # (size matches its recorded sidecar, or -- for files from older
+        # firmware -- its content validates once). An untrustworthy existing
+        # file is left in place until the verified replacement is renamed
+        # over it; download_media never opens dest_path for writing.
+        need_download = not media_path.exists() or not _existing_media_is_trustworthy(media_path)
 
         if need_download:
             if not download_media(media_url, media_path):
-                logger.error(f"Failed to download media for scene {scene_id}, skipping")
+                logger.error(f"Failed to download media for scene {scene_id}, skipping (retry owed)")
+                download_failures += 1
                 continue
 
         # Final verification before adding to scenes
@@ -608,7 +747,7 @@ def load_content() -> bool:
                 f"API returned {api_scene_count} scenes but all downloads failed - "
                 "keeping existing content to avoid blank display"
             )
-            return False
+            return LOAD_FAILED
         else:
             # API explicitly returned no scenes - this might be intentional
             # (user removed all content from the screen)
@@ -618,7 +757,7 @@ def load_content() -> bool:
             with open(live_scenes_path, 'w') as f:
                 json.dump([], f)
             logger.info("Live content cleared - player should show waiting screen")
-            return True
+            return LOAD_COMPLETE
 
     # Calculate total duration and write metadata
     total_duration = sum(s.get('duration', 0) for s in processed_scenes)
@@ -689,13 +828,22 @@ def load_content() -> bool:
     # IMPORTANT: Only cleanup if we have referenced files - never delete everything
     # This protects against API returning empty scenes (backend bug, user error, etc.)
     referenced_files = {s.get('media_file') for s in processed_scenes if s.get('media_file')}
+    if download_failures:
+        # Published what we could, but the set is incomplete. Do NOT clean up:
+        # the missing scene's previous asset may still be needed. The main loop
+        # retries with backoff until a load completes.
+        logger.warning(
+            f"{download_failures} scene(s) could not be downloaded; published the rest, "
+            "skipping media cleanup, retry owed"
+        )
+        return LOAD_PARTIAL
     if referenced_files:
         cleanup_unused_media(referenced_files)
     else:
         logger.warning("No referenced media files - skipping cleanup to preserve existing content")
 
     logger.info("Content loaded successfully")
-    return True
+    return LOAD_COMPLETE
 
 
 def recover_from_corrupt_live_scenes():
@@ -754,6 +902,9 @@ def run():
     # Register signal handler for WebSocket-triggered refresh
     signal.signal(signal.SIGUSR1, handle_refresh_signal)
     logger.info("Registered SIGUSR1 handler for WebSocket content refresh")
+    # systemctl stop/restart must not leave a half-written download behind.
+    signal.signal(signal.SIGTERM, handle_terminate)
+    _remove_stale_partials()
 
     # Wait for device to be registered before trying to fetch content
     # An unregistered device won't have content assigned anyway
@@ -762,19 +913,26 @@ def run():
         time.sleep(10)
     logger.info("Device is registered, proceeding with content management")
 
-    # Initial content load with exponential backoff
+    # Initial content load with exponential backoff. A PARTIAL load is enough
+    # to leave this loop (there is content on the board); the refresh it still
+    # owes is retried by the main loop below.
+    needs_refresh = False
     retry_delay = 10  # Start with 10 seconds
     max_retry_delay = 300  # Cap at 5 minutes
     while True:
         try:
             logger.info("Loading initial content...")
-            if load_content():
+            result = load_content()
+            if result == LOAD_COMPLETE:
                 logger.info("Initial content loaded successfully")
                 break
-            else:
-                logger.warning(f"Failed to load initial content, retrying in {retry_delay}s")
-                time.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, max_retry_delay)
+            if result == LOAD_PARTIAL:
+                logger.warning("Initial content loaded PARTIALLY; will keep retrying the missing assets")
+                needs_refresh = True
+                break
+            logger.warning(f"Failed to load initial content, retrying in {retry_delay}s")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
         except Exception as e:
             logger.error(f"Error during initial content load: {e}", exc_info=True)
             time.sleep(retry_delay)
@@ -789,7 +947,11 @@ def run():
     except Exception:
         pass
 
-    # Main polling loop
+    # Main polling loop. `needs_refresh` is the device's OWN memory that a
+    # load did not complete: the backend resets hasUnpulledUpdates the moment
+    # we poll it and the WebSocket push is already spent, so without this a
+    # failed or partial load stayed wrong until the customer republished.
+    refresh_backoff = REFRESH_RETRY_INITIAL_SECONDS
     while True:
         try:
             should_load_content = False
@@ -798,6 +960,11 @@ def run():
             if refresh_event.is_set():
                 logger.info("WebSocket refresh event received")
                 refresh_event.clear()
+                should_load_content = True
+
+            # A refresh we still owe from a failed/partial load
+            if not should_load_content and needs_refresh:
+                logger.info(f"Retrying the content load that did not complete (backoff {refresh_backoff}s)")
                 should_load_content = True
 
             # Check for backend updates (hasUnpulledUpdates flag) - fallback polling
@@ -825,18 +992,30 @@ def run():
             if should_load_content:
                 logger.info("Reloading content...")
                 try:
-                    if load_content():
+                    result = load_content()
+                    if result == LOAD_COMPLETE:
+                        if needs_refresh:
+                            logger.info("Owed refresh completed")
+                        needs_refresh = False
+                        refresh_backoff = REFRESH_RETRY_INITIAL_SECONDS
                         logger.info("Content reloaded successfully")
                     else:
-                        logger.error("Failed to reload content")
+                        needs_refresh = True
+                        logger.error(f"Content reload did not complete ({result}); will retry in {refresh_backoff}s")
                 except Exception as e:
+                    needs_refresh = True
                     logger.error(f"Error reloading content: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"Error in update check loop: {e}", exc_info=True)
 
-        # Wait for next poll interval, but wake up immediately if refresh signal received
-        refresh_event.wait(timeout=POLL_INTERVAL_SECONDS)
+        # Wait for the next poll -- sooner while a refresh is owed -- but wake
+        # immediately on a refresh signal.
+        if needs_refresh:
+            refresh_event.wait(timeout=refresh_backoff)
+            refresh_backoff = min(refresh_backoff * 2, REFRESH_RETRY_MAX_SECONDS)
+        else:
+            refresh_event.wait(timeout=POLL_INTERVAL_SECONDS)
 
 
 def main():

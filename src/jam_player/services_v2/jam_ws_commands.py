@@ -189,6 +189,37 @@ def handle_set_orientation(payload: dict, command_id: str) -> bool:
         return False
 
 
+def _nudge_content_manager(command_id: str) -> bool:
+    """
+    Wake jam-content-manager with SIGUSR1 so it refetches NOW, falling back to a
+    restart only if the signal cannot be delivered.
+
+    A restart was the old SET_SCREEN_ID path. It killed the manager mid-download
+    -- and until the manager grew a SIGTERM handler that left a truncated media
+    file under its final name, which was then reused and published forever. The
+    signal is also faster: the manager wakes from its poll wait at once.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['systemctl', 'kill', '--signal=SIGUSR1', 'jam-content-manager.service'],
+            timeout=10, capture_output=True
+        )
+        if result.returncode == 0:
+            logger.info(f"[{command_id}] Sent refresh signal to content manager")
+            return True
+        logger.warning(f"[{command_id}] Signal failed, falling back to restart")
+        subprocess.run(
+            ['systemctl', 'restart', 'jam-content-manager.service'],
+            timeout=10, capture_output=True
+        )
+        logger.info(f"[{command_id}] Content manager restart triggered")
+        return True
+    except Exception as e:
+        logger.warning(f"[{command_id}] Failed to signal/restart content manager: {e}")
+        return False
+
+
 def handle_set_screen_id(payload: dict, command_id: str) -> bool:
     """
     Handle a set screen ID command.
@@ -211,18 +242,11 @@ def handle_set_screen_id(payload: dict, command_id: str) -> bool:
         changed = update_screen_id_if_changed(screen_id)
 
         if changed:
-            logger.info(f"[{command_id}] Screen ID updated, restarting content manager to pull new content")
-            import subprocess
-            try:
-                subprocess.run(
-                    ['systemctl', 'restart', 'jam-content-manager.service'],
-                    timeout=10,
-                    capture_output=True
-                )
-                logger.info(f"[{command_id}] Content manager restart triggered")
-            except Exception as e:
-                logger.warning(f"[{command_id}] Failed to restart content manager: {e}")
-                # Not a critical failure - content manager will pick up changes on next cycle
+            # Signal, don't restart: the manager's screen_id watcher plus this
+            # nudge refetch immediately without killing an in-flight download.
+            logger.info(f"[{command_id}] Screen ID updated, nudging content manager to pull new content")
+            _nudge_content_manager(command_id)
+            # Not critical if the nudge fails - the manager polls screen_id.txt anyway
         else:
             logger.info(f"[{command_id}] Screen ID unchanged, no action needed")
 
@@ -252,33 +276,7 @@ def handle_refresh_content(payload: dict, command_id: str) -> bool:
     logger.info(f"[{command_id}] Received REFRESH_CONTENT command (reason: {reason})")
 
     try:
-        import subprocess
-
-        # Send SIGUSR1 to content manager to trigger immediate refresh
-        # This is more efficient than a full restart
-        try:
-            result = subprocess.run(
-                ['systemctl', 'kill', '--signal=SIGUSR1', 'jam-content-manager.service'],
-                timeout=10,
-                capture_output=True
-            )
-            if result.returncode == 0:
-                logger.info(f"[{command_id}] Sent refresh signal to content manager")
-                return True
-            else:
-                # Fallback to restart if signal fails
-                logger.warning(f"[{command_id}] Signal failed, falling back to restart")
-                subprocess.run(
-                    ['systemctl', 'restart', 'jam-content-manager.service'],
-                    timeout=10,
-                    capture_output=True
-                )
-                logger.info(f"[{command_id}] Content manager restart triggered")
-                return True
-        except Exception as e:
-            logger.warning(f"[{command_id}] Failed to signal/restart content manager: {e}")
-            # Not a critical failure - content manager will still poll eventually
-            return False
+        return _nudge_content_manager(command_id)
 
     except Exception as e:
         logger.error(f"[{command_id}] Failed to handle refresh content: {e}")

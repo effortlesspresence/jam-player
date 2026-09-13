@@ -48,7 +48,13 @@ def _undefined_names(tab: symtable.SymbolTable, modnames: set, path: Path, out: 
 
 
 def _service_sources():
-    files = sorted(SERVICES_DIR.glob('*.py')) + sorted((SERVICES_DIR / 'common').glob('*.py'))
+    # services_v2/*.py and common/*.py, plus the parent directory: in the repo
+    # that is src/jam_player (constants, jam_enums, scenes_manager_service --
+    # the content manager IS a deployed service); on a player it is /opt/jam,
+    # which holds no .py files, so the extra glob is harmless there.
+    files = (sorted(SERVICES_DIR.glob('*.py'))
+             + sorted((SERVICES_DIR / 'common').glob('*.py'))
+             + sorted(SERVICES_DIR.parent.glob('*.py')))
     return [f for f in files if f.name != '__init__.py']
 
 

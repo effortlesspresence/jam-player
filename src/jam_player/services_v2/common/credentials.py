@@ -501,8 +501,20 @@ def set_screen_id(screen_id: Optional[str]) -> bool:
     try:
         SCREEN_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
         if screen_id:
-            safe_write_text(SCREEN_ID_FILE, screen_id.strip())
-            logger.info(f"Screen ID set to: {screen_id}")
+            new_value = screen_id.strip()
+            # Compare before writing. The content manager keys reloads (and
+            # used to key manifest invalidation) off this file's mtime, and the
+            # BLE path calls this on every link step -- rewriting an unchanged
+            # value bumped the mtime and, on an offline player, threw away a
+            # perfectly good cached manifest.
+            try:
+                if SCREEN_ID_FILE.exists() and SCREEN_ID_FILE.read_text().strip() == new_value:
+                    logger.debug(f"Screen ID unchanged ({new_value}); not rewriting")
+                    return True
+            except Exception:
+                pass  # unreadable: fall through and write
+            safe_write_text(SCREEN_ID_FILE, new_value)
+            logger.info(f"Screen ID set to: {new_value}")
         else:
             # Clear the file if screen_id is None (device unlinked)
             if SCREEN_ID_FILE.exists():
