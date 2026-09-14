@@ -556,6 +556,62 @@ which covers both locations and still cannot match `jam_updating`. Re-run K1–K
 second list should then be non-empty, and K2's count should stay at one.
 
 
+### L — Boot identity screen and Plymouth splash
+
+The player shows a device-identity screen (Device ID, setup network name, full UUID, Wi-Fi and
+ethernet MACs) for 15 s at every boot, before its first real mode, and once it has a render good
+enough to cache it promotes that image to the Plymouth boot splash. Shipped images keep the JAM logo
+until a player generates its own screen, and the logo is preserved alongside so it can be restored.
+
+**L1 · It appears once per boot, with the right data** `[ ]`
+Reboot a provisioned player and watch the TV. Expected: the identity screen for about 15 s, then the
+normal content or setup screen. Check the Device ID matches the last five characters of the UUID and
+the MACs match what the dashboard reports for this player.
+```
+sudo reboot
+```
+```
+journalctl -u jam-player-display -b --no-pager | grep -E "Boot identity screen up|skipping the boot identity|boot splash"
+```
+
+**L2 · A service restart does NOT re-show it** `[ ]`
+The unit restarts on watchdog kills, crashes and every update; re-holding for 15 s each time would
+delay the customer's content. Expected: the count stays at 1 across restarts, and the screen does not
+reappear on the TV.
+```
+journalctl -u jam-player-display -b --no-pager | grep -c "Boot identity screen up"; sudo systemctl restart jam-player-display; sleep 25; journalctl -u jam-player-display -b --no-pager | grep -c "Boot identity screen up"
+```
+
+**L3 · The splash is replaced once, and the logo is kept** `[ ]`
+Expected after the first boot with data: `splash.jam-logo.png` exists and holds the original logo,
+`splash.png` matches the cached identity render, and a second reboot does NOT rewrite the file (the
+SD card is the scarcest resource on the device — check the modification time is unchanged).
+```
+ls -l /usr/share/plymouth/themes/pix/splash.png /usr/share/plymouth/themes/pix/splash.jam-logo.png; md5sum /usr/share/plymouth/themes/pix/splash.png /var/cache/jam-player-display/boot_identity_*.png
+```
+Then reboot and confirm the new splash actually appears during boot. If it does not, this image keeps
+its Plymouth theme in an initramfs; that is a harmless no-op, and the 15 s screen still works.
+Restore the logo at any time with:
+```
+sudo cp /usr/share/plymouth/themes/pix/splash.jam-logo.png /usr/share/plymouth/themes/pix/splash.png
+```
+
+**L4 · A player with no UUID shows nothing and keeps the logo** `[ ]`
+Simulate a freshly imaged device. Expected: `No device UUID yet; skipping` in the log, no identity
+screen on the TV, and `splash.png` untouched.
+```
+sudo mv /etc/jam/device_data/device_uuid.txt /tmp/device_uuid.bak && sudo rm -f /run/jam/boot_identity_shown && sudo systemctl restart jam-player-display && sleep 20 && journalctl -u jam-player-display -b --no-pager | grep -E "No device UUID yet|Boot identity screen up"
+```
+Restore: `sudo mv /tmp/device_uuid.bak /etc/jam/device_data/device_uuid.txt && sudo reboot`
+
+**L5 · An update at boot keeps its own screen** `[ ]`
+The identity screen must never fight jam-update for the display. With an update running at boot,
+expect `jam-update owns the screen; skipping` and the updating screen undisturbed.
+```
+sudo rm -f /run/jam/boot_identity_shown; sudo systemctl start jam-update & sleep 5; sudo systemctl restart jam-player-display; sleep 20; journalctl -u jam-player-display -b --no-pager | grep -E "owns the screen|Boot identity screen up"
+```
+
+
 ### G — Gates
 
 **G1 · On-device unit suites green** `[ ]` — `cd /opt/jam/services && sudo tests/run_on_device.sh`

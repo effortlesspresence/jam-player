@@ -98,10 +98,12 @@ from common.credentials import (
 from common.system import get_systemd_notifier, setup_signal_handlers, check_chrony_sync
 from common.paths import (
     INTERNET_VERIFIED_FLAG,
+    BOOT_IDENTITY_SHOWN_FLAG, PLYMOUTH_SPLASH, PLYMOUTH_SPLASH_BACKUP,
 )
 from common.display_cache import (
     cleanup_stale_cache,
     get_or_render_cached,
+    DISPLAY_CACHE_DIR,
 )
 from common.outlet_status import (
     is_outlet_operational,
@@ -432,6 +434,16 @@ STATE_CHECK_INTERVAL_SEC = 5
 # alongside the others. Without caching this screen rendered inline at
 # ~10-15s per 4K transition -- see the 2026-05-24 incident.
 NO_SCHEDULED_CONTENT_CACHE_KEY = "no_scheduled_content"
+
+# The device-identity screen shown briefly at every boot, and installed as the
+# Plymouth boot splash once a player has real data to show. Not a DisplayMode:
+# it is a one-shot screen the service puts up before its first real mode, so it
+# is registered in the render map purely so jam-update pre-warms it.
+BOOT_IDENTITY_CACHE_KEY = "boot_identity"
+# How long it stays up. Well under the unit's WatchdogSec=60, and the wait pings
+# the watchdog anyway. Every boot pays this before content appears, including
+# the nightly 3 AM reboot.
+BOOT_IDENTITY_HOLD_SECONDS = 15
 
 # Coordination flag for jam-update.service. While this file exists, the
 # display loop pauses its "feh died -> respawn it" behavior so that
@@ -1657,7 +1669,120 @@ def build_display_render_registry() -> dict:
         DisplayMode.DOWNLOADING_CONTENT.value: create_waiting_for_content_screen,
         DisplayMode.NO_ACTIVE_SCENES.value: create_no_active_scenes_screen,
         NO_SCHEDULED_CONTENT_CACHE_KEY: create_no_scheduled_content_screen,
+        BOOT_IDENTITY_CACHE_KEY: create_boot_identity_screen,
     }
+
+
+def create_boot_identity_screen(width: int, height: int, device_uuid: str = None):
+    """
+    The device-identity screen: what this player is, in the form support and
+    the person installing it actually need.
+
+    Deliberately a FLAT background rather than create_mesh_gradient_background.
+    The gradient takes ~10-15 s to render at 4K (the 2026-05-24 incident) and
+    this screen sits on the boot path; a solid fill plus text renders in well
+    under a second at any resolution, so a cache miss costs the customer
+    nothing.
+
+    Returns (image, cacheable). Returns (None, False) when there is no device
+    UUID yet: a freshly imaged player has nothing to identify, so the caller
+    skips the hold entirely and the shipped logo splash stays in place. Not
+    cacheable when a UUID exists but the MACs could not be read yet, mirroring
+    _draw_device_identity -- a MAC-less PNG must not be persisted to the cache,
+    and must never be promoted to the boot splash.
+    """
+    if not HAS_PIL:
+        return None, False
+
+    lines = device_identity_lines(device_uuid)
+    if not lines:
+        return None, False
+
+    macs = _get_display_macs()
+    mac_lines = mac_identity_lines(macs.get('wifiMac'), macs.get('ethernetMac'))
+    cacheable = bool(mac_lines)
+
+    img = Image.new('RGB', (width, height), BACKGROUND_COLOR)
+    draw = ImageDraw.Draw(img)
+    center_x = width // 2
+
+    title_font = get_font(_scaled(52, height))
+    id_font = get_font(_scaled(46, height))
+    body_font = get_font(_scaled(26, height), bold=False)
+
+    # lines[0] is "Device ID: XXXXX" -- the one a person matches against a
+    # label or a phone's Bluetooth list, so it gets the large type.
+    rows = [(lines[0], id_font, TEXT_COLOR)]
+    rows += [(line, body_font, SECONDARY_COLOR) for line in lines[1:]]
+    rows += [(line, body_font, SECONDARY_COLOR) for line in mac_lines]
+
+    gap = _scaled(48, height)
+    block_top = (height - gap * len(rows)) // 2
+    draw.text(
+        (center_x, block_top - _scaled(86, height)),
+        "JAM PLAYER",
+        font=title_font,
+        fill=ACCENT_COLOR,
+        anchor="mm",
+    )
+    y = block_top
+    for text, font, color in rows:
+        draw.text((center_x, y), text, font=font, fill=color, anchor="mm")
+        y += gap
+
+    version_font = get_font(_scaled(14, height), bold=False)
+    draw.text(
+        (width - 30, height - 25), "v2", font=version_font,
+        fill=(80, 80, 80), anchor="mm",
+    )
+    return img, cacheable
+
+
+def install_boot_splash(png_path: str) -> bool:
+    """
+    Make a rendered identity screen the Plymouth boot splash.
+
+    Shipped images boot the JAM logo from the `pix` theme
+    (/usr/share/plymouth/themes/pix/splash.png; cmdline.txt carries `splash`).
+    The logo remains the shipped default and is backed up once, on the first
+    install, so it can always be restored and so a player that never generates
+    a screen keeps it.
+
+    Writes ONLY when the bytes actually differ. This runs every boot and the SD
+    card is the scarcest resource on the device, so the steady state is a read
+    and a compare. The write is atomic (temp file then replace) so a power cut
+    can never leave Plymouth pointing at a truncated PNG.
+
+    Entirely best-effort: every failure is swallowed, because nothing about the
+    next boot's splash is worth disturbing the display that is running now.
+
+    NOTE: if a build ever bakes the Plymouth theme into an initramfs, replacing
+    the file on the root filesystem simply has no effect. That is a silent
+    no-op rather than a breakage, which is what makes this safe to ship.
+    """
+    try:
+        source = Path(png_path)
+        data = source.read_bytes()
+        if not data:
+            logger.warning("Refusing to install an empty boot splash")
+            return False
+        if not PLYMOUTH_SPLASH.parent.is_dir():
+            logger.info("No Plymouth pix theme on this image; leaving the splash alone")
+            return False
+        if PLYMOUTH_SPLASH.exists():
+            if PLYMOUTH_SPLASH.read_bytes() == data:
+                return True  # already current -- the common path, no write
+            if not PLYMOUTH_SPLASH_BACKUP.exists():
+                PLYMOUTH_SPLASH_BACKUP.write_bytes(PLYMOUTH_SPLASH.read_bytes())
+                logger.info(f"Kept the shipped logo splash at {PLYMOUTH_SPLASH_BACKUP}")
+        tmp = PLYMOUTH_SPLASH.with_name(PLYMOUTH_SPLASH.name + '.jam-tmp')
+        tmp.write_bytes(data)
+        os.replace(tmp, PLYMOUTH_SPLASH)
+        logger.info(f"Installed the device identity screen as the boot splash ({len(data)} bytes)")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not install the boot splash (non-fatal): {e}")
+        return False
 
 
 def display_image_with_feh(img: Image.Image, img_name: str = "jam_display", fallback_message: str = None) -> Optional[subprocess.Popen]:
@@ -3293,6 +3418,86 @@ class JamPlayerDisplayManager:
 
         return False
 
+    def _show_boot_identity_screen_once(self) -> None:
+        """
+        Put the device-identity screen up for BOOT_IDENTITY_HOLD_SECONDS, once
+        per BOOT, before the first real display mode.
+
+        Once per BOOT, not once per service start. This unit restarts on
+        watchdog kills, on crashes and on every update, and re-holding the
+        screen for 15 s on each of those would delay the customer's content
+        exactly when the player is already struggling. The marker lives in
+        /run, which the kernel clears at boot.
+
+        Skipped -- and still marked done -- when showing it would be wrong:
+          * jam-update is showing its own screen. Never fight the updater for
+            the display; that is how the 2026-05 incidents started.
+          * there is no device UUID yet. A freshly imaged player has nothing to
+            identify, and the shipped logo splash stays in place.
+          * the render or feh failed. This screen is an aid, never a gate.
+        Marking on those paths is deliberate: a boot screen that turned up
+        later in the session, mid-setup or mid-playback, would be worse than
+        one that was missed.
+        """
+        try:
+            if BOOT_IDENTITY_SHOWN_FLAG.exists():
+                return
+        except Exception:
+            return  # cannot read the marker: do nothing rather than risk a re-show
+
+        try:
+            if (UPDATE_IN_PROGRESS_FLAG.exists()
+                    and not _is_update_flag_stale()
+                    and _jam_update_service_is_active()):
+                logger.info("jam-update owns the screen; skipping the boot identity screen")
+                return
+
+            device_uuid = get_device_uuid()
+            if not device_uuid:
+                logger.info("No device UUID yet; skipping the boot identity screen")
+                return
+
+            img_path = get_or_render_cached(
+                BOOT_IDENTITY_CACHE_KEY,
+                self.screen_width,
+                self.screen_height,
+                create_boot_identity_screen,
+                device_uuid,
+            )
+            if not img_path:
+                logger.warning("Boot identity screen did not render; skipping")
+                return
+
+            process = display_path_with_feh(img_path)
+            if not process:
+                logger.warning("Could not put the boot identity screen up; skipping")
+                return
+
+            # Tracked, so the first real transition_to_mode tears it down like
+            # any other static screen.
+            self.feh_process = process
+            logger.info(
+                f"Boot identity screen up for {BOOT_IDENTITY_HOLD_SECONDS}s (PID {process.pid})"
+            )
+            self._sleep_with_watchdog(BOOT_IDENTITY_HOLD_SECONDS)
+
+            # Promote to the Plymouth splash only when the render was good
+            # enough to cache. A /tmp path means something was missing (no MACs
+            # yet, or /var/cache is broken), and that must never become the
+            # image every future boot shows.
+            if str(img_path).startswith(str(DISPLAY_CACHE_DIR)):
+                install_boot_splash(img_path)
+            else:
+                logger.info("Boot identity render was not cacheable; leaving the splash alone")
+        except Exception as e:
+            logger.warning(f"Boot identity screen failed (non-fatal): {e}")
+        finally:
+            try:
+                BOOT_IDENTITY_SHOWN_FLAG.parent.mkdir(parents=True, exist_ok=True)
+                BOOT_IDENTITY_SHOWN_FLAG.touch()
+            except Exception as e:
+                logger.debug(f"Could not mark the boot identity screen shown: {e}")
+
     def run(self):
         """Main run loop - monitors state and manages display modes."""
         log_service_start(logger, 'JAM Player Display Service')
@@ -3318,6 +3523,10 @@ class JamPlayerDisplayManager:
         # Send READY=1 immediately - we're initialized and entering main loop
         # Display availability is handled within the loop, not a startup blocker
         sd_notifier.notify("READY=1")
+        # Identify the player before anything else claims the screen. Once per
+        # boot, bounded, and skipped whenever it would be wrong -- see the
+        # method. READY=1 goes first so systemd never waits on this.
+        self._show_boot_identity_screen_once()
         logger.info("Service ready, entering main loop")
 
         last_state_check = 0

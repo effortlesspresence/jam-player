@@ -60,6 +60,19 @@ STATE_MANAGER_ALIVE_FLAG = JAM_RUN_DIR / 'state_manager_alive'
 # tmpfs, so a reboot starts with no evidence. Read via network.api_recently_ok().
 API_LAST_OK_FLAG = JAM_RUN_DIR / 'api_last_ok'
 
+# Marks that the boot identity screen has already been shown for this BOOT.
+# Lives in /run (tmpfs) precisely so the kernel clears it on every boot: the
+# display unit restarts on watchdog kills, crashes and updates, and the screen
+# must not re-hold for 15 s each time and delay the customer's content.
+BOOT_IDENTITY_SHOWN_FLAG = JAM_RUN_DIR / 'boot_identity_shown'
+
+# The Plymouth boot splash. Shipped images boot the JAM logo from the `pix`
+# theme (cmdline.txt carries `splash`); once a player has generated its own
+# identity screen that image replaces this file, and the original logo is kept
+# alongside so it can always be restored.
+PLYMOUTH_SPLASH = Path('/usr/share/plymouth/themes/pix/splash.png')
+PLYMOUTH_SPLASH_BACKUP = Path('/usr/share/plymouth/themes/pix/splash.jam-logo.png')
+
 # --- Updater guard state: PERSISTENT (survives reboot), deliberately NOT tmpfs.
 # The boot guard in jam_venv_repair.py runs on the SYSTEM python and imports
 # nothing from common/ (common/ may be the thing that is broken), so it

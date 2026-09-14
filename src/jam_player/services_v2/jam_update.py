@@ -699,7 +699,7 @@ def get_current_version() -> Optional[str]:
 # turns out to die anyway (runtime crash: two boots without a controlled exit).
 # ---------------------------------------------------------------------------
 _VALIDATOR_SRC = r"""
-import sys, os, pathlib, symtable, builtins
+import sys, os, pathlib, symtable, builtins, ast
 staging = pathlib.Path(sys.argv[1])
 files = sorted(staging.glob('*.py')) + sorted((staging / 'common').glob('*.py'))
 for f in files:                                   # 1) every file compiles
@@ -716,9 +716,18 @@ def walk(t, mn, out, path):
     for c in t.get_children():
         walk(c, mn, out, path)
 bad = []
+def _star_import(src):
+    # A REAL star import, parsed. A substring test here skipped any file that
+    # merely CONTAINS these characters -- including this validator's own host.
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False
+    return any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names)
+               for n in ast.walk(tree))
 for f in files:                                   # 2) no undefined names (the F821 class)
     src = f.read_text()
-    if 'import *' in src:
+    if _star_import(src):
         continue
     m = symtable.symtable(src, str(f), 'exec'); walk(m, modnames(m), bad, f)
 if bad:
@@ -1377,8 +1386,12 @@ def hide_updating_screen():
 # =============================================================================
 
 def pull_latest(ref: str) -> bool:
-    """Pull the latest code from remote."""
-    logger.info(f"Pulling latest code from {branch}...")
+    """Check the repo out at exactly `ref` (a commit, not a branch).
+
+    Named `ref` since 2026-09: the updater no longer always follows branch
+    HEAD, it resets to the commit the release target resolved to.
+    """
+    logger.info(f"Checking out {ref}...")
 
     success, _, stderr = run_command(
         ['git', 'reset', '--hard', ref],

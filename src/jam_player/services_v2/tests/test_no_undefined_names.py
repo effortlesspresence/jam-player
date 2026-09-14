@@ -13,6 +13,7 @@ Pure `symtable`, so it runs on a JAM Player AND on a laptop without any Pi
 library -- the only test in this tree that does not need the device.
 """
 import builtins
+import ast
 import symtable
 import unittest
 from pathlib import Path
@@ -58,6 +59,26 @@ def _service_sources():
     return [f for f in files if f.name != '__init__.py']
 
 
+def _has_star_import(src: str) -> bool:
+    """
+    A REAL `from x import *`, parsed -- not the characters appearing in a
+    string or a comment.
+
+    This was a substring test, and it silently excluded the single most
+    safety-critical file in the product: jam_update.py embeds a copy of this
+    very check as text for the updater's own pre-promotion validator, so the
+    gate skipped it entirely. A newline lost from a constant there went
+    unnoticed by every local run until an unrelated test tripped over it.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False   # let the caller report the parse failure
+    return any(
+        isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names)
+        for node in ast.walk(tree)
+    )
+
 class NoUndefinedNamesTests(unittest.TestCase):
 
     def test_scans_a_meaningful_number_of_files(self):
@@ -67,14 +88,36 @@ class NoUndefinedNamesTests(unittest.TestCase):
         problems = []
         for f in _service_sources():
             src = f.read_text()
-            if 'import *' in src:
+            if _has_star_import(src):
                 continue  # star imports hide bindings from static analysis
-            mod = symtable.symtable(src, str(f), 'exec')
+            try:
+                mod = symtable.symtable(src, str(f), 'exec')
+            except SyntaxError as e:
+                # A file that does not parse is a worse defect than any
+                # undefined name, and it must fail HERE rather than surface as
+                # a service that will not start.
+                problems.append(f"{f.name}: does not parse -- {e}")
+                continue
             _undefined_names(mod, _module_bindings(mod), f, problems)
         self.assertEqual(
             problems, [],
             'Undefined names (each is a NameError waiting for that code path):\n  ' + '\n  '.join(problems),
         )
+
+
+    def test_a_file_is_not_skipped_for_the_words_import_star_in_a_string(self):
+        """The regression that hid a broken jam_update.py from every run."""
+        self.assertFalse(_has_star_import("CHECK = \"if 'import *' in src\"\n"))
+        self.assertTrue(_has_star_import("from os.path import *\n"))
+
+    def test_every_service_file_parses(self):
+        broken = []
+        for f in _service_sources():
+            try:
+                ast.parse(f.read_text())
+            except SyntaxError as e:
+                broken.append(f"{f.name}: {e}")
+        self.assertEqual(broken, [], 'files that will not even import:\n  ' + '\n  '.join(broken))
 
     def test_gate_catches_the_bug_class(self):
         """Self-check: the detector must flag an unbound name in a nested function."""
