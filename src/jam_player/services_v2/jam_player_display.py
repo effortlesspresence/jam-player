@@ -210,6 +210,45 @@ WALL_SYNC_MIN_SEEK_MS = 250
 # every scene load). A late-converging clock starts being trusted within this.
 WALL_SYNC_CLOCK_RECHECK_S = 30
 
+# --- mpv restart policy (2026-09) -------------------------------------------
+# When mpv cannot be started -- nothing playable on disk yet, no display
+# session, no output attached -- the service must stay ALIVE and keep trying.
+# Those conditions clear by themselves (content finishes downloading, the TV is
+# plugged back in), and the unit has WatchdogSec=60 with StartLimitBurst=5/300,
+# so any path that waits WITHOUT pinging the watchdog gets the service killed
+# and, after five kills, left `failed` with a dark screen until a human
+# intervenes. Retries back off between these bounds and every wait pings the
+# watchdog. See docs/BENCH_TESTS.md group J.
+MPV_RESTART_BACKOFF_MIN_SEC = 2
+# Capped near STATE_CHECK_INTERVAL_SEC: a longer wait inside the playback loop
+# also delays the main loop's next mode re-evaluation, so an outlet that is
+# deactivated, a screen that is unlinked, or content that is deleted would take
+# that much longer to leave the screen.
+MPV_RESTART_BACKOFF_MAX_SEC = 10
+# Longest a single sleep slice may run before re-pinging the watchdog.
+WATCHDOG_SLEEP_SLICE_SEC = 5
+# If mpv reports a successful start and then dies again straight away, we are
+# in a start-die loop. Restarting it as fast as the CPU allows just churns
+# processes and log writes, so a burst is slowed by this many seconds at most.
+# The FIRST exit is never delayed: one-off crash recovery stays as immediate as
+# it has always been.
+MPV_CRASH_BURST_MAX_WAIT_SEC = 5
+
+# Outcomes of _start_video_playback. Deliberately strings, not a bool: the
+# caller MUST tell "everything is scheduled off right now" apart from "I could
+# not start mpv". They are not interchangeable -- the first is a normal daily
+# state that owns its own branded screen, the second is a fault. Compare
+# against these constants explicitly; every one of them is truthy, so
+# `if _start_video_playback():` is always wrong.
+PLAYBACK_STARTED = 'started'
+PLAYBACK_NOTHING_SCHEDULED = 'nothing_scheduled'
+PLAYBACK_NO_PLAYABLE_FILE = 'no_playable_file'
+PLAYBACK_MPV_FAILED = 'mpv_failed'
+# Throttle for the "display is stuck" ERROR line. ERROR-level records are
+# shipped to the backend's Logs & Errors panel by the logging pipeline, which
+# is how this reaches the fleet view.
+DISPLAY_TROUBLE_LOG_INTERVAL_SEC = 600
+
 
 class DisplayMode(Enum):
     """
@@ -1966,11 +2005,17 @@ class JamPlayerDisplayManager:
         self.mpv: Optional[MpvIpcClient] = None
         self.is_playing: bool = False
 
-        # MPV crash tracking for self-healing
-        # If MPV crashes too many times in a short period, restart lightdm
+        # MPV crash tracking. Used for reporting only -- see _note_mpv_crash
+        # for why a burst of crashes must NOT restart lightdm.
         self._mpv_crash_times: list = []
         self._mpv_crash_threshold = 5  # Number of crashes
         self._mpv_crash_window_seconds = 30  # Time window to track crashes
+        # Growing wait between failed attempts to start mpv, reset on success.
+        self._mpv_restart_backoff_sec: float = MPV_RESTART_BACKOFF_MIN_SEC
+        # Throttle timestamps PER condition: one shared stamp let a "cannot
+        # start mpv" line suppress a "mpv keeps crashing" line for ten minutes,
+        # so the fleet view could only ever show one of two different faults.
+        self._display_trouble_log_sec: Dict[str, float] = {}
 
         # Wall-clock seek-on-load sync state (multi-screen video walls)
         self._num_screens: Optional[int] = None   # layout screen count (num_screens.txt)
@@ -2316,44 +2361,188 @@ class JamPlayerDisplayManager:
             self._start_video_playback()
             sd_notifier.notify("STATUS=Playing content")
 
-    def _start_video_playback(self):
-        """Initialize and start video playback."""
+    def _sleep_with_watchdog(self, seconds: float) -> None:
+        """
+        Sleep, pinging the systemd watchdog throughout, and cut the wait short
+        if we are shutting down.
+
+        EVERY wait on a path that cannot make progress must go through this.
+        The unit is WatchdogSec=60 with StartLimitBurst=5/300: a path that
+        waits (or spins) without pinging is killed after a minute, restarted
+        into the same state, and left `failed` after five rounds -- with the
+        screen dark and no way back without a human.
+        """
+        remaining = max(0.0, float(seconds))
+        while remaining > 0 and self.running:
+            sd_notifier.notify("WATCHDOG=1")
+            slice_sec = min(WATCHDOG_SLEEP_SLICE_SEC, remaining)
+            time.sleep(slice_sec)
+            remaining -= slice_sec
+        sd_notifier.notify("WATCHDOG=1")
+
+    def _log_display_trouble(self, key: str, message: str) -> None:
+        """
+        Log at ERROR, at most once per DISPLAY_TROUBLE_LOG_INTERVAL_SEC PER KEY.
+
+        The key separates unrelated faults so one cannot hide another in the
+        backend's Logs & Errors panel.
+
+        Deliberately a log line and NOT a direct report_error() call: that
+        helper can block for up to 30 s on a bad network, and this runs inside
+        a loop guarded by WatchdogSec=60. ERROR records are shipped to the
+        backend by the logging pipeline, so the fleet signal is the same
+        without putting an HTTP timeout in the display path.
+        """
+        now = time.time()
+        if now - self._display_trouble_log_sec.get(key, 0.0) < DISPLAY_TROUBLE_LOG_INTERVAL_SEC:
+            logger.debug(f"(throttled:{key}) {message}")
+            return
+        self._display_trouble_log_sec[key] = now
+        logger.error(message)
+
+    def _note_mpv_crash(self) -> int:
+        """
+        Record that an mpv process we started has exited, log a burst, and
+        return how many exits fall inside the window so the caller can slow a
+        start-die loop down.
+
+        THIS USED TO RUN `systemctl restart lightdm`. It must never do that
+        again. History, from the repo:
+
+          * 2026-04-16 (07c3707) added the burst counter and the lightdm
+            restart, on the theory that repeated mpv exits meant a broken
+            display session that reinitialising lightdm would fix.
+          * 2026-05-28 (a2a099d) root-caused the customer-visible flashing and
+            black screens to lightdm restart CYCLES and shipped
+            systemd/lightdm.service.d/jam-no-restart.conf (Restart=no),
+            because lightdm on this image has a GObject teardown crash that
+            fires deterministically on the autologin -> greeter handoff.
+            On a healthy player lightdm is EXPECTED to sit `failed`; the X
+            session from its one successful start survives and mpv keeps
+            rendering against the DRM surface. That is what keeps the picture
+            stable.
+          * 2026-05-29 (7440d2d) removed the same restart from
+            jam_display_hotplug_monitor and documented the mechanism: the
+            restart spawns a new X session that takes DRM master from mpv;
+            lightdm then hits its crash and dies; in the window before the
+            master is released mpv cannot present frames, and on a
+            static-image scene nothing forces a render retry, so the screen
+            stays black until someone power-cycles the player.
+
+        The copy here was simply missed. Recovery for a dead mpv is starting
+        mpv again, which the caller does; a burst is recorded so the fleet
+        view shows the player needs attention.
+        """
+        now = time.time()
+        self._mpv_crash_times.append(now)
+        self._mpv_crash_times = [
+            t for t in self._mpv_crash_times
+            if now - t < self._mpv_crash_window_seconds
+        ]
+        recent = len(self._mpv_crash_times)
+        if recent >= self._mpv_crash_threshold:
+            # The list is NOT cleared here: it prunes itself to the window
+            # above, and keeping it is what lets the caller keep throttling for
+            # as long as the burst lasts. _log_display_trouble is what stops
+            # this becoming a log flood.
+            self._log_display_trouble(
+                'mpv_crash_burst',
+                f"MPV exited {recent} times in "
+                f"{self._mpv_crash_window_seconds}s -- the display session may be "
+                f"unhealthy. NOT restarting lightdm (that causes permanent black "
+                f"screens on this image); continuing to restart mpv."
+            )
+        return recent
+
+    def _start_video_playback(self) -> str:
+        """
+        Start mpv on the first playable scheduled scene.
+
+        Returns one of the PLAYBACK_* constants; see their definition for why
+        this is not a bool. self.mpv is assigned ONLY when a process is really
+        running: it used to be assigned before four early returns, so a missing
+        media file (or an mpv that would not start) left a handle with no
+        process behind it, and the playback loop reads
+        `self.mpv and not self.mpv.is_running()` as "mpv crashed" -- an endless
+        burst of phantom crashes that restarted lightdm every few seconds and
+        let the watchdog kill the unit.
+
+        PLAYBACK_NOTHING_SCHEDULED is NOT a failure. It is the ordinary state
+        of a venue outside its opening hours, and the caller must route it to
+        the schedule-wait screen rather than to any retry path.
+        """
         # Kill any feh processes first
         kill_feh_processes()
-
-        # Initialize MPV
-        self.mpv = MpvIpcClient()
 
         # Get rotation from device orientation setting
         rotation = get_rotation_angle()
 
-        # Get first scene file - MPV must start with a file (idle mode doesn't work)
         scenes = self._load_scenes()
         if not scenes:
-            logger.error("No scenes available for playback")
-            return
+            logger.info("Nothing scheduled to play right now")
+            return PLAYBACK_NOTHING_SCHEDULED
 
+        # mpv must start ON a file (idle mode does not display). Take the first
+        # SCHEDULED scene whose file is actually on disk rather than insisting
+        # on scenes[0]. The manifest and its media are swapped in atomically and
+        # a scene whose download failed is never published, so this is defence
+        # against out-of-band loss -- a deleted or corrupted file, a bad card --
+        # not against a normal partial fetch.
         media_dir = Path(constants.APP_DATA_LIVE_MEDIA_DIR)
-        first_scene = scenes[0]
-        media_file = first_scene.get('media_file')
-        if not media_file:
-            logger.error("First scene has no media_file")
-            return
+        playable = []
+        for scene in scenes:
+            media_file = scene.get('media_file')
+            if not media_file:
+                continue
+            try:
+                candidate = media_dir / media_file
+                if candidate.exists():
+                    playable.append(str(candidate))
+            except (TypeError, ValueError, OSError) as e:
+                # A malformed media_file from the backend must skip one scene,
+                # never take the service down: an uncaught raise here reaches
+                # run()'s bare try and exits the process, and five of those
+                # inside 300 s leave the unit `failed` with a dark screen.
+                logger.error(f"Unusable media_file on scene {scene.get('id')}: {e}")
+        if not playable:
+            logger.error(
+                f"No playable media file among {len(scenes)} scheduled scene(s) "
+                f"in {media_dir}"
+            )
+            return PLAYBACK_NO_PLAYABLE_FILE
 
-        initial_file = str(media_dir / media_file)
-        if not Path(initial_file).exists():
-            logger.error(f"First scene media file not found: {initial_file}")
-            return
-
-        # Start MPV with the first file (required - idle mode doesn't display)
-        # Enable looping for single-scene content to avoid freeze at end
-        single_scene = len(scenes) == 1 if scenes else False
-        if not self.mpv.start_mpv(rotation_angle=rotation, loop=single_scene, initial_file=initial_file):
+        initial_file = playable[0]
+        # Loop when only ONE scene is actually playable, not merely when one is
+        # scheduled: with a single playable file among several scheduled scenes
+        # the wall-clock loop cannot switch away, and without looping mpv sits
+        # on a frozen last frame (it runs with --keep-open=yes).
+        single_scene = len(playable) == 1
+        mpv = MpvIpcClient()
+        started = mpv.start_mpv(rotation_angle=rotation, loop=single_scene, initial_file=initial_file)
+        if not started and mpv.is_running():
+            # start_mpv only waits 5 s for the IPC socket and does not check
+            # whether the process died. On a slow cold boot the process is
+            # alive and the socket is moments away, so adopt it: is_running()
+            # is what the playback loop tests, and load_file reconnects when
+            # the socket appears (_connect logs and returns False, it does not
+            # raise). Dropping it here would orphan a fullscreen mpv that
+            # nothing can ever kill, and the next attempt would unlink its
+            # socket and spawn a second one to fight it for the screen.
+            logger.warning("MPV socket slow to appear; adopting the running process")
+            started = True
+        if not started:
+            # Never leave behind a process we are not going to track.
+            try:
+                mpv.stop_mpv()
+            except Exception as e:
+                logger.warning(f"Error cleaning up the MPV we could not start: {e}")
             logger.error("Failed to start MPV")
-            return
+            return PLAYBACK_MPV_FAILED
 
+        self.mpv = mpv
         logger.info(f"MPV started with initial file: {initial_file}")
         self.is_playing = True
+        return PLAYBACK_STARTED
 
     # =========================================================================
     # Wall Clock Sync Methods
@@ -2500,10 +2689,38 @@ class JamPlayerDisplayManager:
                     self.mpv.stop_mpv()
                 except Exception as e:
                     logger.warning(f"Error cleaning up MPV: {e}")
-            self._start_video_playback()
-            if not self.mpv:
-                logger.error("Failed to start MPV")
+                self.mpv = None
+                self.is_playing = False
+            outcome = self._start_video_playback()
+            if outcome == PLAYBACK_NOTHING_SCHEDULED:
+                # NOT a failure, and it must NOT return here. Everything is
+                # scheduled off right now, and _run_scene_by_scene_sync owns
+                # that case: it puts the branded "No Content Scheduled" screen
+                # up and polls until the schedule opens. Returning instead
+                # would leave the customer looking at a bare desktop for the
+                # whole off-schedule window -- every venue with opening hours,
+                # every night after the 3 AM reboot -- because
+                # _start_video_playback has already run kill_feh_processes().
+                logger.info(
+                    "Nothing scheduled right now -- handing over to the "
+                    "schedule-wait screen"
+                )
+            elif outcome != PLAYBACK_STARTED:
+                # A real fault: no playable file, or mpv will not start. Do not
+                # return straight back into the main loop, which calls this
+                # method again immediately (`run_video_loop(); continue`) and
+                # would spin with no watchdog ping at all. Wait here, pinging
+                # throughout, then return so the main loop re-evaluates the
+                # display mode (the answer may now be DOWNLOADING_CONTENT).
+                self._log_display_trouble(
+                    'mpv_start',
+                    f"Display cannot start MPV ({outcome}). Retrying; the "
+                    f"service stays up."
+                )
+                self._sleep_with_watchdog(STATE_CHECK_INTERVAL_SEC)
                 return
+            else:
+                self._mpv_restart_backoff_sec = MPV_RESTART_BACKOFF_MIN_SEC
 
         logger.info("=" * 60)
         logger.info("Starting SYNCED content playback (wall clock mode)")
@@ -2650,7 +2867,11 @@ class JamPlayerDisplayManager:
             self._show_no_scheduled_content_screen()
             # Wait for schedule to potentially change
             while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
-                time.sleep(10)
+                # Ten seconds of bare time.sleep here meant no watchdog ping:
+                # the unit was SIGABRT'd about every 65 s for the whole of an
+                # off-schedule window, and five kills inside 300 s left it
+                # `failed` -- black until a human intervened.
+                self._sleep_with_watchdog(10)
                 # Bail-out check on every tick: if scenes.json went
                 # empty while we were waiting (customer deactivated all),
                 # exit to the main loop so it can transition to
@@ -2857,48 +3078,54 @@ class JamPlayerDisplayManager:
                     self._current_scene_index = -1
                 continue
 
-            # Check if MPV died and needs restart
-            if self.mpv and not self.mpv.is_running():
-                logger.warning("MPV process died, restarting...")
-
-                # Track this crash for self-healing detection
-                current_time = time.time()
-                self._mpv_crash_times.append(current_time)
-
-                # Remove old crash times outside the window
-                self._mpv_crash_times = [
-                    t for t in self._mpv_crash_times
-                    if current_time - t < self._mpv_crash_window_seconds
-                ]
-
-                # Check if we've hit the crash threshold - indicates display subsystem issue
-                if len(self._mpv_crash_times) >= self._mpv_crash_threshold:
-                    logger.error(
-                        f"MPV crashed {len(self._mpv_crash_times)} times in "
-                        f"{self._mpv_crash_window_seconds} seconds - restarting lightdm to fix display"
-                    )
-                    self._mpv_crash_times.clear()  # Reset counter
+            # No picture: either the mpv we started has exited, or there is no
+            # mpv at all because the last start failed. Both are handled the
+            # same way -- start mpv again, with a backoff when it will not
+            # start. NEVER by restarting lightdm; see _note_mpv_crash.
+            if self.mpv is None or not self.mpv.is_running():
+                recent_crashes = 0
+                if self.mpv is not None:
+                    logger.warning("MPV process died, restarting...")
+                    recent_crashes = self._note_mpv_crash()
                     try:
-                        # Restart lightdm to reinitialize Xwayland
-                        subprocess.run(
-                            ['systemctl', 'restart', 'lightdm'],
-                            timeout=30,
-                            capture_output=True
-                        )
-                        logger.info("lightdm restart triggered, waiting for display to reinitialize...")
-                        time.sleep(5)  # Give lightdm time to restart
+                        self.mpv.stop_mpv()
                     except Exception as e:
-                        logger.error(f"Failed to restart lightdm: {e}")
+                        logger.warning(f"Error stopping dead MPV: {e}")
+                    self.mpv = None
+                    self.is_playing = False
 
-                # Clean up the dead MPV first
-                try:
-                    self.mpv.stop_mpv()
-                except Exception as e:
-                    logger.warning(f"Error stopping dead MPV: {e}")
-                self.mpv = None
-                # Restart video playback
-                self._start_video_playback()
-                self._current_scene_index = -1  # Force scene reload
+                if recent_crashes >= 2:
+                    # mpv keeps starting and dying. Wait BEFORE trying again,
+                    # so that once it does start the loop immediately corrects
+                    # the wall-clock position instead of showing the bootstrap
+                    # scene for the length of the wait. The FIRST exit never
+                    # waits: one-off crash recovery stays as immediate as it
+                    # has always been.
+                    self._sleep_with_watchdog(
+                        min(recent_crashes, MPV_CRASH_BURST_MAX_WAIT_SEC)
+                    )
+
+                outcome = self._start_video_playback()
+                if outcome == PLAYBACK_STARTED:
+                    self._mpv_restart_backoff_sec = MPV_RESTART_BACKOFF_MIN_SEC
+                    self._current_scene_index = -1  # Force scene reload
+                    sd_notifier.notify("WATCHDOG=1")
+                elif outcome == PLAYBACK_NOTHING_SCHEDULED:
+                    # The schedule closed underneath us. Leave the loop so the
+                    # main loop re-enters and the block above puts the
+                    # "No Content Scheduled" screen up.
+                    logger.info("Schedule closed -- leaving playback for the wait screen")
+                    return
+                else:
+                    self._log_display_trouble(
+                        'mpv_start',
+                        f"Display cannot start MPV ({outcome}). Retrying; the "
+                        f"service stays up."
+                    )
+                    self._sleep_with_watchdog(self._mpv_restart_backoff_sec)
+                    self._mpv_restart_backoff_sec = min(
+                        self._mpv_restart_backoff_sec * 2, MPV_RESTART_BACKOFF_MAX_SEC
+                    )
                 continue
 
             # Calculate where we should be based on wall clock
@@ -2927,6 +3154,16 @@ class JamPlayerDisplayManager:
                         logger.error(f"Media file not found: {media_path}")
                     else:
                         logger.debug(f"Media file still missing: {media_path}")
+                    # Ping before sleeping: a scene whose file is missing holds
+                    # this branch for the whole of its scheduled slot, which is
+                    # longer than WatchdogSec on most schedules.
+                    sd_notifier.notify("WATCHDOG=1")
+                    # Forget which scene is loaded. Without this, a cycle whose
+                    # only playable scene has already been loaded matches
+                    # `scene_index == self._current_scene_index` when its slot
+                    # comes round again, the reload is skipped, and mpv sits on
+                    # a frozen last frame forever (it runs with --keep-open).
+                    self._current_scene_index = -1
                     time.sleep(0.5)
                     continue
 

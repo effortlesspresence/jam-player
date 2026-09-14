@@ -115,8 +115,9 @@ def wait_for_hdmi() -> bool:
 
     logger.warning(
         f"Timed out after {MAX_WAIT_SEC}s waiting for HDMI. Letting lightdm "
-        f"start anyway -- display won't render content until HDMI is plugged in "
-        f"and the hotplug monitor restarts lightdm."
+        f"start anyway -- the display will render content once HDMI is plugged "
+        f"in and Wayfire picks the output up (it handles hotplug natively; "
+        f"nothing restarts lightdm, which would cause a black screen)."
     )
     return False
 

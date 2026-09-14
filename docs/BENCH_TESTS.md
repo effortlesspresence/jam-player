@@ -35,6 +35,15 @@ Every command below is a single line and is meant to be pasted as-is.
   unplugged (associates, no internet); a dual-band pair named like `Shop` and
   `Shop-5G`; a spare router (WAN unplugged) with a free LAN port for the
   dead-uplink ethernet case.
+- **Image contents (settles the customer firewall whitelist).** Whether `mpv` and `tailscale` ship in
+  the image, or are apt-installed on first boot, decides whether the Debian and Raspberry Pi mirrors
+  plus the Tailscale apex are steady-state whitelist entries or a recovery-only footnote. If the
+  install line never appears across any boot, the image has them and three entries come off the list
+  customers get.
+```
+journalctl -u jam-boot-check --no-pager | grep -iE "MPV not installed|Tailscale not installed|install.sh"; echo "--- present now? ---"; command -v mpv tailscale
+```
+
 - **Backend visibility:** the JAM Sphere super-admin dashboard for the bench
   device, and API Gateway access logs / CloudWatch `Count` for `/jam-players/health`.
 
@@ -415,6 +424,136 @@ release back onto the old one.
 ```
 sudo systemctl start jam-update; journalctl -u jam-update -b --no-pager | grep -E "staying put|REFUSING to move backwards|Release target decision"
 ```
+
+
+### J — Display and lightdm (audit #11)
+
+**Read this first.** On a healthy fielded player `lightdm` is **expected to be in `failed` state**
+after boot, and the display is fine. That is deliberate: the `jam-no-restart.conf` drop-in sets
+`Restart=no` so lightdm crashes exactly once (a Bookworm GObject teardown bug) instead of
+crash-looping every ~3 s, which was the customer-visible "flashes between content and black"
+symptom. mpv holds the DRM surface independently and keeps rendering. Do not "fix" lightdm being
+failed, and do not restart it to recover a display: a restart spawns a new X session that grabs DRM
+master from mpv, and on a static-image scene mpv never reclaims the surface, so the screen stays
+black until a manual reboot. That is the mechanism behind the field incidents, and it is why the
+hotplug monitor's restart was removed.
+
+**J0 · The healthy signature** `[ ]`
+On a normally booted player with content playing, all four must hold: picture on screen,
+`lightdm` failed, `Restart=no`, and zero lightdm restarts from the display service.
+```
+systemctl is-failed lightdm; systemctl show lightdm -p Restart --value; systemctl is-active jam-player-display; journalctl -u jam-player-display -b --no-pager | grep -c "restarting lightdm"
+```
+
+**J1 · Reproduce the storm on CURRENT code, before changing anything** `[ ]` *(bench unit only — this
+deliberately produces a black screen)*
+Hide the first scheduled scene's media file, then restart the display service.
+```
+sudo python3 -c "import json,os;s=json.load(open('/opt/jam/content/live_scenes/scenes.json'));m='/opt/jam/content/live_media/'+s[0]['media_file'];os.rename(m,m+'.hidden');print(m)" && sudo systemctl restart jam-player-display
+```
+Expected on current code: `restarting lightdm to fix display` within ~30 s and then roughly every 5 s;
+the unit watchdog-killed at 60 s; `failed` within ~5 minutes; black screen despite valid cached
+content. Watch it with:
+```
+journalctl -u jam-player-display -f | grep -E "restarting lightdm|Watchdog|start request repeated|MPV process died"
+```
+Restore: rename the `.hidden` file back, `sudo systemctl reset-failed jam-player-display lightdm`, reboot.
+
+**J2a · One missing file no longer blocks the rest** `[ ]`
+With at least two scheduled scenes, repeat J1's setup (hide only the FIRST scene's media file).
+Expected: playback starts on the next scene whose file exists, `restarting lightdm` never appears, and
+the unit stays `active`. Before the fix this state produced the J1 storm.
+
+**J2b · Nothing playable keeps the service alive and self-heals** `[ ]`
+Hide EVERY media file, then restart the display service.
+```
+sudo find /opt/jam/content/live_media -maxdepth 1 -type f -exec sudo mv {} {}.hidden \; && sudo systemctl restart jam-player-display
+```
+Expected over the next 10 minutes: no `restarting lightdm`, no watchdog kill, `systemctl is-active
+jam-player-display` still `active`, and the "cannot start MPV" ERROR logged at most once (it is
+throttled to 10 minutes). Then restore the files and confirm playback resumes **without a reboot** —
+that is the whole point of keeping the service alive.
+```
+sudo find /opt/jam/content/live_media -maxdepth 1 -name '*.hidden' -exec sh -c 'sudo mv "$1" "${1%.hidden}"' _ {} \; && sleep 45 && systemctl is-active jam-player-display
+```
+
+**J3 · HDMI unplugged across a reboot (the field incident)** `[ ]`
+Power off, unplug HDMI, power on, leave it 5 minutes, then plug HDMI in.
+Expected: no `restarting lightdm` at any point, the display unit stays `active`, the hotplug monitor
+logs the reconnect, and the picture appears within a few seconds of plugging in (Wayfire handles
+hotplug natively).
+```
+journalctl -u jam-player-display -u jam-display-hotplug-monitor -b --no-pager | grep -E "restarting lightdm|HDMI|reconnect"
+```
+
+**J4 · Real repeated mpv crashes still recover** `[ ]`
+Kill mpv five times inside the 30 s window and confirm the self-heal is the display service
+restarting mpv, not a lightdm restart.
+```
+for i in 1 2 3 4 5; do sudo pkill -9 mpv; sleep 3; done; sleep 20; systemctl is-active jam-player-display; journalctl -u jam-player-display -b --no-pager | grep -cE "restarting lightdm"
+```
+Expected: content playing again, unit `active`, count `0`.
+
+
+### K — feh cleanup patterns (VERIFY FIRST, no code change yet)
+
+**Why this group exists.** `kill_feh_processes()` in the display service, the `ExecStopPost` in
+`jam-player-display.service`, and jam-update's kill of the display's screen all use the pattern
+`feh.*jam_display`. That predates the display image cache. Cached screens are written to
+`/var/cache/jam-player-display/` — spelled with hyphens — so on paper the pattern matches only the
+fallback renders at `/tmp/jam_display_*.png` and misses every cached screen. Tested off-device the
+mismatch is certain; what it actually does to the picture depends on X stacking, which only a player
+can answer. **Run K1–K4 on the CURRENT build before anything is changed.** If K1 shows the pattern
+matching nothing, the gap is real. If it matches, the analysis is wrong and nothing should change.
+
+Setup used by K1–K3: force a static cached screen by moving the manifest aside (reversible).
+```
+sudo mv /opt/jam/content/live_scenes/scenes.json /opt/jam/content/live_scenes/scenes.json.bak && sudo systemctl restart jam-player-display && sleep 25
+```
+Restore afterwards:
+```
+sudo mv /opt/jam/content/live_scenes/scenes.json.bak /opt/jam/content/live_scenes/scenes.json && sudo systemctl restart jam-player-display
+```
+
+**K1 · Does the sweep pattern match a live cached screen?** `[ ]`
+With a static screen up, list the real feh processes, then list what the sweep pattern would hit.
+```
+echo "--- all feh ---"; pgrep -a feh; echo "--- what 'feh.*jam_display' matches ---"; pgrep -af 'feh.*jam_display'; echo "(empty second list + non-empty first = the gap is real)"
+```
+Record the exact image path feh is showing. Expected if the analysis holds: the first list shows a
+path under `/var/cache/jam-player-display/`; the second is empty.
+
+**K2 · Do orphans survive a service restart and accumulate?** `[ ]`
+```
+pgrep -c feh; sudo systemctl restart jam-player-display; sleep 25; pgrep -c feh; pgrep -a feh
+```
+Expected if the analysis holds: the count goes **up** by one per restart and old paths stay in the
+list. If cleanup works, it stays at one. Repeat the restart once more to be sure.
+
+**K3 · Can a stale screen become visible?** `[ ]`
+The decisive question, and the one that needs eyes on the TV. With at least one orphan from K2,
+restore the manifest so the device returns to playing content, then stop mpv and watch the screen.
+```
+sudo mv /opt/jam/content/live_scenes/scenes.json.bak /opt/jam/content/live_scenes/scenes.json && sleep 30 && pgrep -a feh && sudo pkill -9 mpv
+```
+Record what appears in the seconds before mpv restarts: customer content, black, or the old static
+screen from K1. An old static screen appearing is the customer-visible symptom.
+
+**K4 · The update case** `[ ]`
+With a static screen up (setup above), run an update and watch feh across it.
+```
+sudo systemctl start jam-update & sleep 20; echo "--- during ---"; pgrep -a feh; sleep 120; echo "--- after ---"; pgrep -a feh
+```
+Expected if the analysis holds: during the update BOTH the updater's `/tmp/jam_updating.png` and the
+older cached screen are running, and after the updater removes its own, the cached one is still
+listed. Note whether the TV shows the old screen after the update finishes and before content
+returns.
+
+**If K1–K4 confirm it**, the change is one pattern in three files —
+`src/jam_player/services_v2/jam_player_display.py`, `systemd/jam-player-display.service`, and
+`src/jam_player/services_v2/jam_update.py` — widened to `feh.*(jam_display|jam-player-display)`,
+which covers both locations and still cannot match `jam_updating`. Re-run K1–K4 afterwards: K1's
+second list should then be non-empty, and K2's count should stay at one.
 
 
 ### G — Gates
