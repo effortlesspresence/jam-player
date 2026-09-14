@@ -37,7 +37,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common.logging_config import setup_service_logging, log_service_start
 from common.api import report_error as api_report_error, ErrorSeverity, SystemService
-from common.paths import ENVIRONMENT_FILE, DEVICE_UUID_FILE, BLE_SESSION_ACTIVE_FLAG, safe_copy
+from common.paths import (
+    ENVIRONMENT_FILE, DEVICE_UUID_FILE, BLE_SESSION_ACTIVE_FLAG, safe_copy,
+    UPDATER_ATTEMPTS_FILE, UPDATER_RECOVERED_FLAG, UPDATER_LKG_DIR, UPDATER_STAGING_DIR,
+)
+from common.update_target import (
+    commits_match, decide_update, read_cached_target, write_cached_target,
+)
 from common.system import set_unique_hostname
 
 # Try to import PIL for update screen display
@@ -416,6 +422,12 @@ def rollback_from_backup() -> bool:
         if SERVICES_BACKUP.exists():
             restored = _copy_tree_over(SERVICES_BACKUP, SERVICES_DEST)
             logger.info(f"  Restored {SERVICES_DEST} ({restored} files, copy-over)")
+            # The backup is "old services + NEW common" (see the docstring):
+            # the last-known-good snapshot is the only copy of the OLD common/
+            # and updater that match those services. Restore them too.
+            lkg_files = _restore_updater_from_lkg()
+            if lkg_files:
+                logger.info(f"  Restored updater + common/ from last-known-good ({lkg_files} files)")
         else:
             logger.warning("  No services backup to restore")
 
@@ -546,7 +558,16 @@ def check_and_reexec_if_updated() -> bool:
             logger.info("jam_update.py unchanged - no re-exec needed")
             return True
 
-        logger.info("jam_update.py has changed - preparing to re-exec with new version...")
+        logger.info("jam_update.py has changed - validating the new updater before promoting it...")
+        ok, why = _validate_staged_updater()
+        if not ok:
+            logger.error(f"New updater FAILED validation; NOT promoting it: {why}")
+            report_error(f"Update aborted: the new jam_update.py/common did not pass validation: {why}")
+            return False
+        if not _snapshot_updater_lkg():
+            report_error("Update aborted: could not snapshot the current updater as last-known-good")
+            return False
+        logger.info("New updater validated and current updater snapshotted - promoting and re-executing")
 
         # Copy new version to installed location (safe_copy: atomic rename,
         # so a kill mid-copy can't leave a truncated updater that then fails
@@ -662,14 +683,374 @@ def get_current_version() -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Updater self-protection (2026-09)
+#
+# The updater used to copy its new self + common/ into place and re-exec
+# BEFORE any validation, with no backup yet and Restart=no on the unit. One
+# import-time error in the new code (syntax error, undefined name, a new
+# third-party import that install_dependencies would have installed 30 s
+# later) killed the new process before its first line, and every boot re-ran
+# the same broken file -- silently (report_error lives in common.api) and
+# fleet-wide by the next nightly reboot. Now: STAGE -> VALIDATE (compile,
+# undefined-name gate, import smoke, all in a subprocess) -> SNAPSHOT the
+# current, provably-working updater as last-known-good -> PROMOTE -> re-exec.
+# jam_venv_repair's boot guard restores the snapshot if the promoted updater
+# turns out to die anyway (runtime crash: two boots without a controlled exit).
+# ---------------------------------------------------------------------------
+_VALIDATOR_SRC = r"""
+import sys, os, pathlib, symtable, builtins
+staging = pathlib.Path(sys.argv[1])
+files = sorted(staging.glob('*.py')) + sorted((staging / 'common').glob('*.py'))
+for f in files:                                   # 1) every file compiles
+    compile(f.read_bytes(), str(f), 'exec')
+KNOWN = set(dir(builtins)) | {'__file__','__name__','__doc__','__spec__','__loader__','__package__','__builtins__','__annotations__','__path__','__debug__'}
+def modnames(m):
+    return {x.get_name() for x in m.get_symbols() if x.is_assigned() or x.is_imported() or x.is_namespace() or x.is_parameter()}
+def walk(t, mn, out, path):
+    if t.get_type() != 'module':
+        for x in t.get_symbols():
+            n = x.get_name()
+            if x.is_global() and not x.is_declared_global() and not x.is_assigned() and n not in mn and n not in KNOWN:
+                out.append(f"{path.name}: {t.get_name()} uses undefined name '{n}'")
+    for c in t.get_children():
+        walk(c, mn, out, path)
+bad = []
+for f in files:                                   # 2) no undefined names (the F821 class)
+    src = f.read_text()
+    if 'import *' in src:
+        continue
+    m = symtable.symtable(src, str(f), 'exec'); walk(m, modnames(m), bad, f)
+if bad:
+    sys.stderr.write('\n'.join(bad) + '\n'); sys.exit(2)
+sys.path.insert(0, str(staging))                   # 3) the new updater imports on this venv
+import jam_update  # noqa: F401
+sys.stdout.write('ok\n'); sys.stdout.flush()
+os._exit(0)                                        # never hang on a background thread
+"""
+
+_UPDATER_FILES = ('jam_update.py', 'venv_check.py', 'jam_venv_repair.py')
+
+
+def _stage_new_updater() -> Path:
+    """Copy the repo's updater + common/ into a scratch dir for validation."""
+    if UPDATER_STAGING_DIR.exists():
+        shutil.rmtree(UPDATER_STAGING_DIR)
+    UPDATER_STAGING_DIR.mkdir(parents=True)
+    for name in _UPDATER_FILES:
+        src = SERVICES_V2_SRC / name
+        if src.exists():
+            shutil.copy2(src, UPDATER_STAGING_DIR / name)
+    shutil.copytree(SERVICES_V2_SRC / 'common', UPDATER_STAGING_DIR / 'common',
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    return UPDATER_STAGING_DIR
+
+
+def _run_validator(staging: Path) -> tuple[bool, str]:
+    try:
+        r = subprocess.run([sys.executable, '-c', _VALIDATOR_SRC, str(staging)],
+                           capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return False, 'validator timed out after 180 s'
+    if r.returncode == 0:
+        return True, ''
+    tail = (r.stderr.strip().splitlines() or ['no stderr'])[-3:]
+    return False, ' | '.join(tail)[:600]
+
+
+def _validate_staged_updater() -> tuple[bool, str]:
+    """
+    Stage the new updater and prove it loads BEFORE it replaces the running one.
+    A failure that looks like a missing third-party module is retried once
+    after installing the new requirements: a release may legitimately add a
+    dependency, and the OLD updater installing it is exactly what keeps that
+    from being a chicken-and-egg brick.
+    """
+    try:
+        staging = _stage_new_updater()
+        ok, why = _run_validator(staging)
+        if not ok and 'ModuleNotFoundError' in why:
+            logger.warning(f"New updater needs a module the venv lacks ({why}); installing requirements, then re-validating")
+            try:
+                install_dependencies()
+            except Exception as e:
+                logger.warning(f"install_dependencies before re-validation failed: {e}")
+            ok, why = _run_validator(staging)
+        return ok, why
+    except Exception as e:
+        return False, f'validation could not run: {e}'
+    finally:
+        try:
+            if UPDATER_STAGING_DIR.exists():
+                shutil.rmtree(UPDATER_STAGING_DIR)
+        except Exception:
+            pass
+
+
+def _snapshot_updater_lkg() -> bool:
+    """
+    Save the CURRENTLY INSTALLED updater + common/ + recovery agents as the
+    last-known-good snapshot -- it is running right now, so it is known-good
+    by definition. Built in a .new dir and swapped atomically.
+    """
+    new = UPDATER_LKG_DIR.with_name(UPDATER_LKG_DIR.name + '.new')
+    old = UPDATER_LKG_DIR.with_name(UPDATER_LKG_DIR.name + '.old')
+    try:
+        for d in (new, old):
+            if d.exists():
+                shutil.rmtree(d)
+        new.mkdir(parents=True)
+        for name in _UPDATER_FILES:
+            src = SERVICES_DEST / name
+            if src.exists():
+                shutil.copy2(src, new / name)
+        shutil.copytree(SERVICES_DEST / 'common', new / 'common',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        (new / 'lkg_version.txt').write_text((get_current_version() or 'unknown') + '\n')
+        if UPDATER_LKG_DIR.exists():
+            UPDATER_LKG_DIR.rename(old)
+        new.rename(UPDATER_LKG_DIR)
+        if old.exists():
+            shutil.rmtree(old)
+        logger.info(f"Saved last-known-good updater snapshot to {UPDATER_LKG_DIR}")
+        return True
+    except Exception as e:
+        logger.error(f"Could not snapshot the current updater as last-known-good: {e}")
+        if old.exists() and not UPDATER_LKG_DIR.exists():
+            try:
+                old.rename(UPDATER_LKG_DIR)
+            except Exception:
+                pass
+        return False
+
+
+def _restore_updater_from_lkg() -> int:
+    """Copy the last-known-good updater + common/ over the installed tree
+    (used by rollback: the backup is 'old services + NEW common', see
+    rollback_from_backup). Returns files restored, 0 if no snapshot."""
+    if not (UPDATER_LKG_DIR / 'jam_update.py').exists():
+        return 0
+    restored = 0
+    for name in _UPDATER_FILES:
+        src = UPDATER_LKG_DIR / name
+        if src.exists():
+            safe_copy(src, SERVICES_DEST / name); restored += 1
+    if (UPDATER_LKG_DIR / 'common').is_dir():
+        restored += _copy_tree_over(UPDATER_LKG_DIR / 'common', SERVICES_DEST / 'common')
+    return restored
+
+
+def _clear_updater_attempts() -> None:
+    """A controlled exit: tell the boot guard this run did not die silently."""
+    try:
+        UPDATER_ATTEMPTS_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug(f"Could not clear the updater attempt counter: {e}")
+
+
+def _report_guard_recovery_if_any() -> None:
+    """The boot guard cannot sign a request; it leaves a flag we report here."""
+    try:
+        if UPDATER_RECOVERED_FLAG.exists():
+            details = UPDATER_RECOVERED_FLAG.read_text().strip()
+            logger.error(f"Boot guard restored the last-known-good updater:\n{details}")
+            report_error(f"Updater was restored from last-known-good by the boot guard: {details}")
+            UPDATER_RECOVERED_FLAG.unlink()
+    except Exception as e:
+        logger.warning(f"Could not report guard recovery: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Release target: which commit should this player run? (2026-09)
+# Asked of the backend before every pull. FAIL-CLOSED: when the backend cannot
+# answer, the last cached answer is used and otherwise nothing changes this
+# run -- never the branch tip. A backend outage overlapping the 3 AM reboot
+# must not become an unstaged fleet-wide install of whatever sits at HEAD, and
+# a customer firewall that blocks our API but not GitHub must not bypass the
+# staged rollout forever. The cost is one delayed run; the next boot retries.
+# Decision rules live in common.update_target (stdlib, unit-tested).
+# ---------------------------------------------------------------------------
+def _fetch_update_target(branch: str) -> Optional[dict]:
+    try:
+        from common.api import api_request
+        response = api_request(method='GET', path='/jam-players/update-target',
+                               query={'branch': branch}, signed=True, timeout=15)
+        if response is None:
+            logger.warning("Release target: no response from the backend")
+            return None
+        if response.status_code != 200:
+            logger.warning(f"Release target: HTTP {response.status_code}")
+            return None
+        data = response.json()
+        data = data.get('data', data) if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            logger.warning("Release target: unexpected response shape")
+            return None
+        return data
+    except Exception as e:
+        logger.warning(f"Release target lookup failed ({e})")
+        return None
+
+
+_TARGET_LOOKUP_ATTEMPTS = 3
+_TARGET_LOOKUP_INITIAL_DELAY_S = 5
+_TARGET_LOOKUP_MAX_DELAY_S = 20
+
+
+def _lookup_update_target(branch: str) -> Optional[dict]:
+    """
+    The backend's answer for this branch, retried briefly so a transient blip
+    does not cost a night; on success it is cached. When the backend cannot be
+    asked, the cached answer for this branch is used instead (the admin's last
+    decision), and with no cache the caller stays put. Never the branch tip.
+    """
+    answer = retry_with_backoff(
+        lambda: _fetch_update_target(branch), "release target lookup",
+        max_attempts=_TARGET_LOOKUP_ATTEMPTS,
+        initial_delay=_TARGET_LOOKUP_INITIAL_DELAY_S,
+        max_delay=_TARGET_LOOKUP_MAX_DELAY_S,
+    )
+    if answer:
+        if not write_cached_target(branch, answer):
+            logger.warning("Could not cache the release-target answer (will re-ask next run)")
+        return answer
+    cached = read_cached_target(branch)
+    if cached:
+        cached_answer, fetched_at = cached
+        logger.warning(
+            f"Backend unreachable; using the cached release-target answer for '{branch}' "
+            f"from {fetched_at} (fail closed -- never the branch tip)"
+        )
+        return cached_answer
+    logger.warning(
+        f"Backend unreachable and no cached release-target answer for '{branch}'; "
+        "staying put this run (fail closed). The next boot retries."
+    )
+    return None
+
+
+def _would_move_backwards(desired: str, installed: Optional[str]) -> bool:
+    """
+    Is `desired` an ancestor of what we are running, i.e. would applying it
+    move this player BACKWARDS?
+
+    Backward moves are refused outright. The updater is one-directional by
+    construction: _copy_tree_over never deletes files that a newer release
+    added (that is what keeps the recovery agents alive during a failed-update
+    restore), and install_systemd_units copies by glob without pruning. So
+    checking out an older commit does not give you the older version -- it
+    gives you older code plus every file and unit any newer release ever
+    installed, still enabled. Nobody tests that state, and it would be entered
+    in a panic on a fleet that is already misbehaving.
+
+    Fixing forward is the supported repair path: hold the branch to stop the
+    spread, cut a new release, target it. If a release is so broken the player
+    cannot update at all, that is what the validate-before-promote checks, the
+    last-known-good snapshot and the boot guard are for, all of which act
+    locally without the backend.
+
+    Only a definitive "yes, it is an ancestor" refuses. An equal commit is not
+    a move, unrelated histories (a bench unit switching branches) are not a
+    move, and a git error leaves the answer unknown, which allows the update
+    rather than wedging the fleet on a failed side-check.
+    """
+    if not installed or commits_match(desired, installed):
+        return False
+    ok, _, _ = run_command(
+        ['git', 'merge-base', '--is-ancestor', desired, installed],
+        cwd=JAM_REPO_DIR, timeout=30,
+    )
+    return ok
+
+
+def _commit_present(commit: str) -> bool:
+    ok, _, _ = run_command(['git', 'cat-file', '-e', f'{commit}^{{commit}}'], cwd=JAM_REPO_DIR, timeout=30)
+    return ok
+
+
+def _ensure_commit_available(commit: str) -> bool:
+    """A targeted/stable commit must exist locally; fetch it by SHA if
+    the branch fetch did not bring it (GitHub serves reachable SHAs)."""
+    if _commit_present(commit):
+        return True
+    logger.info(f"Commit {commit[:12]} not present locally; fetching it by SHA")
+    ok, _, stderr = run_command(['git', 'fetch', GIT_REMOTE, commit], cwd=JAM_REPO_DIR, timeout=GIT_TIMEOUT)
+    if not ok:
+        logger.warning(f"Fetch by SHA failed: {stderr.strip()[:300]}")
+    return _commit_present(commit)
+
+
+# ---------------------------------------------------------------------------
+# Git hygiene: a SIGKILLed or power-cut git leaves lock files and temp packs
+# behind that make every later fetch fail ("index.lock: File exists") --
+# a second way for updates to silently stop forever.
+# ---------------------------------------------------------------------------
+_GIT_LOCK_MAX_AGE_S = 10 * 60
+_GIT_TMP_PACK_MAX_AGE_S = 24 * 3600
+_GIT_CORRUPTION_MARKERS = ('bad object', 'corrupt', 'could not read', 'index file smaller than expected',
+                           'loose object', 'is broken', 'fatal: not a git repository')
+
+
+def _sweep_git_residue() -> None:
+    try:
+        git_dir = JAM_REPO_DIR / '.git'
+        if not git_dir.is_dir():
+            return
+        now = time.time()
+        for lock in list(git_dir.glob('*.lock')) + list((git_dir / 'refs').rglob('*.lock')):
+            try:
+                if now - lock.stat().st_mtime > _GIT_LOCK_MAX_AGE_S:
+                    lock.unlink(); logger.warning(f"Removed stale git lock: {lock.relative_to(git_dir)}")
+            except FileNotFoundError:
+                pass
+        for tmp in list((git_dir / 'objects' / 'pack').glob('tmp_pack_*')) + list((git_dir / 'objects' / 'pack').glob('tmp_idx_*')):
+            try:
+                if now - tmp.stat().st_mtime > _GIT_TMP_PACK_MAX_AGE_S:
+                    tmp.unlink(); logger.info(f"Removed stale git temp pack: {tmp.name}")
+            except FileNotFoundError:
+                pass
+    except Exception as e:
+        logger.debug(f"git residue sweep skipped: {e}")
+
+
+def _looks_like_git_corruption(stderr: str) -> bool:
+    low = (stderr or '').lower()
+    return any(m in low for m in _GIT_CORRUPTION_MARKERS)
+
+
+def _reclone_repo(branch: str) -> bool:
+    """Move a corrupt checkout aside and clone fresh. Bounded to one attempt per run."""
+    aside = JAM_REPO_DIR.with_name(f"{JAM_REPO_DIR.name}.corrupt-{int(time.time())}")
+    try:
+        logger.error(f"Git repository looks corrupt; moving it to {aside} and re-cloning")
+        report_error(f"jam-player git repo looked corrupt; re-cloning (old checkout kept at {aside})")
+        JAM_REPO_DIR.rename(aside)
+    except Exception as e:
+        logger.error(f"Could not move the corrupt repo aside: {e}")
+        return False
+    return clone_repo(branch)
+
+
 def get_latest_version(branch: str) -> Optional[str]:
     """
-    Fetch and get the latest version from remote.
+    Which commit should this player be on right now?
 
-    Retries with exponential backoff on failure (GitHub can be
-    intermittently unavailable).
+    Fetches the branch (after sweeping stale git locks; re-cloning once if the
+    checkout looks corrupt), then asks the backend for the branch's release
+    target and applies the rules in common.update_target: hold >
+    follow-HEAD > eligible-for-target > stable floor > stay. Returns the commit
+    to run, or None when nothing should change this run (held, not eligible
+    with no stable release yet, fetch failed, or the wanted commit could not be
+    obtained). Fail-closed: no answer from the backend means the last cached
+    answer, and with no cache nothing changes this run -- never the branch tip.
+    A branch with no release targeted also stays put unless its target carries
+    the explicit followHead opt-in.
     """
+    _sweep_git_residue()
     logger.info(f"Fetching latest from {GIT_REMOTE}/{branch}...")
+    last_err = {'msg': ''}
 
     def attempt_fetch():
         success, _, stderr = run_command(
@@ -678,11 +1059,14 @@ def get_latest_version(branch: str) -> Optional[str]:
             timeout=GIT_TIMEOUT
         )
         if not success:
+            last_err['msg'] = stderr or ''
             logger.warning(f"Fetch attempt failed: {stderr}")
             return None
         return True
 
     result = retry_with_backoff(attempt_fetch, "git fetch")
+    if not result and _looks_like_git_corruption(last_err['msg']) and _reclone_repo(branch):
+        result = retry_with_backoff(attempt_fetch, "git fetch (after re-clone)")
     if not result:
         return None
 
@@ -690,11 +1074,39 @@ def get_latest_version(branch: str) -> Optional[str]:
         ['git', 'rev-parse', f'{GIT_REMOTE}/{branch}'],
         cwd=JAM_REPO_DIR
     )
-    if success:
-        return stdout.strip()
+    if not success:
+        logger.error(f"Failed to get remote HEAD: {stderr}")
+        return None
+    head = stdout.strip()
 
-    logger.error(f"Failed to get remote HEAD: {stderr}")
-    return None
+    target = _lookup_update_target(branch)
+    try:
+        from common.credentials import get_device_uuid
+        device_uuid = get_device_uuid()
+    except Exception:
+        device_uuid = None
+    installed = get_current_version()
+    desired, reason = decide_update(head, target, device_uuid=device_uuid,
+                                    installed_commit=installed)
+    logger.info(f"Release target decision: {reason}" + (f" -> {desired[:12]}" if desired else " -> no change this run"))
+    if desired is None:
+        return None
+    if desired != head and not _ensure_commit_available(desired):
+        logger.error(f"Wanted commit {desired[:12]} is not obtainable from {GIT_REMOTE}; not updating this run")
+        report_error(f"Release target commit {desired} is not reachable in the repo; update skipped")
+        return None
+    if _would_move_backwards(desired, installed):
+        logger.error(
+            f"REFUSING to move backwards: {desired[:12]} is an ancestor of the "
+            f"installed {str(installed)[:12]}. Players only move forward; fix "
+            f"forward with a new release instead."
+        )
+        report_error(
+            f"Update refused: target {desired} is older than the installed "
+            f"{installed}. Backward moves are not supported; cut a new release."
+        )
+        return None
+    return desired
 
 
 # =============================================================================
@@ -964,12 +1376,12 @@ def hide_updating_screen():
 # Installation Functions
 # =============================================================================
 
-def pull_latest(branch: str) -> bool:
+def pull_latest(ref: str) -> bool:
     """Pull the latest code from remote."""
     logger.info(f"Pulling latest code from {branch}...")
 
     success, _, stderr = run_command(
-        ['git', 'reset', '--hard', f'{GIT_REMOTE}/{branch}'],
+        ['git', 'reset', '--hard', ref],
         cwd=JAM_REPO_DIR,
         timeout=60
     )
@@ -2418,6 +2830,7 @@ def report_error(error_message: str):
 
 def main():
     log_service_start(logger, 'JAM Update Service')
+    _report_guard_recovery_if_any()
 
     # Always disable comitup on every run - it interferes with JAM 2.0 BLE provisioning
     # This is idempotent and safe to run repeatedly, ensuring comitup stays disabled
@@ -2457,7 +2870,7 @@ def main():
     # Get latest version
     latest_version = get_latest_version(branch)
     if not latest_version:
-        logger.error("Could not fetch latest version - skipping update")
+        logger.info("No update to apply this run (fetch failed, backend unreachable with no cached answer, updates held, no release targeted, or not eligible yet -- see the decision above)")
         sys.exit(0)
 
     logger.info(f"Latest version: {latest_version[:12]}...")
@@ -2507,13 +2920,18 @@ def main():
         sys.exit(1)
 
     # Pull latest code (git repo, not the installed files)
-    if not pull_latest(branch):
+    if not pull_latest(latest_version):
         fail_update("Failed to pull latest code from git", should_rollback=False)
 
     # Check if jam_update.py itself changed - if so, re-exec with new version
     # This ensures new install functions (like install_wifi_stability_configs)
     # take effect immediately, not on the next update cycle
-    check_and_reexec_if_updated()
+    if not check_and_reexec_if_updated():
+        # Validation failed: the new release cannot even load. Nothing was
+        # promoted; the current updater stays in place and retries next boot
+        # (a fix pushed to the branch will be picked up then).
+        logger.error("Update aborted before promotion; the current updater remains installed")
+        sys.exit(1)
 
     # Ensure venv exists (before backup since we're not backing up venv)
     if not ensure_venv_exists():
@@ -2694,7 +3112,7 @@ def main():
         # Importing at the top of the file would have referenced the
         # PRE-update version of common.api -- not what we want.
         from common.installed_version import report_installed_version_to_backend
-        report_installed_version_to_backend(version=latest_version)
+        report_installed_version_to_backend(version=latest_version, branch=branch)
     except Exception as e:
         logger.warning(
             f"Could not report installedVersion to backend (non-fatal): {e}"
@@ -2826,4 +3244,17 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # Controlled exits (up to date, held, aborted, success, handled failure)
+    # clear the boot guard's attempt counter. A crash -- any other exception --
+    # leaves it armed; two such boots in a row make jam_venv_repair restore the
+    # last-known-good updater. See jam_venv_repair._updater_guard.
+    try:
+        main()
+    except SystemExit:
+        _clear_updater_attempts()
+        raise
+    except Exception:
+        logger.exception("jam-update crashed (uncontrolled exit); leaving the boot-guard attempt counter armed")
+        raise
+    else:
+        _clear_updater_attempts()

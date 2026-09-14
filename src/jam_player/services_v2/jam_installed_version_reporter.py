@@ -35,6 +35,7 @@ from common.installed_version import (
     read_installed_version,
     report_installed_version_to_backend,
 )
+from common.update_target import read_update_branch
 from common.network import device_is_offline
 from common.logging_config import setup_service_logging
 
@@ -80,7 +81,7 @@ def main() -> int:
 
     backoff = INITIAL_BACKOFF_SEC
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        if report_installed_version_to_backend(version=version):
+        if report_installed_version_to_backend(version=version, branch=read_update_branch()):
             logger.info(f"Successfully reported on attempt {attempt}")
             return 0
 

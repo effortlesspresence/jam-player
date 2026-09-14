@@ -19,6 +19,9 @@ packages, no common.* modules. Standard library only, and shell out to the
 venv interpreter/pip via subprocess. It runs on the SYSTEM python
 (/usr/bin/python3), never the (possibly broken) venv python.
 """
+import filecmp
+import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -234,17 +237,181 @@ def _attempt_self_heal():
     return 0  # always exit 0: never wedge the boot sequence
 
 
+# ---------------------------------------------------------------------------
+# Updater guard (2026-09).
+#
+# jam-update used to be able to brick ITSELF: it copied a new jam_update.py +
+# common/ into place and re-exec'd before any validation, so an import-time
+# error in the new code (a syntax error, an undefined name, a third-party
+# import pip would have installed 30 s later) killed the new process before
+# its first line, and -- Restart=no -- every boot re-ran the same broken file.
+# The failure was silent (report_error lives in common.api) and fleet-wide by
+# the next nightly reboot.
+#
+# This guard runs BEFORE jam-update, on the SYSTEM python, importing nothing
+# from common/ -- the whole point is to work when common/ is what is broken.
+# It (1) compiles the installed updater + common/, (2) if the venv is healthy,
+# import-smokes jam_update with the venv python, and (3) counts boots on
+# which jam-update was started but never recorded a controlled exit. Any of
+# those failing -> restore the last-known-good snapshot the updater took
+# before it promoted itself, and leave a flag the restored updater reports.
+# Literals mirror common/paths.py on purpose; keep them in sync.
+# ---------------------------------------------------------------------------
+STATE_DIR = Path('/var/lib/jam')
+ATTEMPTS_FILE = STATE_DIR / 'updater_attempts'
+RECOVERED_FLAG = STATE_DIR / 'updater_recovered'
+LKG_DIR = OPT_JAM / 'updater-lkg'
+SERVICES = OPT_JAM / 'services'
+UPDATER_FILES = ('jam_update.py', 'venv_check.py', 'jam_venv_repair.py')
+ATTEMPTS_BEFORE_RESTORE = 2      # two boots dying before writing a line = broken
+IMPORT_SMOKE_TIMEOUT_S = 90
+
+
+def _read_attempts():
+    try:
+        return int(ATTEMPTS_FILE.read_text().strip() or 0)
+    except Exception:
+        return 0
+
+
+def _write_attempts(n):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = ATTEMPTS_FILE.with_name(ATTEMPTS_FILE.name + '.tmp')
+        tmp.write_text(str(int(n)))
+        os.replace(tmp, ATTEMPTS_FILE)
+    except Exception as e:
+        log(f"could not write updater attempt counter: {e}")
+
+
+def _installed_updater_sources():
+    files = [SERVICES / 'jam_update.py', SERVICES / 'venv_check.py']
+    common = SERVICES / 'common'
+    if common.is_dir():
+        files.extend(sorted(common.rglob('*.py')))
+    return [f for f in files if f.exists()]
+
+
+def _installed_updater_compiles():
+    """(ok, reason): every installed updater source byte-compiles on this python."""
+    for f in _installed_updater_sources():
+        try:
+            # In-memory compile: no .pyc is written anywhere.
+            compile(f.read_bytes(), str(f), 'exec')
+        except Exception as e:
+            return False, f"{f.relative_to(SERVICES)} does not compile: {e}"
+    return True, ''
+
+
+def _installed_updater_imports():
+    """True/False = the venv python could/could not import the installed updater;
+    None = unknown (venv not healthy -- that is venv repair's domain, not a
+    code problem, so it must NOT trigger a restore)."""
+    if not VENV_PY.exists() or not venv_ok():
+        return None
+    try:
+        r = subprocess.run(
+            [str(VENV_PY), '-c', f"import sys; sys.path.insert(0, {str(SERVICES)!r}); import jam_update"],
+            capture_output=True, text=True, timeout=IMPORT_SMOKE_TIMEOUT_S,
+        )
+        if r.returncode != 0:
+            log("installed jam_update.py fails to import: " + (r.stderr.strip().splitlines() or ['?'])[-1][:300])
+            return False
+        return True
+    except Exception as e:
+        log(f"import smoke could not run ({e}); treating as unknown")
+        return None
+
+
+def _lkg_matches_installed():
+    """True when restoring would change nothing (never loop on a broken LKG)."""
+    try:
+        if not filecmp.cmp(LKG_DIR / 'jam_update.py', SERVICES / 'jam_update.py', shallow=False):
+            return False
+        d = filecmp.dircmp(str(LKG_DIR / 'common'), str(SERVICES / 'common'))
+        return not (d.diff_files or d.left_only or d.right_only or d.funny_files)
+    except Exception:
+        return False
+
+
+def _copy_atomic(src, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + '.lkg-tmp')
+    shutil.copy2(src, tmp)
+    with open(tmp, 'rb') as f:
+        os.fsync(f.fileno())
+    os.replace(tmp, dest)
+
+
+def _restore_from_lkg(reason):
+    if not (LKG_DIR / 'jam_update.py').exists():
+        log("no last-known-good updater snapshot to restore from")
+        return False
+    restored = 0
+    for name in UPDATER_FILES:
+        src = LKG_DIR / name
+        if src.exists():
+            _copy_atomic(src, SERVICES / name); restored += 1
+    lkg_common = LKG_DIR / 'common'
+    if lkg_common.is_dir():
+        for src in lkg_common.rglob('*'):
+            if src.is_file():
+                _copy_atomic(src, SERVICES / 'common' / src.relative_to(lkg_common)); restored += 1
+    lkg_version = ''
+    try:
+        lkg_version = (LKG_DIR / 'lkg_version.txt').read_text().strip()
+    except Exception:
+        pass
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        RECOVERED_FLAG.write_text(
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\nreason={reason}\nlkg_version={lkg_version}\nfiles={restored}\n"
+        )
+    except Exception as e:
+        log(f"restored LKG but could not write the recovered flag: {e}")
+    log(f"RESTORED last-known-good updater ({restored} files, lkg {lkg_version[:12] or '?'}): {reason}")
+    return True
+
+
+def _updater_guard():
+    attempts = _read_attempts()
+    ok_compile, why = _installed_updater_compiles()
+    imports = _installed_updater_imports() if ok_compile else None
+    reason = None
+    if not ok_compile:
+        reason = why
+    elif imports is False:
+        reason = "installed jam_update.py fails to import on the venv python"
+    elif attempts >= ATTEMPTS_BEFORE_RESTORE:
+        reason = f"jam-update started {attempts} boots in a row without recording a controlled exit"
+    if reason:
+        log(f"updater looks BROKEN: {reason}")
+        if _lkg_matches_installed():
+            log("last-known-good is identical to the installed updater -- nothing to restore; needs a human")
+        elif _restore_from_lkg(reason):
+            _write_attempts(0)
+            return
+    # Arm the counter for this boot; jam_update clears it on every controlled exit.
+    _write_attempts(attempts + 1)
+
+
 def main():
     # Structural guarantee of the "never wedge boot" invariant: whatever goes
     # wrong (an OSError from a bad mount, a permission fault, anything), we log
     # it and exit 0 so the ordered-after jam services still start and the repair
     # simply retries next boot. This must NOT depend on every callee's internal
-    # error handling staying perfect as the file evolves.
+    # error handling staying perfect as the file evolves. The venv self-heal and
+    # the updater guard are caught independently: one failing must not skip the
+    # other.
     try:
-        return _attempt_self_heal()
+        _attempt_self_heal()
     except Exception as e:
         log(f"unexpected error during self-heal -- deferring to next boot: {e}")
-        return 0
+    try:
+        _updater_guard()
+    except Exception as e:
+        log(f"unexpected error in the updater guard -- deferring to next boot: {e}")
+    return 0
 
 
 if __name__ == '__main__':

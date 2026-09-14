@@ -6,6 +6,7 @@ Includes request signing with Ed25519 keys.
 """
 
 import hashlib
+from urllib.parse import urlencode
 import time
 import logging
 from typing import Optional, Dict, Any
@@ -216,7 +217,8 @@ def api_request(
     path: str,
     body: Optional[Dict[str, Any]] = None,
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
-    signed: bool = True
+    signed: bool = True,
+    query: Optional[Dict[str, str]] = None,
 ) -> Optional[requests.Response]:
     """
     Make a signed request to the JAM 2.0 API.
@@ -226,6 +228,8 @@ def api_request(
         path: API path (e.g., /jam-player/provision)
         body: Request body dict (will be JSON encoded)
         timeout: Request timeout in seconds
+        query: Optional query parameters, appended to the URL and deliberately
+               NOT part of the signed path (the authorizer signs event.path only)
         signed: Whether to sign the request (default True)
 
     Returns:
@@ -234,7 +238,13 @@ def api_request(
     import json
 
     base_url = get_api_base_url()
+    # The backend authorizer verifies the signature over API Gateway's
+    # event.path, which EXCLUDES the query string. So query parameters go in
+    # the URL only and never in the signed path -- pass them via `query`,
+    # never by appending "?..." to `path` (that would fail verification).
     url = f"{base_url}{path}"
+    if query:
+        url += '?' + urlencode({k: str(v) for k, v in query.items() if v is not None})
 
     headers = {'Content-Type': 'application/json'}
     body_str = json.dumps(body) if body else ""

@@ -342,6 +342,81 @@ Steps: relink via the web dashboard while a download is in flight. Expected:
 `journalctl -u jam-ws-commands -b --no-pager | grep -c "nudging content manager"` ≥ 1 and
 `systemctl show jam-content-manager -p NRestarts` unchanged; the in-flight download finishes.
 
+### I — Updater safety and release control (audit #17, parts 1–6)
+
+**I1 · A release whose updater cannot load is refused, not promoted** `[ ]`
+Setup: on the bench branch, commit a deliberate `NameError` (e.g. `x = undefined_name` at the
+bottom of `services_v2/common/paths.py`) and push. Steps:
+`sudo systemctl start jam-update; journalctl -u jam-update -b --no-pager | grep -E "FAILED validation|aborted before promotion"`
+Expected: both lines; `/etc/jam/version.txt` unchanged; the old updater still installed
+(`cmp /opt/jam/services/jam_update.py /opt/jam/updater-lkg/jam_update.py` may differ — the point is
+it was NOT replaced); a backend error "did not pass validation" in Logs & Errors. Revert the
+commit → next run validates, logs `promoting and re-executing`, and `/opt/jam/updater-lkg/lkg_version.txt`
+holds the previous commit.
+
+**I2 · A broken installed updater is restored at boot** `[ ]`
+Steps: `sudo sed -i '1i import definitely_missing_module' /opt/jam/services/jam_update.py && sudo reboot`
+Expected on the next boot: `journalctl -u jam-venv-repair -b --no-pager | grep -E "BROKEN|RESTORED"` shows
+both; `jam-update` then runs on the restored file and reports "restored from last-known-good" to the
+backend (Logs & Errors); `/var/lib/jam/updater_recovered` is gone afterwards.
+
+**I3 · Two silent deaths in a row trigger a restore even when the file imports** `[ ]`
+Steps: `echo 2 | sudo tee /var/lib/jam/updater_attempts && sudo reboot`
+Expected: guard logs `2 boots in a row without recording a controlled exit` and restores; after a
+normal `jam-update` run the counter file is gone (`ls /var/lib/jam/`).
+
+**I4 · Release target decisions** `[ ]`
+Setup: in the super-admin Releases panel, cut a release for the bench branch and set its target.
+For each row run `sudo systemctl start jam-update; journalctl -u jam-update -b --no-pager | grep "Release target decision"`:
+- eligible 0% (bench device outside the bucket), no stable → `staying put`; with a stable set →
+  `running the stable release instead` and `version.txt` = stable commit
+- eligible 100% → `eligible for the current release target` → updates to the target
+- hold on → `HELD` → no change
+- no release targeted, follow-HEAD off (the default; also what a target created for `main` without a
+  release looks like) → `follow-HEAD is off; staying put` → no change, even after a push to the branch
+- no release targeted, follow-HEAD ON (bench branch only; the backend refuses it on main) →
+  `following branch HEAD` → updates to the branch tip
+- backend unreachable (block the API host at the router for one run), cached answer present →
+  `using the cached release-target answer` and the cached decision applies (a cached hold still holds)
+- backend unreachable AND `sudo rm /var/lib/jam/update_target.json` → `staying put this run (fail closed)`;
+  `version.txt` unchanged. `following branch HEAD` must NEVER appear in either unreachable case
+
+**I5 · First-connect update waits for announce** `[ ]`
+Fresh (unregistered) device; provision WiFi from the app. Expected:
+`journalctl -u jam-ble-state-manager -b --no-pager | grep -E "Device announced; starting the first-connect update|Announce not observed"`
+shows the first form (the second only if announce took > 90 s).
+
+**I6 · Stale git locks do not stop updates forever** `[ ]`
+Steps: `sudo touch -d '20 minutes ago' /home/comitup/jam-player/.git/index.lock && sudo systemctl start jam-update && journalctl -u jam-update -b --no-pager | grep "Removed stale git lock"`
+Expected: the lock is removed and the fetch proceeds.
+
+**I7 · The dashboard knows the branch and the version** `[ ]`
+After a boot, the super-admin detail modal shows Branch = `testing` (bench) and Version changed = the
+time of the last real change; the Releases panel's "Not reporting" row does not include this device.
+
+**I8 · Stale-firmware job** `[ ]`
+Set the bench branch's target to a release the device is eligible for but block the device from
+updating (block git at the router) for > 72 h — or
+temporarily lower the job's 72 h/3-day rule in a test deploy. Expected: `staleFirmwareSince` set, a
+"Stale firmware" badge in the modal, a fleet alert once the threshold is crossed, one email; the alert
+resolves after the device catches up.
+
+**I9 · A player never moves backwards** `[ ]`
+The path that must be impossible: lowering the eligibility knob pulling devices that already took the
+release back onto the old one.
+1. Put the bench player on the target release (eligible 100%). Confirm `cat /etc/jam/version.txt`.
+2. Lower `eligiblePercent` below the device's bucket (the plan box names the bucket), with a stable
+   release set. Reboot or `sudo systemctl start jam-update`.
+3. Expected: `already installed the target; staying put` in the decision line, `version.txt` unchanged.
+   The device must NOT move to the stable commit.
+4. Now target the branch at an OLDER release directly. Expected: `REFUSING to move backwards` and an
+   error in Logs & Errors; `version.txt` unchanged.
+5. Re-target the newer release. Expected: a normal update, proving the refusal is not sticky.
+```
+sudo systemctl start jam-update; journalctl -u jam-update -b --no-pager | grep -E "staying put|REFUSING to move backwards|Release target decision"
+```
+
+
 ### G — Gates
 
 **G1 · On-device unit suites green** `[ ]` — `cd /opt/jam/services && sudo tests/run_on_device.sh`
@@ -357,7 +432,7 @@ Steps: relink via the web dashboard while a download is in flight. Expected:
   no watchdog kill, next playable scene plays; restore file → resumes.
 - **Timezone applied live:** change the location timezone → schedule flips
   without a reboot.
-- **Updater validate-before-promote, hardware watchdog, health-monitor cooldown.**
+- **Hardware watchdog, health-monitor cooldown.**
 - **Mobile:** Android link-loss message; verify-after-`connected` on old firmware;
   Location Services gate; enterprise-network detection; ethernet "continue
   without WiFi".

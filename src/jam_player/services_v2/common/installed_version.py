@@ -34,7 +34,7 @@ fleet's tooling.
 """
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from common.api import api_request
 
@@ -103,7 +103,7 @@ def write_installed_version(version: str) -> bool:
         return False
 
 
-def report_installed_version_to_backend(version: Optional[str] = None) -> bool:
+def report_installed_version_to_backend(version: Optional[str] = None, branch: Optional[str] = None) -> bool:
     """
     POST /jam-players/installed-version with the given (or current)
     commit hash.
@@ -127,10 +127,15 @@ def report_installed_version_to_backend(version: Optional[str] = None) -> bool:
         )
         return False
 
+    body: Dict[str, Any] = {'installedVersion': version}
+    if branch:
+        # Which branch this device follows (see common.update_target.read_update_branch):
+        # lets the fleet views compare a device to ITS branch's release target.
+        body['branch'] = branch
     response = api_request(
         method='POST',
         path='/jam-players/installed-version',
-        body={'installedVersion': version},
+        body=body,
         signed=True,
     )
 

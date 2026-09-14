@@ -60,6 +60,30 @@ STATE_MANAGER_ALIVE_FLAG = JAM_RUN_DIR / 'state_manager_alive'
 # tmpfs, so a reboot starts with no evidence. Read via network.api_recently_ok().
 API_LAST_OK_FLAG = JAM_RUN_DIR / 'api_last_ok'
 
+# --- Updater guard state: PERSISTENT (survives reboot), deliberately NOT tmpfs.
+# The boot guard in jam_venv_repair.py runs on the SYSTEM python and imports
+# nothing from common/ (common/ may be the thing that is broken), so it
+# duplicates these literals on purpose; keep them in sync.
+JAM_STATE_DIR = Path('/var/lib/jam')
+# How many boots in a row jam-update was STARTED without recording completion
+# (the guard increments before jam-update runs; the updater deletes it on any
+# controlled exit). Two in a row means the updater dies before it can even
+# write a line -- an import-time failure -- and the guard restores LKG.
+UPDATER_ATTEMPTS_FILE = JAM_STATE_DIR / 'updater_attempts'
+# Left by the guard when it restores the last-known-good updater; the restored
+# updater reports it to the backend on its next run and removes it.
+UPDATER_RECOVERED_FLAG = JAM_STATE_DIR / 'updater_recovered'
+# Last-known-good snapshot of the updater + common/ + recovery agents, taken
+# immediately before a new updater is promoted. What the guard restores from.
+UPDATER_LKG_DIR = Path('/opt/jam/updater-lkg')
+# Where a new updater + common/ are staged and validated before promotion.
+UPDATER_STAGING_DIR = Path('/opt/jam/services/.staging')
+# The last good answer from GET /jam-players/update-target, per branch. When
+# the backend cannot be asked, the updater uses this and otherwise stays put
+# (fail CLOSED -- never the branch tip; see common.update_target). Persistent
+# on purpose: it must survive the nightly reboot.
+UPDATE_TARGET_CACHE_FILE = JAM_STATE_DIR / 'update_target.json'
+
 
 def touch_volatile_flag(path: Path) -> bool:
     """

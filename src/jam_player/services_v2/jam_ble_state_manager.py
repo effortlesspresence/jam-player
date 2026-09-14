@@ -72,7 +72,7 @@ from gi.repository import GLib
 
 from common.system import manage_service, seconds_since_boot, unit_active_since_boot_seconds
 from common.network import InternetConnectivityMonitor, check_internet_connectivity, api_recently_ok
-from common.credentials import is_device_registered
+from common.credentials import is_device_registered, is_device_announced
 from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, STATE_MANAGER_ALIVE_FLAG, safe_touch, touch_volatile_flag
 
 # ============================================================================
@@ -188,6 +188,12 @@ BLE_BOOT_RECOVERY_WINDOW_SECONDS = 15 * 60
 #     case). A marker older than that means the attempt died without
 #     clearing it, not that somebody is still waiting.
 BLE_SESSION_FLAG_MAX_AGE_SECONDS = 5 * 60
+
+# First-connect auto-update: wait (bounded) for jam-announce so the updater's
+# device-authorized release-target lookup can be verified; see
+# _maybe_trigger_first_connect_update.
+FIRST_CONNECT_ANNOUNCE_WAIT_SECONDS = 90
+FIRST_CONNECT_ANNOUNCE_POLL_SECONDS = 3
 
 # Services to restart when connectivity is restored
 # These services may have failed/exited during offline period
@@ -800,31 +806,59 @@ class BLEStateManager:
             return
 
         self._first_connect_update_triggered = True
+        # Sequence the update AFTER announce. The updater asks the backend
+        # which release to run (GET /jam-players/update-target), and that call
+        # is device-authorized: it can only be verified once the device's key
+        # is known -- i.e. once jam-announce has succeeded. Fired before that,
+        # the call fails and the updater stays put (fail closed), so exactly the
+        # warehouse devices this trigger exists for would miss their first-connect
+        # update until the next boot.
+        # jam-announce runs on this same online transition; wait for its flag,
+        # bounded, then start regardless (a slow announce must never
+        # block a device from ever updating).
+        waited = {'ticks': 0}
+        max_ticks = FIRST_CONNECT_ANNOUNCE_WAIT_SECONDS // FIRST_CONNECT_ANNOUNCE_POLL_SECONDS
 
-        import subprocess
-        logger.info(
-            "First internet connection on an unregistered device -- "
-            "triggering jam-update.service so warehouse devices catch "
-            "up to latest code before setup"
-        )
-        try:
-            result = subprocess.run(
-                ['systemctl', 'start', 'jam-update.service'],
-                capture_output=True,
-                text=True,
-                timeout=10,
+        def _start_update():
+            import subprocess
+            logger.info(
+                "First internet connection on an unregistered device -- "
+                "triggering jam-update.service so warehouse devices catch "
+                "up to their release target before setup"
             )
-            if result.returncode == 0:
-                logger.info("jam-update.service start triggered")
-            else:
-                logger.warning(
-                    f"systemctl start jam-update returned non-zero: "
-                    f"{result.stderr.strip() or result.stdout.strip()}"
+            try:
+                result = subprocess.run(
+                    ['systemctl', 'start', 'jam-update.service'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
-        except subprocess.TimeoutExpired:
-            logger.warning("systemctl start jam-update timed out")
-        except Exception as e:
-            logger.warning(f"Failed to trigger jam-update: {e}")
+                if result.returncode == 0:
+                    logger.info("jam-update.service start triggered")
+                else:
+                    logger.warning(
+                        f"systemctl start jam-update returned non-zero: "
+                        f"{result.stderr.strip() or result.stdout.strip()}"
+                    )
+            except subprocess.TimeoutExpired:
+                logger.warning("systemctl start jam-update timed out")
+
+        def _tick() -> bool:
+            if is_device_announced():
+                logger.info("Device announced; starting the first-connect update")
+                _start_update()
+                return False  # stop the timer
+            waited['ticks'] += 1
+            if waited['ticks'] >= max_ticks:
+                logger.warning(
+                    f"Announce not observed within {FIRST_CONNECT_ANNOUNCE_WAIT_SECONDS}s; "
+                    "starting the first-connect update anyway (it will use a cached answer or stay put)"
+                )
+                _start_update()
+                return False
+            return True  # poll again
+
+        GLib.timeout_add_seconds(FIRST_CONNECT_ANNOUNCE_POLL_SECONDS, _tick)
 
     def _apply_ble_state(self, is_online: bool, method: str = "unknown"):
         """
