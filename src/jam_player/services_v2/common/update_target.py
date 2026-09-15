@@ -43,6 +43,11 @@ REASON_NO_TARGET = 'no release targeted for this branch and follow-HEAD is off; 
 REASON_ELIGIBLE = 'eligible for the current release target'
 REASON_STABLE = 'not yet eligible for the current target; running the stable release instead'
 REASON_STAY = 'not eligible for the current target and no stable release exists yet; staying put'
+REASON_FIRST_INSTALL_STABLE = ('nothing installed yet; installing the stable release')
+REASON_FIRST_INSTALL_TARGET = ('nothing installed yet and no stable release; installing the '
+                               'current release target')
+REASON_FIRST_INSTALL_HEAD = ('nothing installed yet and no release cut for this branch; '
+                             'installing branch HEAD')
 REASON_ALREADY_ON_TARGET = ('no longer eligible, but this device already installed the target; '
                            'staying put -- a player never moves backwards on its own')
 
@@ -107,24 +112,50 @@ def decide_update(head_commit: Optional[str], target: Optional[Dict[str, Any]],
         target: the backend's answer (fresh or cached), or None if there is
                 none (FAIL-CLOSED: nothing changes this run).
         device_uuid: used to recompute eligibility if the answer lacks it.
-        installed_commit: what this player is running right now. Used only to
-                refuse to move BACKWARDS -- see the stable branch below.
+        installed_commit: what this player is running right now, or None when
+                NOTHING is installed. Used to refuse backward moves and to
+                recognise a first install.
 
     Returns (commit_or_None, reason). None means "do not change anything this
     run". The caller compares the commit to the installed version; equality
-    means up to date. Precedence: hold > follow-HEAD (explicit opt-in
-    only) > eligible > already-on-target > stable > stay. No answer, and no
-    release targeted without the opt-in, both mean stay.
+    means up to date. Precedence: hold > follow-HEAD (explicit opt-in only) >
+    eligible > already-on-target > stable > stay.
+
+    FIRST INSTALL. A player with no installed version cannot "stay put" --
+    there is nothing to stay on. That is a 1.0 player migrating to 2.0 (the
+    1.0 installer clones this repo, enables jam-update and leaves the actual
+    install to it, with no /etc/jam/version.txt yet) and any 2.0 player whose
+    version file was lost. Those players historically installed branch HEAD,
+    so refusing to install anything would strand a 1.0 player on 1.0 forever
+    the moment a branch has no release targeted -- which is the DEFAULT state
+    of a branch. So when nothing is installed we fall back to the most proven
+    commit available: stable, else the target, else branch HEAD. `hold` still
+    wins: it is the emergency stop and must freeze even a first install.
     """
+    fresh_install = not installed_commit
+
+    def first_install_floor(reason: str) -> Tuple[Optional[str], str]:
+        if not fresh_install:
+            return None, reason
+        answer = target or {}
+        for candidate, why in (
+            (answer.get('stableCommit'), REASON_FIRST_INSTALL_STABLE),
+            (answer.get('targetCommit'), REASON_FIRST_INSTALL_TARGET),
+            (head_commit, REASON_FIRST_INSTALL_HEAD),
+        ):
+            if candidate:
+                return str(candidate), why
+        return None, reason
+
     if not target:
-        return None, REASON_NO_ANSWER
+        return first_install_floor(REASON_NO_ANSWER)
     if target.get('hold'):
         return None, REASON_HOLD
     target_commit = target.get('targetCommit')
     if not target_commit:
         if target.get('followHead') is True:
             return head_commit, REASON_FOLLOW_HEAD
-        return None, REASON_NO_TARGET
+        return first_install_floor(REASON_NO_TARGET)
     eligible = target.get('eligible')
     if eligible is None and device_uuid:
         try:
@@ -148,7 +179,7 @@ def decide_update(head_commit: Optional[str], target: Optional[Dict[str, Any]],
     stable = target.get('stableCommit')
     if stable:
         return str(stable), REASON_STABLE
-    return None, REASON_STAY
+    return first_install_floor(REASON_STAY)
 
 
 # ---------------------------------------------------------------------------

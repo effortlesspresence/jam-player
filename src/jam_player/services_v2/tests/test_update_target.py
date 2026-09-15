@@ -51,8 +51,10 @@ class DecideUpdateTests(unittest.TestCase):
     def test_no_answer_stays_put_never_head(self):
         """Fail CLOSED: a backend outage at 3 AM must not become an unstaged
         fleet-wide install of whatever sits at HEAD."""
-        self.assertEqual(ut.decide_update(HEAD, None), (None, ut.REASON_NO_ANSWER))
-        self.assertEqual(ut.decide_update(HEAD, {}), (None, ut.REASON_NO_ANSWER))
+        self.assertEqual(ut.decide_update(HEAD, None, installed_commit='z' * 40),
+                         (None, ut.REASON_NO_ANSWER))
+        self.assertEqual(ut.decide_update(HEAD, {}, installed_commit='z' * 40),
+                         (None, ut.REASON_NO_ANSWER))
 
     def test_hold_freezes_both_pointers(self):
         self.assertEqual(ut.decide_update(HEAD, self._t(hold=True, eligible=True)), (None, ut.REASON_HOLD))
@@ -60,10 +62,13 @@ class DecideUpdateTests(unittest.TestCase):
     def test_no_release_targeted_stays_put_by_default(self):
         """The human-error trap: a target created for main without a release
         must NOT push the branch tip to the whole fleet in one night."""
-        self.assertEqual(ut.decide_update(HEAD, self._t(targetCommit=None)), (None, ut.REASON_NO_TARGET))
+        self.assertEqual(ut.decide_update(HEAD, self._t(targetCommit=None), installed_commit='z' * 40),
+                         (None, ut.REASON_NO_TARGET))
         t = self._t(targetCommit=None); del t['followHead']          # backend without the field
-        self.assertEqual(ut.decide_update(HEAD, t), (None, ut.REASON_NO_TARGET))
-        self.assertEqual(ut.decide_update(HEAD, self._t(targetCommit=None, followHead='yes')),
+        self.assertEqual(ut.decide_update(HEAD, t, installed_commit='z' * 40),
+                         (None, ut.REASON_NO_TARGET))
+        self.assertEqual(ut.decide_update(HEAD, self._t(targetCommit=None, followHead='yes'),
+                                          installed_commit='z' * 40),
                          (None, ut.REASON_NO_TARGET), 'only a real boolean True opts in')
 
     def test_no_release_with_follow_head_opt_in_follows_head(self):
@@ -109,13 +114,67 @@ class DecideUpdateTests(unittest.TestCase):
         self.assertEqual(ut.decide_update(HEAD, self._t(eligible=False)), ('c' * 40, ut.REASON_STABLE))
 
     def test_not_eligible_and_no_stable_yet_stays_put(self):
-        self.assertEqual(ut.decide_update(HEAD, self._t(eligible=False, stableCommit=None)), (None, ut.REASON_STAY))
+        self.assertEqual(
+            ut.decide_update(HEAD, self._t(eligible=False, stableCommit=None), installed_commit='z' * 40),
+            (None, ut.REASON_STAY))
 
     def test_missing_eligible_flag_is_recomputed_locally(self):
         t = self._t(eligiblePercent=48); del t['eligible']          # SAMPLE bucket 47 -> eligible
         self.assertEqual(ut.decide_update(HEAD, t, device_uuid=SAMPLE_UUID)[1], ut.REASON_ELIGIBLE)
         t = self._t(eligiblePercent=47); del t['eligible']          # 47 -> not eligible
         self.assertEqual(ut.decide_update(HEAD, t, device_uuid=SAMPLE_UUID)[1], ut.REASON_STABLE)
+
+
+class FirstInstallTests(unittest.TestCase):
+    """A player with NOTHING installed must always be given something.
+
+    This is the 1.0 -> 2.0 migration path: the 1.0 installer clones this repo,
+    enables jam-update and leaves the actual install to it, with no
+    /etc/jam/version.txt. Returning "stay put" there would strand a 1.0 player
+    on 1.0 forever the moment a branch has no release targeted -- the DEFAULT
+    state of a branch.
+    """
+
+    def _t(self, **kw):
+        base = {'branch': 'main', 'targetCommit': 'b' * 40, 'hold': False, 'eligiblePercent': 25,
+                'eligible': False, 'stableCommit': 'c' * 40, 'followHead': False}
+        base.update(kw); return base
+
+    def test_no_release_targeted_still_installs_something(self):
+        self.assertEqual(
+            ut.decide_update(HEAD, self._t(targetCommit=None), installed_commit=None),
+            ('c' * 40, ut.REASON_FIRST_INSTALL_STABLE))
+
+    def test_prefers_stable_then_target_then_head(self):
+        self.assertEqual(
+            ut.decide_update(HEAD, self._t(targetCommit=None, stableCommit=None), installed_commit=None),
+            (HEAD, ut.REASON_FIRST_INSTALL_HEAD))
+        self.assertEqual(
+            ut.decide_update(HEAD, self._t(eligible=False, stableCommit=None), installed_commit=None),
+            ('b' * 40, ut.REASON_FIRST_INSTALL_TARGET))
+
+    def test_backend_unreachable_still_installs_head(self):
+        """A 1.0 player has no 2.0 code to protect; fail-closed would strand it."""
+        self.assertEqual(ut.decide_update(HEAD, None, installed_commit=None),
+                         (HEAD, ut.REASON_FIRST_INSTALL_HEAD))
+
+    def test_hold_still_wins_even_for_a_first_install(self):
+        """Hold is the emergency stop. It freezes migrations too, on purpose."""
+        self.assertEqual(ut.decide_update(HEAD, self._t(hold=True), installed_commit=None),
+                         (None, ut.REASON_HOLD))
+
+    def test_an_eligible_first_install_takes_the_target_normally(self):
+        self.assertEqual(ut.decide_update(HEAD, self._t(eligible=True), installed_commit=None),
+                         ('b' * 40, ut.REASON_ELIGIBLE))
+
+    def test_nothing_known_at_all_changes_nothing(self):
+        self.assertEqual(ut.decide_update(None, None, installed_commit=None),
+                         (None, ut.REASON_NO_ANSWER))
+
+    def test_an_installed_player_is_never_given_the_floor(self):
+        for kwargs in ({'targetCommit': None}, {'eligible': False, 'stableCommit': None}):
+            commit, _ = ut.decide_update(HEAD, self._t(**kwargs), installed_commit='z' * 40)
+            self.assertIsNone(commit, f'installed players must still be able to stay put: {kwargs}')
 
 
 class CommitsMatchTests(unittest.TestCase):

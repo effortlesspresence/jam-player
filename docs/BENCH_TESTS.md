@@ -426,6 +426,23 @@ sudo systemctl start jam-update; journalctl -u jam-update -b --no-pager | grep -
 ```
 
 
+**I10 · A fielded player converges in ONE nightly reboot** `[ ]`
+The whole-fleet path, and the one that bit us on the bench. A player on fielded firmware pulls the
+branch tip, promotes `jam_update.py` + `common/`, and re-execs with `version.txt` still naming the OLD
+commit. The new updater must FINISH that update, not re-decide it.
+1. Flash a card on the fielded commit, set its branch, let it reach the internet.
+2. Expected in one run: `Continuing an update already in flight: installing the checked-out <sha>`,
+   then the install completes and `cat /etc/jam/version.txt` equals the branch tip.
+3. The failure this guards against: `version.txt` still on the old commit while
+   `git -C /home/comitup/jam-player rev-parse --short HEAD` shows the new one. That is a player that
+   will NEVER converge, because every later boot repeats the same non-decision.
+4. Confirm the target governs from the next run: restart the updater and expect a normal
+   `Release target decision:` line, with no further change.
+```
+journalctl -u jam-update -b --no-pager | grep -E "Continuing an update already in flight|Release target decision|Already up to date"; cat /etc/jam/version.txt; echo; sudo git -C /home/comitup/jam-player rev-parse --short HEAD
+```
+
+
 ### J — Display and lightdm (audit #11)
 
 **Read this first.** On a healthy fielded player `lightdm` is **expected to be in `failed` state**

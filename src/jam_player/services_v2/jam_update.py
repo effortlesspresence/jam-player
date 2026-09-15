@@ -529,8 +529,6 @@ def check_and_reexec_if_updated() -> bool:
         True if we should continue (no re-exec needed or re-exec failed safely)
         Does not return if re-exec succeeds (process is replaced)
     """
-    REEXEC_ENV_VAR = 'JAM_UPDATE_REEXEC'
-
     # Check if we've already re-execed (prevent infinite loop)
     if os.environ.get(REEXEC_ENV_VAR) == '1':
         logger.info("Running after re-exec - continuing with new version")
@@ -739,6 +737,12 @@ os._exit(0)                                        # never hang on a background 
 """
 
 _UPDATER_FILES = ('jam_update.py', 'venv_check.py', 'jam_venv_repair.py')
+
+# Set by an updater immediately before it re-execs into a newly installed copy
+# of itself, and inherited by that copy. It means "an update is already in
+# flight: the branch has been fetched, the repo is checked out at the commit a
+# previous process decided on, and this file plus common/ have been promoted".
+REEXEC_ENV_VAR = 'JAM_UPDATE_REEXEC'
 
 
 def _stage_new_updater() -> Path:
@@ -1057,6 +1061,37 @@ def get_latest_version(branch: str) -> Optional[str]:
     A branch with no release targeted also stays put unless its target carries
     the explicit followHead opt-in.
     """
+    # An update ALREADY IN FLIGHT must be finished, never re-decided.
+    #
+    # Every updater built before release control -- 7440d2d and earlier, which
+    # is the whole fielded fleet -- resolves the branch tip, pulls it, copies
+    # this file and common/ into place, and re-execs, handing over mid-update
+    # with /etc/jam/version.txt still naming the OLD commit. If we ran the
+    # release-target decision here we would read that stale version.txt,
+    # conclude the player is already on the release it is supposed to be on,
+    # and exit 0 -- abandoning the update with the repo, common/ and the
+    # updater on the new commit while every other service stayed old. Worse,
+    # it would repeat forever: the same stale version.txt produces the same
+    # non-decision on every later boot, so the player would never converge.
+    #
+    # So when we are the second half of an update, install what is already
+    # checked out. The release target governs from the NEXT run onward, once
+    # version.txt finally tells the truth about what is installed.
+    if os.environ.get(REEXEC_ENV_VAR) == '1':
+        ok, stdout, _ = run_command(['git', 'rev-parse', 'HEAD'], cwd=JAM_REPO_DIR)
+        in_flight = stdout.strip() if ok else ''
+        if in_flight:
+            logger.info(
+                f"Continuing an update already in flight: installing the "
+                f"checked-out {in_flight[:12]} (the release target applies from "
+                f"the next run)"
+            )
+            return in_flight
+        logger.warning(
+            "Re-exec detected but the repo HEAD could not be read; falling "
+            "through to a normal release-target decision"
+        )
+
     _sweep_git_residue()
     logger.info(f"Fetching latest from {GIT_REMOTE}/{branch}...")
     last_err = {'msg': ''}

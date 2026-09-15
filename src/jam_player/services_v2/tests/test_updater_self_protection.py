@@ -205,6 +205,56 @@ class ReleaseTargetResolutionTests(unittest.TestCase):
     def test_no_release_with_follow_head_opt_in_follows_head(self):
         self.assertEqual(self._resolve({'targetCommit': None, 'hold': False, 'eligible': True, 'followHead': True}), self.HEAD)
 
+    def test_an_update_handed_over_mid_flight_is_finished_not_re_decided(self):
+        """The fielded-fleet path. Every updater before release control pulls
+        the branch tip, promotes this file plus common/, and re-execs with
+        version.txt still naming the OLD commit. Re-deciding here would read
+        that stale file, decide the player is already where it belongs, and
+        abandon the update -- forever, since every later boot repeats it."""
+        checked_out = 'c' * 40
+
+        def run(cmd, cwd=None, timeout=120):
+            if cmd == ['git', 'rev-parse', 'HEAD']:
+                return (True, checked_out + '\n', '')
+            raise AssertionError(f'must not reach {cmd[:3]} while finishing an in-flight update')
+
+        with mock.patch.dict(ju.os.environ, {ju.REEXEC_ENV_VAR: '1'}), \
+             mock.patch.object(ju, 'run_command', side_effect=run), \
+             mock.patch.object(ju, '_lookup_update_target',
+                               side_effect=AssertionError('must not ask the backend mid-flight')), \
+             mock.patch.object(ju, '_sweep_git_residue',
+                               side_effect=AssertionError('must not re-fetch mid-flight')):
+            self.assertEqual(ju.get_latest_version('main'), checked_out)
+
+    def test_a_normal_run_is_unaffected_by_the_absent_reexec_flag(self):
+        env = {k: v for k, v in ju.os.environ.items() if k != ju.REEXEC_ENV_VAR}
+        with mock.patch.dict(ju.os.environ, env, clear=True):
+            self.assertEqual(
+                self._resolve({'targetCommit': 't' * 40, 'hold': False, 'eligible': True}),
+                't' * 40)
+
+    def test_an_unreadable_head_mid_flight_falls_back_to_a_normal_decision(self):
+        """Never strand the player because one git call failed."""
+        def run(cmd, cwd=None, timeout=120):
+            if cmd == ['git', 'rev-parse', 'HEAD']:
+                return (False, '', 'fatal: not a git repository')
+            if cmd[:2] == ['git', 'fetch']:
+                return (True, '', '')
+            if cmd[:2] == ['git', 'rev-parse']:
+                return (True, self.HEAD + '\n', '')
+            return (True, '', '')
+        with mock.patch.dict(ju.os.environ, {ju.REEXEC_ENV_VAR: '1'}), \
+             mock.patch.object(ju, 'run_command', side_effect=run), \
+             mock.patch.object(ju, '_sweep_git_residue'), \
+             mock.patch.object(ju, 'retry_with_backoff', side_effect=lambda fn, name, **kw: fn()), \
+             mock.patch.object(ju, '_fetch_update_target', return_value=None), \
+             mock.patch.object(ju, 'read_cached_target', return_value=None), \
+             mock.patch.object(ju, 'write_cached_target', return_value=True), \
+             mock.patch.object(ju, 'get_current_version', return_value=None), \
+             mock.patch('common.credentials.get_device_uuid', return_value='u'), \
+             mock.patch.object(ju, 'report_error'):
+            self.assertIsNone(ju.get_latest_version('main'), 'no answer, no cache -> stay put')
+
     def test_lowering_the_knob_does_not_move_a_device_that_already_took_the_target(self):
         """The scary path: eligiblePercent lowered, and devices that already
         installed the new release get pulled back to stable. They must not."""
