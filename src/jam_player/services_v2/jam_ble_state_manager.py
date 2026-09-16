@@ -756,17 +756,25 @@ class BLEStateManager:
         import subprocess
 
         logger.info("Restarting post-connectivity services...")
+        # --no-block: several of these are ordered After=jam-update.service,
+        # and jam-update (Type=oneshot) is usually RUNNING right now -- the
+        # first-connect trigger just started it. systemd will not run their
+        # restart jobs until it exits, so a blocking restart sat out its full
+        # 15 s timeout per service (75 s with this loop frozen, against a
+        # 90 s watchdog) and logged "Timeout restarting" for each. Queuing the
+        # jobs has the same effect without the stall: they run the moment
+        # systemd allows.
 
         for service in POST_CONNECTIVITY_SERVICES:
             try:
                 result = subprocess.run(
-                    ['systemctl', 'restart', service],
+                    ['systemctl', 'restart', '--no-block', service],
                     capture_output=True,
                     text=True,
                     timeout=15
                 )
                 if result.returncode == 0:
-                    logger.info(f"Restarted {service}")
+                    logger.info(f"Restart queued: {service}")
                 else:
                     # Not an error - service might not be needed yet
                     # (e.g., jam-announce if already announced)
@@ -855,15 +863,20 @@ class BLEStateManager:
                 "triggering jam-update.service so warehouse devices catch "
                 "up to their release target before setup"
             )
+            # --no-block: jam-update is Type=oneshot and a real update runs
+            # for minutes, so a blocking start always hit the timeout here --
+            # freezing this GLib main loop (and every BLE D-Bus callback) for
+            # 10 s, then logging a spurious "timed out" warning on every
+            # first-connect update. Queue the job and move on.
             try:
                 result = subprocess.run(
-                    ['systemctl', 'start', 'jam-update.service'],
+                    ['systemctl', 'start', '--no-block', 'jam-update.service'],
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
                 if result.returncode == 0:
-                    logger.info("jam-update.service start triggered")
+                    logger.info("jam-update.service start queued")
                 else:
                     logger.warning(
                         f"systemctl start jam-update returned non-zero: "

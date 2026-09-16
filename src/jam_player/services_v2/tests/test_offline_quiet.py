@@ -21,10 +21,15 @@ from common import network  # noqa: E402
 
 
 class DeviceIsOfflineTests(unittest.TestCase):
-    """The flag is a cache; these tests pin BOTH ways it can be unknown."""
+    """The flag is a cache; these tests pin every way its answer can be unknown,
+    and the one way it must NOT be: a manager that never stamped (the fielded
+    7440d2d build, still running through a mid-setup update) is trusted."""
+
+    def _state(self, value):
+        return mock.patch.object(network, 'connectivity_state', return_value=value)
 
     def _fresh(self):
-        return mock.patch.object(network, 'connectivity_state_is_fresh', return_value=True)
+        return self._state(network.CONNECTIVITY_STATE_FRESH)
 
     def test_is_internet_verified_fails_in_the_direction_the_caller_chooses(self):
         flag = mock.MagicMock()
@@ -53,30 +58,54 @@ class DeviceIsOfflineTests(unittest.TestCase):
             self.assertFalse(network.device_is_offline())
 
     def test_a_dead_state_manager_makes_the_answer_unknown_not_stale(self):
-        """The flag says 'absent' but nobody has maintained it for a while:
-        the gates must run (fail open) and the display/BLE must say offline."""
+        """The flag says 'absent' but the manager that stamped once has not for
+        a while: the gates must run (fail open) and the display/BLE must say
+        offline."""
         flag = mock.MagicMock()
         flag.exists.return_value = False
-        with mock.patch.object(network, 'connectivity_state_is_fresh', return_value=False), \
+        with self._state(network.CONNECTIVITY_STATE_STALE), \
              mock.patch.object(network, 'INTERNET_VERIFIED_FLAG', flag):
             self.assertFalse(network.device_is_offline(), 'a frozen flag must not disable a service')
             self.assertFalse(network.is_internet_verified())
             flag.exists.assert_not_called()  # the flag is not even consulted when unknown
 
-    def test_freshness_is_the_stamp_age(self):
+    def test_a_manager_that_never_stamped_is_trusted_like_7440d2d(self):
+        """No stamp at all is the fielded 7440d2d manager (it predates the
+        stamp), which keeps running through a player's first update whenever a
+        phone is mid-setup. Its flag is the truth: answering 'unknown' put an
+        online, registered player back on the setup screen until its next boot."""
+        flag = mock.MagicMock()
+        for present in (True, False):
+            flag.exists.return_value = present
+            with self._state(network.CONNECTIVITY_STATE_ABSENT), \
+                 mock.patch.object(network, 'INTERNET_VERIFIED_FLAG', flag):
+                self.assertEqual(network.is_internet_verified(), present)
+                self.assertEqual(network.is_internet_verified(unreadable_means=True), present)
+                self.assertEqual(network.device_is_offline(), not present)
+
+    def test_state_is_the_stamp_age(self):
         stamp = mock.MagicMock()
         stamp.stat.return_value = mock.MagicMock(st_mtime=1_000_000.0)
         with mock.patch.object(network, 'STATE_MANAGER_ALIVE_FLAG', stamp):
             with mock.patch.object(network.time, 'time', return_value=1_000_030.0):
+                self.assertEqual(network.connectivity_state(), network.CONNECTIVITY_STATE_FRESH)
                 self.assertTrue(network.connectivity_state_is_fresh())
             with mock.patch.object(network.time, 'time', return_value=1_000_000.0 + network.CONNECTIVITY_STATE_MAX_AGE_SECONDS + 1):
+                self.assertEqual(network.connectivity_state(), network.CONNECTIVITY_STATE_STALE)
                 self.assertFalse(network.connectivity_state_is_fresh())
 
-    def test_never_stamped_this_boot_is_not_fresh(self):
+    def test_never_stamped_this_boot_is_absent_not_stale(self):
         stamp = mock.MagicMock()
         stamp.stat.side_effect = FileNotFoundError()
         with mock.patch.object(network, 'STATE_MANAGER_ALIVE_FLAG', stamp):
+            self.assertEqual(network.connectivity_state(), network.CONNECTIVITY_STATE_ABSENT)
             self.assertFalse(network.connectivity_state_is_fresh())
+
+    def test_an_unreadable_stamp_is_stale(self):
+        stamp = mock.MagicMock()
+        stamp.stat.side_effect = OSError('EIO')
+        with mock.patch.object(network, 'STATE_MANAGER_ALIVE_FLAG', stamp):
+            self.assertEqual(network.connectivity_state(), network.CONNECTIVITY_STATE_STALE)
 
 
 class OneshotOfflineGateTests(unittest.TestCase):

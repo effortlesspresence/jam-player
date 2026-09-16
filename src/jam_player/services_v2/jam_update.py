@@ -40,6 +40,7 @@ from common.api import report_error as api_report_error, ErrorSeverity, SystemSe
 from common.paths import (
     ENVIRONMENT_FILE, DEVICE_UUID_FILE, BLE_SESSION_ACTIVE_FLAG, safe_copy,
     UPDATER_ATTEMPTS_FILE, UPDATER_RECOVERED_FLAG, UPDATER_LKG_DIR, UPDATER_STAGING_DIR,
+    FIRST_CONNECT_UPDATE_FLAG,
 )
 from common.update_target import (
     commits_match, decide_update, read_cached_target, write_cached_target,
@@ -1416,6 +1417,25 @@ def hide_updating_screen():
         logger.warning(f"Could not remove update-in-progress flag: {e}")
 
 
+def refresh_updating_screen_flag():
+    """Re-stamp the update-in-progress flag's mtime.
+
+    jam-player-display stops deferring to our screen once the flag is older
+    than its UPDATE_FLAG_MAX_AGE_SEC (5 min). That clock starts when
+    show_updating_screen() creates the flag, so an install that runs long
+    (dependencies on a poor connection) outlives it -- and the display we then
+    restart would treat the flag as stale, put up the boot identity screen and
+    a possibly wrong state screen while we are still finishing. Re-stamping
+    right before the restarts gives the fresh display a full budget for the
+    few seconds until hide_updating_screen(). No-op when there is no flag.
+    """
+    try:
+        if UPDATE_IN_PROGRESS_FLAG.exists():
+            UPDATE_IN_PROGRESS_FLAG.touch()
+    except Exception as e:
+        logger.debug(f"Could not refresh the update-in-progress flag: {e}")
+
+
 # =============================================================================
 # Installation Functions
 # =============================================================================
@@ -2079,11 +2099,8 @@ def install_wifi_stability_configs():
 _DBUS_POLICY_DEST = Path('/etc/dbus-1/system.d/jam-ble-provisioning.conf')
 _BLUEZ_MAIN_CONF_DEST = Path('/etc/bluetooth/main.conf')
 
-# How long a live BLE setup session may hold off the BLE/bluetoothd restarts.
-# Registration is a BLE write that lands 30 s-3 min after WiFi connects; five
-# minutes covers a slow customer without holding the update hostage.
-BLE_SESSION_RESTART_WAIT_SEC = 5 * 60
-_BLE_SESSION_FLAG_MAX_AGE_SEC = 5 * 60   # mirrors jam_ble_state_manager
+# A BLE session flag older than this is stale (mirrors jam_ble_state_manager).
+_BLE_SESSION_FLAG_MAX_AGE_SEC = 5 * 60
 
 
 def _install_if_changed(src: Path, dest: Path, label: str) -> bool:
@@ -2167,20 +2184,23 @@ def _ble_session_active() -> bool:
     return _ble_central_connected()
 
 
-def _wait_for_ble_session_to_end(max_wait: float = BLE_SESSION_RESTART_WAIT_SEC) -> bool:
-    """Poll until no BLE setup session is active. True if clear, False if still
-    active when the budget runs out."""
-    if not _ble_session_active():
-        return True
-    logger.info(f"  A BLE setup session is in progress; deferring BLE restarts up to {int(max_wait)}s")
-    waited = 0.0
-    while waited < max_wait:
-        time.sleep(5)
-        waited += 5
-        if not _ble_session_active():
-            logger.info(f"  BLE setup session ended after {int(waited)}s; proceeding")
-            return True
-    return False
+def _mark_first_connect_update_fired() -> None:
+    """Record that an update was installed this boot (marker in /run).
+
+    jam-ble-state-manager fires `systemctl start jam-update` once per boot when
+    an unregistered device first gets internet, and reads this marker to know
+    it already happened. The updater sets it too, right before that service
+    may be restarted onto new code: a fresh manager process must not count
+    the boot as untriggered just because it was not the process that did the
+    triggering. Fielded 7440d2d managers only ever kept an in-process flag, so
+    without this the first update onto new code fired the updater once more.
+    """
+    try:
+        FIRST_CONNECT_UPDATE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        FIRST_CONNECT_UPDATE_FLAG.touch()
+    except Exception as e:
+        logger.debug(f"Could not mark the first-connect update fired: {e}")
+
 
 def install_lightdm_cursor_config():
     """
@@ -2731,17 +2751,38 @@ def restart_services(bluetooth_conf_changed: bool = False):
     process to hang on every one of them -- but the display service is
     special because it owns the screen.
 
+    Two groups, in this order:
+
+      1. Everything that is not Bluetooth -- restarted immediately.
+      2. bluetoothd (only when main.conf changed) and the two BLE units --
+         restarted only if no BLE setup session is live at that moment;
+         otherwise left on their current code until the next boot.
+
+    The BLE check is a decision, not a wait. An earlier version waited up
+    to five minutes for the session to end before restarting ANYTHING, and
+    that one wait produced three customer-visible faults on the bench:
+    every other service (heartbeat, tailscale, display) sat on old code for
+    the whole wait; jam-player-display's own stale-flag budget is also five
+    minutes, so mid-wait it stopped deferring to the "updating" screen and
+    the two fought over the display; and because this unit is Type=oneshot,
+    anything ordered After=jam-update.service (jam-tailscale) cannot even
+    START a queued restart until this process exits, so a wait placed after
+    the restarts would have held those units down instead. The BLE units
+    picking up new code one boot later is by far the cheaper outcome.
+
     After triggering all restarts, we verify services are starting correctly.
     """
     logger.info("Restarting JAM services...")
 
+    # The display we are about to restart must keep deferring to our screen
+    # until hide_updating_screen(), however long the install took.
+    refresh_updating_screen_flag()
+
     # Services to restart - ordered by dependency (independent ones first).
     # jam-player-display.service is in this list but gets special treatment
-    # (synchronous restart) inside the loop.
+    # (synchronous restart) inside _restart_one.
     services_to_restart = [
         'jam-content-manager.service',    # Type=simple, starts fast
-        'jam-ble-provisioning.service',   # Type=notify, BLE provisioning (must restart after BLE config)
-        'jam-ble-state-manager.service',  # Type=notify, but sends READY=1 early
         'jam-player-display.service',     # Type=notify, sends READY=1 early -- SYNCHRONOUS RESTART (see above)
         'jam-health-monitor.service',     # Type=notify, sends READY=1 early
         'jam-heartbeat.service',          # Type=notify, sends READY=1 early (has ConditionPath)
@@ -2759,34 +2800,13 @@ def restart_services(bluetooth_conf_changed: bool = False):
         # backend. Skipping the systemctl-restart of the reporter avoids
         # a redundant POST.
     ]
+    # Restarted last, and only when no setup session is live (see below).
+    ble_units = [
+        'jam-ble-provisioning.service',   # Type=notify, BLE provisioning (must restart after BLE config)
+        'jam-ble-state-manager.service',  # Type=notify, but sends READY=1 early
+    ]
 
-    # Never tear down a live BLE setup session. The first-connect auto-update
-    # starts seconds after the customer joins WiFi from the app and reached this
-    # point right as they were registering (a BLE write); restarting bluetoothd
-    # (jam-ble-provisioning is PartOf= it) or the BLE units dropped their link
-    # and looked like a broken device. Wait for the session to end; if it does
-    # not within the budget, leave the BLE units and bluetoothd on their current
-    # code -- they pick up the new code at the next boot, and the state manager
-    # re-asserts BLE on its own tick regardless.
-    ble_units = {'jam-ble-provisioning.service', 'jam-ble-state-manager.service'}
-    if not _wait_for_ble_session_to_end():
-        logger.warning(
-            f"  BLE setup session still active after {BLE_SESSION_RESTART_WAIT_SEC}s; "
-            f"leaving BLE units (and bluetoothd) untouched until next boot"
-        )
-        services_to_restart = [svc for svc in services_to_restart if svc not in ble_units]
-        bluetooth_conf_changed = False
-    if bluetooth_conf_changed:
-        # PartOf= means this also restarts jam-ble-provisioning; the loop below
-        # restarting it again is harmless.
-        success, _, stderr = run_command(['systemctl', 'restart', 'bluetooth'], timeout=30)
-        if success:
-            logger.info("  Restarted bluetooth service to apply new main.conf")
-        else:
-            logger.warning(f"  Failed to restart bluetooth: {stderr}")
-
-    logger.info("  Triggering service restarts...")
-    for service in services_to_restart:
+    def _restart_one(service: str) -> None:
         if service == _SYNCHRONOUS_RESTART_SERVICE:
             # Synchronous (blocking) restart with explicit timeout cap.
             # systemctl blocks until the service reports active (or fails);
@@ -2812,20 +2832,52 @@ def restart_services(bluetooth_conf_changed: bool = False):
                     f"{(stderr or '').strip()[:200]}. Proceeding with "
                     f"rest of update; systemd will continue retrying."
                 )
+            return
+        # Async restart: just hand it to systemd and move on.
+        success, _, stderr = run_command(
+            ['systemctl', 'restart', '--no-block', service],
+            timeout=10,
+        )
+        if success:
+            logger.info(f"    Triggered restart: {service}")
         else:
-            # Async restart: just hand it to systemd and move on.
-            success, _, stderr = run_command(
-                ['systemctl', 'restart', '--no-block', service],
-                timeout=10,
+            # Log warning but continue - the service might just not be enabled
+            logger.warning(
+                f"    Failed to trigger restart for {service}: "
+                f"{stderr[:100] if stderr else 'unknown'}"
             )
+
+    logger.info("  Triggering service restarts...")
+    for service in services_to_restart:
+        _restart_one(service)
+
+    # An update has been installed this boot, so the first-connect auto-update
+    # has done its job -- record that before the state manager can be
+    # restarted onto code that reads the marker (see the helper).
+    _mark_first_connect_update_fired()
+
+    # Never tear down a live BLE setup session. The first-connect auto-update
+    # starts seconds after the customer joins WiFi from the app and reached this
+    # point right as they were registering (a BLE write); restarting bluetoothd
+    # (jam-ble-provisioning is PartOf= it) or the BLE units dropped their link
+    # and looked like a broken device. The state manager re-asserts BLE on its
+    # own tick regardless, and both units pick up the new code at the next boot.
+    if _ble_session_active():
+        logger.warning(
+            "  BLE setup session in progress; leaving BLE units (and bluetoothd) "
+            "on their current code until the next boot"
+        )
+    else:
+        if bluetooth_conf_changed:
+            # PartOf= means this also restarts jam-ble-provisioning; restarting
+            # it again just below is harmless.
+            success, _, stderr = run_command(['systemctl', 'restart', 'bluetooth'], timeout=30)
             if success:
-                logger.info(f"    Triggered restart: {service}")
+                logger.info("  Restarted bluetooth service to apply new main.conf")
             else:
-                # Log warning but continue - the service might just not be enabled
-                logger.warning(
-                    f"    Failed to trigger restart for {service}: "
-                    f"{stderr[:100] if stderr else 'unknown'}"
-                )
+                logger.warning(f"  Failed to restart bluetooth: {stderr}")
+        for service in ble_units:
+            _restart_one(service)
 
     # Give services a moment to start
     logger.info("  Waiting for services to initialize...")

@@ -1,14 +1,21 @@
 """
-jam-update must never tear down a live BLE setup session.
+jam-update must never tear down a live BLE setup session -- and must never
+make the rest of the player wait for one.
 
 The first-connect auto-update starts seconds after the customer joins WiFi
 from the app, and its unconditional `systemctl restart bluetooth` (the BLE unit
 is PartOf= it) plus the BLE unit restarts landed right as they were registering
 -- a BLE write 30 s-3 min later -- dropping the link so the device looked
 broken. Now: BLE configs are installed only when their bytes differ (and
-atomically), bluetoothd is restarted only when main.conf changed, and both wait
-for any session to end (bounded) before touching BLE. Runs on a JAM Player
-(jam_update imports the device venv); systemctl/busctl are mocked.
+atomically); every non-Bluetooth service is restarted first, immediately; then
+bluetoothd (only when main.conf changed) and the two BLE units are restarted
+only if no session is live at that moment, otherwise left alone until the next
+boot. There is deliberately no waiting: the earlier five-minute wait held every
+other restart, outlived jam-player-display's stale-flag budget, and (jam-update
+being Type=oneshot) would have pinned any unit ordered After= it.
+
+Runs on a JAM Player (jam_update imports the device venv); systemctl/busctl
+are mocked.
 """
 import json
 import os
@@ -65,25 +72,6 @@ class SessionDetectionTests(unittest.TestCase):
             self.assertFalse(jam_update._ble_session_active())
 
 
-class WaitForSessionTests(unittest.TestCase):
-
-    def test_no_session_returns_immediately(self):
-        with mock.patch.object(jam_update, '_ble_session_active', return_value=False), \
-             mock.patch.object(jam_update.time, 'sleep') as slept:
-            self.assertTrue(jam_update._wait_for_ble_session_to_end())
-        slept.assert_not_called()
-
-    def test_session_that_ends_is_waited_for(self):
-        states = iter([True, True, False])
-        with mock.patch.object(jam_update, '_ble_session_active', side_effect=lambda: next(states)), \
-             mock.patch.object(jam_update.time, 'sleep'):
-            self.assertTrue(jam_update._wait_for_ble_session_to_end(max_wait=60))
-
-    def test_session_that_never_ends_gives_up_after_budget(self):
-        with mock.patch.object(jam_update, '_ble_session_active', return_value=True), \
-             mock.patch.object(jam_update.time, 'sleep'):
-            self.assertFalse(jam_update._wait_for_ble_session_to_end(max_wait=20))
-
 
 class InstallOnlyWhenChangedTests(unittest.TestCase):
 
@@ -126,36 +114,103 @@ class InstallOnlyWhenChangedTests(unittest.TestCase):
 
 
 class RestartGuardTests(unittest.TestCase):
+    NON_BLE = ('jam-player-display.service', 'jam-heartbeat.service', 'jam-tailscale.service',
+               'jam-content-manager.service')
+    BLE = ('jam-ble-provisioning.service', 'jam-ble-state-manager.service')
+    SESSION_CHECK = '<ble-session-check>'
 
-    def _restart(self, session_clears, bluetooth_changed):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.marker = root / 'run' / 'jam' / 'first_connect_update_triggered'
+        self.update_flag = root / 'run' / 'jam-update-in-progress'
+        for name, value in (('FIRST_CONNECT_UPDATE_FLAG', self.marker),
+                            ('UPDATE_IN_PROGRESS_FLAG', self.update_flag)):
+            patcher = mock.patch.object(jam_update, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _restart(self, session_active, bluetooth_changed):
+        """Run restart_services; return every systemctl call in order, with a
+        marker where the BLE session was consulted."""
         calls = []
         def run(cmd, *a, **k):
             calls.append(list(cmd)); return (True, 'active', '')
-        with mock.patch.object(jam_update, '_wait_for_ble_session_to_end', return_value=session_clears), \
+        def session():
+            calls.append([self.SESSION_CHECK]); return session_active
+        with mock.patch.object(jam_update, '_ble_session_active', side_effect=session), \
              mock.patch.object(jam_update, 'run_command', side_effect=run), \
-             mock.patch.object(jam_update.time, 'sleep'):
+             mock.patch.object(jam_update.time, 'sleep') as slept:
             jam_update.restart_services(bluetooth_conf_changed=bluetooth_changed)
+        self.slept = slept
         return calls
 
-    def _restarted(self, calls):
-        return [c[2] for c in calls if c[:2] == ['systemctl', 'restart']]
+    @staticmethod
+    def _restarted(calls):
+        return [c[-1] for c in calls if c[:2] == ['systemctl', 'restart']]
 
     def test_active_session_skips_ble_units_and_bluetoothd(self):
-        restarted = self._restarted(self._restart(session_clears=False, bluetooth_changed=True))
+        restarted = self._restarted(self._restart(session_active=True, bluetooth_changed=True))
         self.assertNotIn('bluetooth', restarted)
-        self.assertNotIn('jam-ble-provisioning.service', restarted)
-        self.assertNotIn('jam-ble-state-manager.service', restarted)
-        self.assertTrue(any(s.startswith('jam-') for s in restarted), 'other services still restart')
+        for unit in self.BLE:
+            self.assertNotIn(unit, restarted)
+        for unit in self.NON_BLE:
+            self.assertIn(unit, restarted, 'every other service still restarts')
 
     def test_clear_session_with_changed_conf_restarts_bluetoothd_once(self):
-        restarted = self._restarted(self._restart(session_clears=True, bluetooth_changed=True))
+        restarted = self._restarted(self._restart(session_active=False, bluetooth_changed=True))
         self.assertEqual(restarted.count('bluetooth'), 1)
-        self.assertIn('jam-ble-provisioning.service', restarted)
+        for unit in self.BLE:
+            self.assertIn(unit, restarted)
 
     def test_unchanged_conf_never_restarts_bluetoothd(self):
-        restarted = self._restarted(self._restart(session_clears=True, bluetooth_changed=False))
+        restarted = self._restarted(self._restart(session_active=False, bluetooth_changed=False))
         self.assertNotIn('bluetooth', restarted)
+        for unit in self.BLE:
+            self.assertIn(unit, restarted)
 
+    def test_every_other_service_restarts_before_the_session_is_consulted(self):
+        """The bench fault: heartbeat, tailscale and the display sat on old code
+        for five minutes because the BLE decision came first."""
+        calls = self._restart(session_active=False, bluetooth_changed=True)
+        check_at = calls.index([self.SESSION_CHECK])
+        for i, cmd in enumerate(calls):
+            if cmd[:2] != ['systemctl', 'restart']:
+                continue
+            unit = cmd[-1]
+            if unit in self.BLE or unit == 'bluetooth':
+                self.assertGreater(i, check_at, f'{unit} must be decided by the session check')
+            else:
+                self.assertLess(i, check_at, f'{unit} must restart before the BLE decision')
+
+    def test_a_live_session_is_decided_once_and_never_waited_for(self):
+        calls = self._restart(session_active=True, bluetooth_changed=True)
+        self.assertEqual(calls.count([self.SESSION_CHECK]), 1, 'no polling')
+        # The only sleep left is the 5 s settle before verifying service status.
+        self.assertTrue(all(c.args[0] <= 5 for c in self.slept.call_args_list),
+                        f'unexpected wait: {self.slept.call_args_list}')
+
+    def test_first_connect_marker_is_set_whether_or_not_ble_units_restart(self):
+        self._restart(session_active=True, bluetooth_changed=False)
+        self.assertTrue(self.marker.exists(), 'marker set even when the state manager is left alone')
+        self.marker.unlink()
+        self._restart(session_active=False, bluetooth_changed=False)
+        self.assertTrue(self.marker.exists(), 'marker set before the state manager restarts onto new code')
+
+    def test_updating_flag_is_refreshed_before_the_display_restarts(self):
+        """A long install must not leave the freshly restarted display thinking
+        the updater's screen is stale."""
+        self.update_flag.parent.mkdir(parents=True)
+        self.update_flag.touch()
+        stale = time.time() - 15 * 60
+        os.utime(self.update_flag, (stale, stale))
+        self._restart(session_active=False, bluetooth_changed=False)
+        self.assertGreater(self.update_flag.stat().st_mtime, stale + 60, 'flag mtime not refreshed')
+
+    def test_no_updating_flag_is_not_created_by_the_refresh(self):
+        self._restart(session_active=False, bluetooth_changed=False)
+        self.assertFalse(self.update_flag.exists(), 'refresh must never create the flag')
 
 if __name__ == '__main__':
     unittest.main()

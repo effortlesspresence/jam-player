@@ -1440,15 +1440,37 @@ def api_recently_ok(max_age: float = API_HEALTH_MAX_AGE_SECONDS) -> Optional[boo
 CONNECTIVITY_STATE_MAX_AGE_SECONDS = 60
 
 
-def connectivity_state_is_fresh(max_age: float = CONNECTIVITY_STATE_MAX_AGE_SECONDS) -> bool:
-    """True while jam-ble-state-manager has stamped its liveness within max_age."""
+CONNECTIVITY_STATE_FRESH = 'fresh'
+CONNECTIVITY_STATE_STALE = 'stale'
+CONNECTIVITY_STATE_ABSENT = 'absent'
+
+
+def connectivity_state(max_age: float = CONNECTIVITY_STATE_MAX_AGE_SECONDS) -> str:
+    """
+    Is anyone maintaining the .internet_verified flag right now?
+
+      'fresh'  -- jam-ble-state-manager stamped its liveness within max_age.
+      'stale'  -- it stamped once but not recently (died or wedged), or the
+                  stamp cannot be read. The flag may be frozen.
+      'absent' -- never stamped this boot. Either the manager has not started
+                  yet, or the manager running is the fielded 7440d2d build,
+                  which predates the stamp entirely. That build keeps running
+                  right through a player's first update whenever a phone is
+                  mid-setup (the updater leaves the BLE units alone then), and
+                  it maintains the flag perfectly well -- it just never says so.
+    """
     try:
         age = time.time() - STATE_MANAGER_ALIVE_FLAG.stat().st_mtime
-        return age <= max_age
     except FileNotFoundError:
-        return False  # never stamped this boot (manager not up yet, or not running)
+        return CONNECTIVITY_STATE_ABSENT
     except Exception:
-        return False
+        return CONNECTIVITY_STATE_STALE
+    return CONNECTIVITY_STATE_FRESH if age <= max_age else CONNECTIVITY_STATE_STALE
+
+
+def connectivity_state_is_fresh(max_age: float = CONNECTIVITY_STATE_MAX_AGE_SECONDS) -> bool:
+    """True while jam-ble-state-manager has stamped its liveness within max_age."""
+    return connectivity_state(max_age) == CONNECTIVITY_STATE_FRESH
 
 
 def is_internet_verified(unreadable_means: bool = False) -> bool:
@@ -1471,8 +1493,10 @@ def is_internet_verified(unreadable_means: bool = False) -> bool:
 
     THE FLAG CAN ALSO BE FROZEN. It is maintained by one process; if that
     process dies or wedges, the flag stops changing. The manager therefore
-    stamps its liveness every tick, and a stale stamp makes the answer
-    "unknown" here rather than a confident stale value.
+    stamps its liveness every tick, and a STALE stamp makes the answer
+    "unknown" here rather than a confident stale value. No stamp at all is
+    different: see connectivity_state() -- that is the fielded 7440d2d
+    manager, whose flag is trusted as it always was.
 
     Args:
         unreadable_means: the answer for "unknown" -- the flag cannot be read
@@ -1482,9 +1506,18 @@ def is_internet_verified(unreadable_means: bool = False) -> bool:
             WiFi setup); the oneshot gates treat unknown as online so a dead
             manager can never silently disable a service. Default False.
     """
-    if not connectivity_state_is_fresh():
+    state = connectivity_state()
+    if state == CONNECTIVITY_STATE_STALE:
         logger.debug("Connectivity state not being maintained (state manager stamp stale); answering 'unknown'")
         return unreadable_means
+    # 'absent' falls through to the flag on purpose. A manager that started
+    # and then died leaves a STALE stamp, so the frozen-flag protection above
+    # still holds; no stamp at all is what the fielded 7440d2d manager looks
+    # like, and it keeps running through the first update whenever a phone is
+    # mid-setup. Treating that as "unknown" put a fully online, registered
+    # player back on the "Set up your JAM Player" screen until its next boot
+    # (bench, 2026-09-16). The flag that manager maintains is the truth, and
+    # trusting it is exactly what 7440d2d itself did.
     try:
         return INTERNET_VERIFIED_FLAG.exists()
     except Exception as e:

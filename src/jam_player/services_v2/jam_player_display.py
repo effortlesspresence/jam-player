@@ -410,6 +410,21 @@ FONT_SIZE_URL = 28
 FONT_SIZE_DEVICE_ID = 24
 FONT_SIZE_TAGLINE = 42
 
+# Identity block geometry (1080p reference values; everything goes through
+# _scaled). The block is drawn bottom-up from IDENTITY_BOTTOM_OFFSET above the
+# bottom edge: the muted lines IDENTITY_MUTED_LEADING line-heights apart, the
+# two prominent lines IDENTITY_BIG_LEADING apart. It grew by two MAC lines in
+# 2026-09 and collided with the setup screen's tagline, because the screens laid
+# themselves out top-down with fixed gaps and assumed the block's height. They
+# now lay out against _identity_block_top() and keep IDENTITY_CLEARANCE above
+# it; the two QR screens shrink their code to fit, never below QR_MIN_SIZE.
+IDENTITY_BOTTOM_OFFSET = 42
+IDENTITY_MUTED_LEADING = 1.35
+IDENTITY_BIG_LEADING = 1.5
+IDENTITY_BIG_SEPARATION = 0.2
+IDENTITY_CLEARANCE = 20
+QR_MIN_SIZE = 160
+
 # Reference display height that the FONT_SIZE_* constants are calibrated to.
 # All scaling is linear vs this baseline -- a 4K screen (2160px) renders
 # everything at 2x, a 720p screen (720px) renders at 0.67x, etc.
@@ -567,7 +582,12 @@ def get_font(size: int, bold: bool = True):
     for path in font_paths:
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+    # No TrueType face on this system. Pillow >= 10.1 can still size its
+    # built-in face; older Pillow only has the fixed ~10 px bitmap font.
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 # The device's permanent MACs are an immutable hardware fact, read at most
@@ -590,6 +610,62 @@ def _get_display_macs() -> Dict[str, Optional[str]]:
     return macs
 
 
+def _identity_block_geometry(height: int, n_muted: int) -> dict:
+    """
+    Pixel geometry of the identity block for a display `height` px tall with
+    `n_muted` small lines (the UUID plus 0-2 MAC lines).
+
+    Shared by _draw_device_identity (which draws it) and _identity_block_top
+    (which the screens lay out against), so the two can never disagree.
+    Returns the "mm"-anchored y of each line, top to bottom, and `top`: the
+    pixel row the block's highest glyphs reach.
+    """
+    big_px = _scaled(FONT_SIZE_URL, height)
+    small_px = _scaled(FONT_SIZE_DEVICE_ID, height)
+    y = height - _scaled(IDENTITY_BOTTOM_OFFSET, height)
+    muted_ys = []
+    for _ in range(n_muted):
+        muted_ys.append(y)
+        y -= int(small_px * IDENTITY_MUTED_LEADING)
+    y -= int(big_px * IDENTITY_BIG_SEPARATION)
+    setup_y = y
+    y -= int(big_px * IDENTITY_BIG_LEADING)
+    id_y = y
+    # "mm"-anchored text reaches about 0.6 of the font size above its centre.
+    return {
+        'muted_ys': list(reversed(muted_ys)),
+        'setup_y': setup_y,
+        'id_y': id_y,
+        'top': id_y - int(big_px * 0.6),
+    }
+
+
+def _identity_block_top(height: int, device_uuid) -> int:
+    """
+    The pixel row a screen's own content must stay above: the top of the
+    identity block _draw_device_identity will draw for this device, or the
+    bottom margin when there is no UUID and nothing will be drawn.
+    """
+    if not device_identity_lines(device_uuid):
+        return height - _scaled(IDENTITY_BOTTOM_OFFSET, height)
+    macs = _get_display_macs()
+    n_muted = 1 + len(mac_identity_lines(macs.get('wifiMac'), macs.get('ethernetMac')))
+    return _identity_block_geometry(height, n_muted)['top']
+
+
+def _fit_qr_size(nominal: int, available: int, height: int, what: str) -> int:
+    """
+    The QR edge that fits in `available` vertical pixels: `nominal` when there
+    is room (every normal display), smaller when the identity block leaves
+    less, never below QR_MIN_SIZE -- a code that cannot be scanned is worse
+    than a tight layout on a display too short for this design to begin with.
+    """
+    size = max(_scaled(QR_MIN_SIZE, height), min(nominal, available))
+    if size < nominal:
+        logger.info(f"QR code reduced to {size}px (nominal {nominal}px) to clear the identity block on the {what}")
+    return size
+
+
 def _draw_device_identity(draw, width: int, height: int, device_uuid) -> bool:
     """
     The identity block at the bottom of every non-content screen.
@@ -608,6 +684,7 @@ def _draw_device_identity(draw, width: int, height: int, device_uuid) -> bool:
     service advertises, so the two can never disagree. The MAC lines let support
     tie a screen to the addresses the backend/dashboards report. Sits above the
     "v2" marker at height - 25; draws nothing when there is no UUID yet.
+    Screens must keep their own content above _identity_block_top().
 
     Returns whether this render is safe to CACHE. It is not when the device has
     a UUID but the MACs could not be read at all (NetworkManager not ready yet):
@@ -626,23 +703,17 @@ def _draw_device_identity(draw, width: int, height: int, device_uuid) -> bool:
     center_x = width // 2
     big = get_font(_scaled(FONT_SIZE_URL, height), bold=True)
     small = get_font(_scaled(FONT_SIZE_DEVICE_ID, height), bold=False)
-    big_px = _scaled(FONT_SIZE_URL, height)
-    small_px = _scaled(FONT_SIZE_DEVICE_ID, height)
 
     # Muted support block (small/secondary): the full UUID plus any MAC lines,
-    # stacked upward from just above the "v2" marker so it grows with the
-    # number of readable MACs without colliding with the corner text.
+    # with the two prominent lines above it. Every position comes from
+    # _identity_block_geometry, the same numbers the screens lay out against
+    # via _identity_block_top(), so the block can never grow into content.
     muted = [lines[2]] + mac_lines
-    y = height - 45
-    for text in reversed(muted):
+    geo = _identity_block_geometry(height, len(muted))
+    for text, y in zip(muted, geo['muted_ys']):
         draw.text((center_x, y), text, font=small, fill=SECONDARY_COLOR, anchor="mm")
-        y -= int(small_px * 1.5)
-
-    # Prominent lines above the muted block, with a little extra separation.
-    y -= int(big_px * 0.2)
-    draw.text((center_x, y), lines[1], font=big, fill=TEXT_COLOR, anchor="mm")
-    y -= int(big_px * 1.6)
-    draw.text((center_x, y), lines[0], font=big, fill=TEXT_COLOR, anchor="mm")
+    draw.text((center_x, geo['setup_y']), lines[1], font=big, fill=TEXT_COLOR, anchor="mm")
+    draw.text((center_x, geo['id_y']), lines[0], font=big, fill=TEXT_COLOR, anchor="mm")
     return cacheable
 
 
@@ -852,12 +923,17 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
     center_x = width // 2
 
     # Layout dimensions scale with display height. 1080p reference values:
-    # logo=120, qr=320. On 4K these become 240/640.
+    # logo=120, qr=320. On 4K these become 240/640. The gaps scale too --
+    # fixed-pixel gaps left this screen short of room on 720p and floating
+    # on 4K. Everything the screen draws itself ends above content_bottom;
+    # the identity block (_draw_device_identity) owns the rest.
     logo_height = _scaled(120, height)
-    qr_size = _scaled(320, height)
+    qr_nominal = _scaled(320, height)
+    border_padding = _scaled(8, height)
+    content_bottom = _identity_block_top(height, device_uuid) - _scaled(IDENTITY_CLEARANCE, height)
 
     # Start from top with some padding
-    y = int(height * 0.08)
+    y = _scaled(52, height)
 
     # Logo
     logo = load_and_scale_logo(logo_height)
@@ -865,10 +941,10 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         logo_x = center_x - logo.width // 2
         # Paste with alpha mask for transparency
         img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
-        y += logo.height + 30
+        y += logo.height + _scaled(24, height)
     else:
         # Fallback: draw a simple placeholder or skip
-        y += 40
+        y += _scaled(40, height)
 
     # "JAM Player" title with gradient-like orange
     title = "JAM Player"
@@ -880,7 +956,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), title, font=title_font)
-    y += bbox[3] + 40
+    y += bbox[3] + _scaled(30, height)
 
     # Instruction text
     instruction = "Set up your JAM Player with the JAM Player Setup App."
@@ -892,7 +968,7 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), instruction, font=instructions_font)
-    y += bbox[3] + 20
+    y += bbox[3] + _scaled(14, height)
 
     # "Scan the QR code to begin."
     scan_text = "Scan the QR code to begin."
@@ -904,29 +980,36 @@ def create_unregistered_screen(width: int, height: int, device_uuid: str = None)
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), scan_text, font=instructions_font)
-    y += bbox[3] + 40
+    y += bbox[3] + _scaled(30, height)
 
-    # QR Code with subtle border/glow effect
+    # QR code, sized to the room left above the tagline and the identity
+    # block -- full size on every normal display (see _fit_qr_size).
+    tagline = "Get ready to JAM."
+    tagline_height = draw.textbbox((0, 0), tagline, font=tagline_font)[3]
+    tagline_gap = _scaled(40, height)
+    qr_size = _fit_qr_size(
+        qr_nominal,
+        content_bottom - y - border_padding - tagline_gap - tagline_height,
+        height,
+        f"setup screen at {width}x{height}",
+    )
     qr_img = generate_qr_code(UNIVERSAL_SETUP_URL, qr_size)
     if qr_img:
         qr_x = center_x - qr_size // 2
         qr_y = y
 
         # Draw subtle orange border around QR code
-        border_padding = 8
-        border_color = JAM_ORANGE_PRIMARY
         draw.rectangle(
             [qr_x - border_padding, qr_y - border_padding,
              qr_x + qr_size + border_padding, qr_y + qr_size + border_padding],
-            outline=border_color,
-            width=3
+            outline=JAM_ORANGE_PRIMARY,
+            width=max(2, _scaled(3, height))
         )
 
         img.paste(qr_img, (qr_x, qr_y))
-        y += qr_size + 50
+        y += qr_size + border_padding + tagline_gap
 
     # "Get ready to JAM." tagline
-    tagline = "Get ready to JAM."
     draw.text(
         (center_x, y),
         tagline,
@@ -1199,20 +1282,23 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
 
     # Layout proportions mirror create_unregistered_screen so the user
     # doesn't experience a jarring layout shift when transitioning from
-    # AWAITING_NETWORK to AWAITING_REGISTRATION. Scaled to display height.
+    # AWAITING_NETWORK to AWAITING_REGISTRATION. Scaled to display height,
+    # gaps included, and laid out above the identity block like that screen.
     logo_height = _scaled(120, height)
-    qr_size = _scaled(320, height)
+    qr_nominal = _scaled(320, height)
+    border_padding = _scaled(8, height)
+    content_bottom = _identity_block_top(height, device_uuid) - _scaled(IDENTITY_CLEARANCE, height)
 
-    y = int(height * 0.08)
+    y = _scaled(52, height)
 
     # Logo
     logo = load_and_scale_logo(logo_height)
     if logo:
         logo_x = center_x - logo.width // 2
         img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
-        y += logo.height + 30
+        y += logo.height + _scaled(24, height)
     else:
-        y += 40
+        y += _scaled(40, height)
 
     # Primary heading: "Almost there."
     heading = "Almost there."
@@ -1224,7 +1310,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), heading, font=title_font)
-    y += bbox[3] + 20
+    y += bbox[3] + _scaled(20, height)
 
     # Status confirmation: explicitly reassure the user that the device
     # is online. AWAITING_REGISTRATION is only reached when
@@ -1241,7 +1327,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), line1, font=instructions_font)
-    y += bbox[3] + 12
+    y += bbox[3] + _scaled(12, height)
 
     line2 = "JAM Player Setup app on your phone."
     draw.text(
@@ -1252,7 +1338,7 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), line2, font=instructions_font)
-    y += bbox[3] + 30
+    y += bbox[3] + _scaled(30, height)
 
     # "Scan the QR code to begin."
     scan_text = "Scan the QR code to continue."
@@ -1264,20 +1350,26 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
         anchor="mt"
     )
     bbox = draw.textbbox((0, 0), scan_text, font=instructions_font)
-    y += bbox[3] + 30
+    y += bbox[3] + _scaled(30, height)
 
-    # QR Code pointing at the mobile-app setup landing page.
+    # QR Code pointing at the mobile-app setup landing page, sized to the
+    # room left above the identity block (full size on every normal display).
+    qr_size = _fit_qr_size(
+        qr_nominal,
+        content_bottom - y - border_padding,
+        height,
+        f"registration screen at {width}x{height}",
+    )
     qr_img = generate_qr_code(UNIVERSAL_SETUP_URL, qr_size)
     if qr_img:
         qr_x = center_x - qr_size // 2
         qr_y = y
 
-        border_padding = 8
         draw.rectangle(
             [qr_x - border_padding, qr_y - border_padding,
              qr_x + qr_size + border_padding, qr_y + qr_size + border_padding],
             outline=JAM_ORANGE_PRIMARY,
-            width=3
+            width=max(2, _scaled(3, height))
         )
         img.paste(qr_img, (qr_x, qr_y))
 

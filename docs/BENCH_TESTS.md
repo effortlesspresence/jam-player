@@ -122,7 +122,9 @@ stamp with `stat -c %y /run/jam/api_last_ok`.
 ### R7 — An update while a phone is mid-setup
 
 With a phone connected over BLE (on the Device Details / location step, *after*
-WiFi connected), trigger an update: `sudo systemctl start jam-update && journalctl -u jam-update -f`.
+WiFi connected), trigger an update: `sudo systemctl start jam-update`. INFO lines
+are not stored on the card, so watch service (re)start times instead:
+`for u in jam-update jam-player-display jam-heartbeat jam-tailscale jam-ble-state-manager bluetooth; do echo "$u $(systemctl show -p ExecMainStartTimestamp -p ActiveEnterTimestamp -p Result --value $u | tr '\n' ' ')"; done`.
 To exercise the bluetooth-restart branch, first make `main.conf` differ:
 `echo "# bench" | sudo tee -a /etc/bluetooth/main.conf`.
 
@@ -271,33 +273,70 @@ per attempt — event-driven, not periodic.
 
 ### E — Updater respects a live BLE session (audit #9)
 
+Rule since 2026-09-16: the updater restarts every non-Bluetooth service
+immediately, then decides ONCE whether a BLE setup session is live -- if it is,
+bluetoothd and both BLE units are left on their current code until the next
+boot. There is no waiting. (The earlier 5-minute wait held every other restart,
+outlived jam-player-display's 5-minute stale-flag budget so the two fought over
+the screen, and -- jam-update being Type=oneshot -- would have pinned any unit
+ordered After= it. That is what the 2026-09-15 bench flap was.)
+
 **E1 · Unchanged `main.conf` → bluetooth is not restarted** `[ ]`
 Run an update with no BLE config change. Verify
-`journalctl -u jam-update -b --no-pager | grep -c "Restarted bluetooth"` = 0 and
-`journalctl -u bluetooth -b --no-pager | grep -c "Started"` did not increase.
+`journalctl -u bluetooth -b --no-pager | grep -c "Started"` did not increase and
+`systemctl show -p ExecMainStartTimestamp --value bluetooth` is unchanged.
 
-**E2 · Update during a live session defers BLE restarts; registration completes** `[ ]`
-Setup R7 (phone connected, `main.conf` modified). Expected: journal shows
-`A BLE setup session is in progress; deferring BLE restarts`; the phone's link
-**survives**; finish registration in the app; after the phone disconnects the
-journal shows `BLE setup session ended ...; proceeding` and bluetooth restarts once.
+**E2 · Update during a live session leaves BLE alone and does not wait** `[ ]`
+Setup R7 (phone connected, `main.conf` modified). Expected: the R7 loop shows
+jam-player-display, jam-heartbeat and jam-tailscale (re)started within seconds
+of each other and of jam-update's exit -- no 5-minute gap; the journal has the
+warning `BLE setup session in progress; leaving BLE units (and bluetoothd) on
+their current code until the next boot`; bluetooth and both BLE units keep their
+old start timestamps; the phone's link **survives** and registration completes.
 
-**E3 · A session longer than 5 min is not held hostage** `[ ]`
-Keep the phone connected > 5 min during R7. Expected: warning `BLE setup session
-still active after 300s; leaving BLE units (and bluetoothd) untouched`; every
-other service restarts; the update completes; BLE picks up the new code at the
-next boot.
+**E3 · Session over before the restart → BLE restarts once, updater does not re-fire** `[ ]`
+Disconnect the phone before the install finishes (or update with no phone at
+all), `main.conf` modified. Expected: bluetooth restarted exactly once, both BLE
+units restarted after every other service, `ls /run/jam/first_connect_update_triggered`
+exists, and `systemctl show -p ExecMainStartTimestamp --value jam-update` does
+not change afterwards (the restarted state manager did not start a second run).
 
 **E4 · First-connect auto-update with the app in hand** `[ ]`
 Fresh (unregistered) device with an update pending on the branch. Provision WiFi
-and immediately proceed through registration. Expected: no disconnect, no
-"Updating…" takeover of the BLE flow before registration completes.
+and immediately proceed through registration. Expected: no disconnect; ONE
+"Updating…" screen for the length of the install; then exactly one transition to
+the correct state screen (no content → updating → content flap); heartbeat and
+tailscale alive within a minute of the update completing (`tailscale ip -4`).
+
+**E5 · Mixed-version window: old state manager, new everything else** `[ ]`
+The E2 outcome leaves jam-ble-state-manager on the OLD build until the next
+boot. With the phone still connected and the location ACTIVE with no content
+yet, the display must show the correct setup-ladder screen (screen link /
+downloading), never "Set up your JAM Player" (AWAITING_NETWORK), even though
+`ls /run/jam/state_manager_alive` does not exist. Then reboot: the stamp appears
+and the screens are unchanged. (2026-09-16: the new display treated the missing
+stamp as offline and showed the setup screen until reboot.)
+
+**E6 · No stalls or timeouts in the state manager during the update** `[ ]`
+During E2/E4, `journalctl -u jam-ble-state-manager -b --no-pager | grep -cE "Timeout restarting|start jam-update timed out"`
+= 0 (both systemctl calls are now `--no-block`; queued jobs run when jam-update exits).
 
 ### F — Reporting and display (MAC / network status)
 
-**F1 · Setup screens show the MACs** `[ ]`
+**F1 · Setup screens show the MACs, and nothing collides** `[ ]`
 Any non-content screen shows `Wi-Fi MAC:` and (if present) `Ethernet MAC:` under
 the device UUID. Compare with `nmcli -t -f GENERAL.TYPE,GENERAL.HWADDR device show`.
+On the setup screen, "Get ready to JAM." sits clearly ABOVE "Device ID: XXXXX"
+and the QR code is full size (2026-09-16 bench: the two MAC lines pushed
+"Device ID" up over the tagline). To force a fresh render on the bench:
+`sudo rm -f /var/cache/jam-player-display/*.png && sudo systemctl restart jam-player-display`.
+
+**F1b · Every screen, every display size, by test** `[ ]`
+From the services_v2 directory on the device:
+`sudo /opt/jam/venv/bin/python3 -m unittest tests.test_display_screen_layout -v`.
+Renders all eight non-content screens at 720p/1080p/1440p/4K with 0/1/2 MAC
+lines and asserts no text or QR border overlaps anything and nothing runs off
+the image; the two QR screens must keep a full-size code at every size.
 
 **F2 · Backend shows MACs and network** `[ ]`
 After announce (fresh) or the first heartbeat after boot, both dashboards show
@@ -306,6 +345,14 @@ Wi-Fi MAC, Ethernet MAC, and Network (SSID / Ethernet) for the bench device.
 **F3 · Offline shows "last connected"** `[ ]`
 Power off the AP for > 10 min. Expected: dashboard flips to offline with the last
 network shown; no false-offline while the device is healthy.
+
+**F4 · Logs reach the backend** `[ ]`
+Within a minute of any service starting on new code, JamPlayerLog rows for this
+device appear in the testing dashboard's Logs & Errors panel (INFO level). If
+not: `sudo journalctl -b --no-pager | grep -F "[log_shipper]"` (drops are reported
+only after 1 h of continuous failure) and confirm the handler is attached:
+`cd /opt/jam/services && sudo /opt/jam/venv/bin/python -c "import logging; from common.logging_config import setup_service_logging; setup_service_logging('jam-heartbeat'); print([type(h).__name__ for h in logging.getLogger().handlers])"`
+must list `BackendLogHandler`. (2026-09-11..16 code never attached it.)
 
 ### H — Content pipeline integrity (audit #12, #13, #14)
 
@@ -511,6 +558,15 @@ for i in 1 2 3 4 5; do sudo pkill -9 mpv; sleep 3; done; sleep 20; systemctl is-
 ```
 Expected: content playing again, unit `active`, count `0`.
 
+
+**J5 · A display restarted after a LONG install still defers to the updater** `[ ]`
+Start an update (`sudo systemctl start jam-update`); while it is installing, age
+the coordination flag past the display's 5-minute budget:
+`sudo touch -d '-6 min' /run/jam-update-in-progress`. Expected: at the restart
+the flag is re-stamped (`stat -c %y /run/jam-update-in-progress` is seconds old
+while jam-update is still running), the boot identity screen does NOT appear
+mid-update, no state screen appears before the "Updating…" screen is taken
+down, and the display transitions exactly once when jam-update exits.
 
 ### K — feh cleanup patterns (VERIFY FIRST, no code change yet)
 

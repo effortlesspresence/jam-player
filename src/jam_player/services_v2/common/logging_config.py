@@ -229,8 +229,13 @@ def setup_service_logging(
         # (jam_update imports jam_player_display inside a function) cannot
         # steal the tag from the running service.
         backend_handler.service = service_enum_for(service_name)
-        if backend_handler is not None and backend_handler not in root.handlers:
-            root.addHandler(backend_handler)
+    # Attach on EVERY path, not just the re-tag branch. From 2026-09-11 to
+    # 2026-09-16 this line sat one indent deeper, inside the elif above, so a
+    # freshly created handler (the normal first call in every service) was
+    # configured, levelled and then never added to the root logger: not one
+    # line reached POST /jam-players/logs from any player on that code.
+    if backend_handler is not None and backend_handler not in root.handlers:
+        root.addHandler(backend_handler)
     if backend_handler is not None:
         backend_handler.setLevel(effective_level)
 
