@@ -36,6 +36,9 @@ DEFAULT_ENVIRONMENT = 'prod'
 DEFAULT_REQUEST_TIMEOUT = 10  # seconds
 
 
+_environment_logged = False  # get_api_base_url() announces a non-prod environment once per process
+
+
 def get_api_base_url() -> str:
     """
     Get the API base URL based on environment.
@@ -57,7 +60,14 @@ def get_api_base_url() -> str:
     url = API_URLS.get(env, API_URLS[DEFAULT_ENVIRONMENT])
 
     if env != DEFAULT_ENVIRONMENT:
-        logger.info(f"Using {env} environment: {url}")
+        # Once per process. This runs on every API call, and at INFO it was one
+        # shipped log row per call (and one journal line per tick on older
+        # builds) on every testing/staging device -- and an extra INFO record
+        # that broke test_api_failure_dedup on a testing-environment bench player.
+        global _environment_logged
+        if not _environment_logged:
+            _environment_logged = True
+            logger.info(f"Using {env} environment: {url}")
 
     return url
 

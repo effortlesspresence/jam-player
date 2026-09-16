@@ -97,6 +97,21 @@ class RecoveryWindowTests(unittest.TestCase):
     def test_after_window_online_registered_stops_ble(self):
         self.assertFalse(self._should_run(WINDOW, is_online=True, registered=True))
 
+    def test_after_window_offline_keeps_ble_up(self):
+        self.assertTrue(self._should_run(WINDOW + 3600, is_online=False, registered=True))
+
+    def test_after_window_unregistered_keeps_ble_up(self):
+        self.assertTrue(self._should_run(WINDOW + 3600, is_online=True, registered=False))
+
+    def test_after_window_online_only_via_fallback_keeps_ble_up(self):
+        """A guest network that firewalls our API but passes 443 to Cloudflare
+        is 'online' by the fallback probe and unreachable for support: degraded."""
+        for method in ('cloudflare_tls', 'google_tls', 'unknown', 'none'):
+            self.assertTrue(self._should_run(WINDOW + 60, is_online=True, registered=True, method=method), method)
+
+    def test_only_a_reachable_backend_can_stop_ble(self):
+        self.assertFalse(self._should_run(WINDOW + 60, is_online=True, registered=True, method='jam_backend'))
+
 
 class SetupSessionHoldTests(unittest.TestCase):
     """The window must never close on somebody who is mid-setup."""
@@ -170,21 +185,6 @@ class SetupSessionHoldTests(unittest.TestCase):
         m.bus.get_object.side_effect = Exception('no bluez')
         with mock.patch.object(sm, 'BLE_SESSION_ACTIVE_FLAG', flag):
             self.assertFalse(m._setup_session_in_progress())
-
-    def test_after_window_offline_keeps_ble_up(self):
-        self.assertTrue(self._should_run(WINDOW + 3600, is_online=False, registered=True))
-
-    def test_after_window_unregistered_keeps_ble_up(self):
-        self.assertTrue(self._should_run(WINDOW + 3600, is_online=True, registered=False))
-
-    def test_after_window_online_only_via_fallback_keeps_ble_up(self):
-        """A guest network that firewalls our API but passes 443 to Cloudflare
-        is 'online' by the fallback probe and unreachable for support: degraded."""
-        for method in ('cloudflare_tls', 'google_tls', 'unknown', 'none'):
-            self.assertTrue(self._should_run(WINDOW + 60, is_online=True, registered=True, method=method), method)
-
-    def test_only_a_reachable_backend_can_stop_ble(self):
-        self.assertFalse(self._should_run(WINDOW + 60, is_online=True, registered=True, method='jam_backend'))
 
 
 class PeriodicCheckClosesWindowTests(unittest.TestCase):

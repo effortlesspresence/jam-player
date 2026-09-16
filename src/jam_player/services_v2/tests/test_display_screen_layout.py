@@ -104,8 +104,15 @@ def _render(screen_fn, width, height, macs):
         qr_sizes.append(size)
         return real_qr(url, size)
 
+    # The mesh gradient is decorative and costs 10-15 s per 4K render; layout
+    # depends only on the canvas size, so paint a flat one. 96 renders would
+    # otherwise take the better part of ten minutes on a Pi.
+    def flat_background(w, h, theme="vibrant"):
+        return disp.Image.new('RGB', (w, h), (24, 24, 32))
+
     with mock.patch.object(disp.ImageDraw, 'Draw', side_effect=recording_draw), \
          mock.patch.object(disp, 'generate_qr_code', side_effect=recording_qr), \
+         mock.patch.object(disp, 'create_mesh_gradient_background', side_effect=flat_background), \
          mock.patch.object(disp, '_get_display_macs', return_value=dict(macs)):
         result = screen_fn(width, height, UUID)
     img = result[0] if isinstance(result, tuple) else result
@@ -185,11 +192,17 @@ class ScreenLayoutTests(unittest.TestCase):
         return qr_sizes
 
     def test_nothing_overlaps_and_nothing_runs_off_screen(self):
+        # Two MACs is the tallest identity block, so it is the case that can
+        # collide: every screen at every size. Fewer MAC lines only free up
+        # room, so those variants are checked at 1080p alone. 48 renders on a
+        # flat background: well under a minute on a Pi.
         for name, fn in _screens():
             for width, height in SIZES:
-                for macs in (BOTH_MACS, WIFI_ONLY, NO_MACS):
-                    with self.subTest(screen=name, size=f"{width}x{height}", macs=_n_macs(macs)):
-                        self._check(name, fn, width, height, macs)
+                with self.subTest(screen=name, size=f"{width}x{height}", macs=2):
+                    self._check(name, fn, width, height, BOTH_MACS)
+            for macs in (WIFI_ONLY, NO_MACS):
+                with self.subTest(screen=name, size="1920x1080", macs=_n_macs(macs)):
+                    self._check(name, fn, 1920, 1080, macs)
 
     def test_qr_screens_keep_a_full_size_code_on_every_display_size(self):
         for name, fn in _screens():
