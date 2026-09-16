@@ -66,6 +66,14 @@ API_LAST_OK_FLAG = JAM_RUN_DIR / 'api_last_ok'
 # must not re-hold for 15 s each time and delay the customer's content.
 BOOT_IDENTITY_SHOWN_FLAG = JAM_RUN_DIR / 'boot_identity_shown'
 
+# Marks that the first-connect auto-update has already been fired for this
+# BOOT. Per-boot, not per-process: jam-update RESTARTS jam-ble-state-manager as
+# part of installing, which used to reset an in-process flag and let the
+# freshly restarted manager fire the updater all over again on a device that is
+# still unregistered -- an extra update run (and its "updating" screen) after
+# every update, with a loop whenever that run finds work to do.
+FIRST_CONNECT_UPDATE_FLAG = JAM_RUN_DIR / 'first_connect_update_triggered'
+
 # The Plymouth boot splash. Shipped images boot the JAM logo from the `pix`
 # theme (cmdline.txt carries `splash`); once a player has generated its own
 # identity screen that image replaces this file, and the original logo is kept

@@ -7,6 +7,7 @@ This is the guarantee that a player stranded on a captive-portal / firewalled
 network can always be rescued by a power-cycle + the mobile app.
 """
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -360,6 +361,55 @@ class ApiHealthGatesBleStopTests(unittest.TestCase):
         self.assertFalse(any(c.kwargs.get('should_run') is False for c in manage.call_args_list),
                          'edge reachable but no API proof: BLE must not be stopped')
 
+
+
+class FirstConnectUpdateFiresOncePerBootTests(unittest.TestCase):
+    """jam-update RESTARTS jam-ble-state-manager as part of installing.
+
+    With an in-process flag only, the restarted manager saw a clean slate,
+    was still unregistered, and fired the updater again -- an extra run and an
+    extra "updating" screen after every update, and a loop whenever that run
+    found work. The marker has to survive the restart but not the boot.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.flag = Path(self.tmp.name) / 'run' / 'first_connect_update_triggered'
+        self.patch = mock.patch.object(sm, 'FIRST_CONNECT_UPDATE_FLAG', self.flag)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def _manager(self):
+        mgr = sm.BLEStateManager.__new__(sm.BLEStateManager)
+        mgr._first_connect_update_triggered = False
+        return mgr
+
+    def test_a_restarted_manager_does_not_re_fire(self):
+        first = self._manager()
+        self.assertFalse(first._first_connect_update_already_fired())
+        first._mark_first_connect_update_fired()
+        # jam-update restarts the service: a brand new instance, clean flag.
+        restarted = self._manager()
+        self.assertTrue(restarted._first_connect_update_already_fired(),
+                        'the restarted manager must not fire the updater again')
+
+    def test_a_real_boot_gets_its_one_trigger(self):
+        self._manager()._mark_first_connect_update_fired()
+        self.flag.unlink()          # /run is tmpfs: the kernel clears it at boot
+        self.assertFalse(self._manager()._first_connect_update_already_fired())
+
+    def test_an_unreadable_marker_prefers_firing_over_never_updating(self):
+        with mock.patch.object(sm, 'FIRST_CONNECT_UPDATE_FLAG') as bad:
+            bad.exists.side_effect = OSError('boom')
+            self.assertFalse(self._manager()._first_connect_update_already_fired())
+
+    def test_marking_is_best_effort_and_never_raises(self):
+        with mock.patch.object(sm, 'FIRST_CONNECT_UPDATE_FLAG') as bad:
+            bad.parent.mkdir.side_effect = OSError('read-only')
+            self._manager()._mark_first_connect_update_fired()   # must not raise
 
 if __name__ == '__main__':
     unittest.main()

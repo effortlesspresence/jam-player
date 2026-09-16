@@ -73,7 +73,10 @@ from gi.repository import GLib
 from common.system import manage_service, seconds_since_boot, unit_active_since_boot_seconds
 from common.network import InternetConnectivityMonitor, check_internet_connectivity, api_recently_ok
 from common.credentials import is_device_registered, is_device_announced
-from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, STATE_MANAGER_ALIVE_FLAG, safe_touch, touch_volatile_flag
+from common.paths import (
+    INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, STATE_MANAGER_ALIVE_FLAG,
+    FIRST_CONNECT_UPDATE_FLAG, safe_touch, touch_volatile_flag,
+)
 
 # ============================================================================
 # Logging Configuration
@@ -773,6 +776,31 @@ class BLEStateManager:
             except Exception as e:
                 logger.warning(f"Error restarting {service}: {e}")
 
+    @staticmethod
+    def _first_connect_update_already_fired() -> bool:
+        """Has the first-connect update already fired THIS BOOT?
+
+        The in-process flag is not enough: jam-update RESTARTS this very
+        service as part of installing, so a freshly restarted manager would
+        see a clean flag, still be unregistered, and fire the updater all over
+        again -- one extra run and one extra "updating" screen after every
+        update, and a loop whenever that run finds work to do. The marker
+        lives in /run, which the kernel clears at boot, so a real reboot still
+        gets its one trigger.
+        """
+        try:
+            return FIRST_CONNECT_UPDATE_FLAG.exists()
+        except Exception:
+            return False   # unreadable: prefer firing over never updating
+
+    @staticmethod
+    def _mark_first_connect_update_fired() -> None:
+        try:
+            FIRST_CONNECT_UPDATE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            FIRST_CONNECT_UPDATE_FLAG.touch()
+        except Exception as e:
+            logger.debug(f"Could not mark the first-connect update fired: {e}")
+
     def _maybe_trigger_first_connect_update(self):
         """
         If this is the first time this never-registered device has seen
@@ -796,7 +824,7 @@ class BLEStateManager:
         already-running or already-finished jam-update as a no-op
         rather than kicking off a second run.
         """
-        if self._first_connect_update_triggered:
+        if self._first_connect_update_triggered or self._first_connect_update_already_fired():
             return
 
         if is_device_registered():
@@ -806,6 +834,7 @@ class BLEStateManager:
             return
 
         self._first_connect_update_triggered = True
+        self._mark_first_connect_update_fired()
         # Sequence the update AFTER announce. The updater asks the backend
         # which release to run (GET /jam-players/update-target), and that call
         # is device-authorized: it can only be verified once the device's key
