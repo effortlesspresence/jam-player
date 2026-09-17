@@ -61,7 +61,9 @@ CONTRACT_MAPPING = {
     'jam-content-manager': 'JAM_CONTENT_MANAGER',
 }
 
-LOCAL_LINE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - (?P<name>\S+) - (?P<level>[A-Z]+) - (?P<msg>.*)$')
+# Under the journal every card line carries a <N> priority prefix; the tests
+# simulate the journal by default, so the prefix is optional here.
+LOCAL_LINE = re.compile(r'^(?:<\d>)?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - (?P<name>\S+) - (?P<level>[A-Z]+) - (?P<msg>.*)$')
 
 
 def _response(status):
@@ -95,7 +97,12 @@ class _RootIsolation(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
-        os.environ.pop('JOURNAL_STREAM', None)
+        # These tests describe a service under systemd: stderr IS the journal.
+        # stderr_is_journal() applies systemd's rule (the variable names stderr's
+        # own dev:inode), so point it at the real fd 2. Tests about the
+        # terminal case pop it again.
+        st = os.fstat(2)
+        os.environ['JOURNAL_STREAM'] = f'{st.st_dev}:{st.st_ino}'
         os.environ.pop(logging_config.SHIPPING_DISABLED_ENV, None)  # run_on_device.sh sets it; these tests want the shipper
 
     def tearDown(self):
@@ -147,17 +154,28 @@ class ServiceMappingTests(unittest.TestCase):
         setup_service_logging runs first; the process must still ship as
         JAM_DISPLAY_CACHE_PREWARM."""
         root = logging.getLogger()
-        for h in list(root.handlers):
+        saved = list(root.handlers)
+        for h in saved:
             root.removeHandler(h)
-        # Simulate the imported module's call (not from __main__).
-        logging_config.setup_service_logging('jam-player-display')
-        handler = next(h for h in root.handlers if isinstance(h, BackendLogHandler))
-        self.assertEqual(handler.service, SystemService.JAM_PLAYER_DISPLAY)
-        # Simulate the process's own call, made from __main__.
-        with mock.patch.object(logging_config, '_called_from_main_module', return_value=True):
-            logging_config.setup_service_logging('jam-display-cache-prewarm')
-        self.assertIs(next(h for h in root.handlers if isinstance(h, BackendLogHandler)), handler)
-        self.assertEqual(handler.service, SystemService.JAM_DISPLAY_CACHE_PREWARM)
+        try:
+            with mock.patch.dict(os.environ):
+                os.environ.pop(logging_config.SHIPPING_DISABLED_ENV, None)  # run_on_device.sh sets it
+                # Simulate the imported module's call (not from __main__).
+                logging_config.setup_service_logging('jam-player-display')
+                handler = next(h for h in root.handlers if isinstance(h, BackendLogHandler))
+                self.assertEqual(handler.service, SystemService.JAM_PLAYER_DISPLAY)
+                # Simulate the process's own call, made from __main__.
+                with mock.patch.object(logging_config, '_called_from_main_module', return_value=True):
+                    logging_config.setup_service_logging('jam-display-cache-prewarm')
+                self.assertIs(next(h for h in root.handlers if isinstance(h, BackendLogHandler)), handler)
+                self.assertEqual(handler.service, SystemService.JAM_DISPLAY_CACHE_PREWARM)
+        finally:
+            for h in list(root.handlers):
+                root.removeHandler(h)
+                if isinstance(h, BackendLogHandler):
+                    h.close()
+            for h in saved:
+                root.addHandler(h)
         # A later NON-main call (lazy import inside a function) must not steal it.
         with mock.patch.object(logging_config, '_called_from_main_module', return_value=False):
             logging_config.setup_service_logging('jam-player-display')
@@ -224,7 +242,7 @@ class HandlerWiringTests(_RootIsolation):
         self.assertEqual(backend.service, 'JAM_HEARTBEAT')
 
     def test_unknown_service_ships_as_other(self):
-        setup_service_logging('jam-display-hotplug-monitor', level=logging.INFO)
+        setup_service_logging('jam-not-a-service', level=logging.INFO)
         self.assertEqual(self.backend_handler().service, 'OTHER')
 
     def test_configured_level_is_the_shipped_level_not_the_card_level(self):
@@ -309,6 +327,7 @@ class RoutingTests(_RootIsolation):
         self.assertEqual(self.shipped(), [('DEBUG', 'debug-line'), ('INFO', 'info-line')])
 
     def test_card_lines_keep_the_existing_format_outside_systemd(self):
+        os.environ.pop('JOURNAL_STREAM', None)   # run by hand in a terminal
         logger = setup_service_logging('jam-heartbeat', level=logging.INFO)
         card = self.capture_card()
         logger.warning('warn-line')
@@ -318,7 +337,7 @@ class RoutingTests(_RootIsolation):
         self.assertEqual(match.group('level'), 'WARNING')
 
     def test_card_lines_carry_journal_priority_under_systemd(self):
-        os.environ['JOURNAL_STREAM'] = '9:12345'  # what systemd sets for StandardError=journal
+        # setUp already made stderr look like the journal (real dev:inode).
         logger = setup_service_logging('jam-heartbeat', level=logging.INFO)
         card = self.capture_card()
         logger.warning('warn-line')

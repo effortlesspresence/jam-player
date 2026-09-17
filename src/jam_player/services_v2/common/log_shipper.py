@@ -41,10 +41,12 @@ never keep anything on disk.
   and at most one line per hour written directly to stderr at journal
   priority warning. Set JAM_LOG_SHIPPER_TRACE=1 in the unit's environment
   to get one such line per flush attempt while debugging.
-- flush() (which logging.shutdown() calls at exit) makes one final
-  synchronous send of the oldest pending batch with a short timeout;
-  close() stops the thread. Lines still buffered after that are lost,
-  which is the accepted trade.
+- flush() (which logging.shutdown() calls at exit) is deliberately a no-op:
+  a send there would add its full timeout, plus unbounded DNS resolution, to
+  every service's exit path, on the very networks this system exists for.
+  The last <=30 s of INFO lines at exit are the accepted loss (docs/
+  LOGGING.md). flush_now() is the explicit synchronous send for callers
+  that want one.
 """
 
 import collections
@@ -294,7 +296,9 @@ class BackendLogHandler(logging.Handler):
         Send the oldest pending batch synchronously on the calling thread.
 
         Returns True when the batch was accepted or nothing was pending;
-        False when it was dropped (no identity, request failure, non-2xx).
+        False when it could not be sent: no identity (entries discarded), a
+        transient failure (the batch stays queued for the background thread),
+        or a rejection by the backend (the batch is dropped).
         Entries beyond one batch stay queued for the background thread.
         """
         try:
@@ -307,7 +311,10 @@ class BackendLogHandler(logging.Handler):
                 batch = self._take_batch()
                 if not batch:
                     return True
-                return self._send(batch, timeout)
+                outcome = self._send(batch, timeout)
+                if outcome == SEND_RETRY:
+                    self._requeue(batch)
+                return outcome == SEND_OK
         except Exception:
             return False
 
@@ -460,7 +467,7 @@ class BackendLogHandler(logging.Handler):
         Shares the once-an-hour failure report with real drops."""
         with self._lock:
             self._stats['batches_deferred'] += 1
-        self._record_failure(0, reason)
+        self._record_failure(0, reason, kept=record_count)
         self._trace_line(f'deferred {record_count} records ({reason})')
 
     def _discard_all_no_identity(self) -> int:
@@ -520,7 +527,10 @@ class BackendLogHandler(logging.Handler):
     # Out-of-band health reporting
     # ------------------------------------------------------------------
 
-    def _record_failure(self, record_count: int, reason: str) -> None:
+    def _record_failure(self, record_count: int, reason: str, kept: int = 0) -> None:
+        """Account for a failed send. record_count entries were dropped; kept
+        entries are going back to the ring (they are counted as held in the
+        report because the batch is out of the buffer while this runs)."""
         now = time.monotonic()
         report: Optional[str] = None
         with self._lock:
@@ -542,7 +552,7 @@ class BackendLogHandler(logging.Handler):
                 report = (
                     f'{self._failures_unreported} log batch send(s) failed since '
                     f'{iso_utc(self._failure_window_start)}; last: {reason}; '
-                    f'{self._stats["records_dropped"]} records dropped, {len(self._buffer)} held'
+                    f'{self._stats["records_dropped"]} records dropped, {len(self._buffer) + kept} held'
                 )
                 self._failures_unreported = 0
                 self._last_failure_report = now

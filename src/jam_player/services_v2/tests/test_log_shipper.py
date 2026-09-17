@@ -297,12 +297,15 @@ class FlushNowTests(_ShipperTestCase):
         self.assertLessEqual(SHUTDOWN_FLUSH_TIMEOUT, 3)
         self.assertEqual(handler.stats()['queued'], 50)
 
-    def test_handler_flush_is_the_shutdown_send(self):
-        """logging.shutdown() calls Handler.flush(); ours must send, not no-op."""
+    def test_handler_flush_is_a_no_op_at_shutdown(self):
+        """logging.shutdown() calls Handler.flush() in every exit path, after the
+        display has blanked and inside SIGTERM handling; a send there would add
+        its timeout plus unbounded DNS to every restart. It must not send."""
         handler = self.handler()
         handler.emit(_record())
         handler.flush()
-        self.assertEqual(len(self.backend.calls), 1)
+        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(handler.stats()['queued'], 1)
 
     def test_nothing_pending_is_a_success_without_a_request(self):
         handler = self.handler()
@@ -477,9 +480,14 @@ class RecursionTests(_ShipperTestCase):
             handler.emit(_record('a real line'))
             self.assertFalse(handler.flush_now())
             stats = handler.stats()
-            self.assertEqual(stats['queued'], 0)         # api.py's ERROR was not queued for the next batch
+            # The 503 keeps the real line for the next flush; api.py's ERROR,
+            # logged from inside the send, must NOT have joined it.
+            self.assertEqual(stats['queued'], 1)
             self.assertEqual(stats['suppressed'], 1)
             self.assertEqual(len(self.backend.calls), 1)
+            self.backend.status = 200
+            self.assertTrue(handler.flush_now())
+            self.assertEqual(self.sent_messages(call_index=1), ['a real line'])
         finally:
             root.removeHandler(handler)
 
