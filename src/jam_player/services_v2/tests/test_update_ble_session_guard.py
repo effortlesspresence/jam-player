@@ -208,6 +208,38 @@ class RestartGuardTests(unittest.TestCase):
         self._restart(session_active=False, bluetooth_changed=False)
         self.assertGreater(self.update_flag.stat().st_mtime, stale + 60, 'flag mtime not refreshed')
 
+    def test_a_restart_queued_behind_the_oneshot_is_not_reported_as_a_fault(self):
+        """jam-update.service is Before=jam-content-manager: systemd cannot start
+        it until this process exits, so verification sees it inactive with a
+        queued job. That is expected, not 'may need attention'."""
+        def run(cmd, *a, **k):
+            if cmd[:2] == ['systemctl', 'is-active']:
+                return (True, 'inactive' if cmd[-1] == 'jam-content-manager.service' else 'active', '')
+            if cmd[:3] == ['systemctl', 'show', '-p'] and cmd[-1] == 'jam-content-manager.service':
+                return (True, '4242 start', '')
+            return (True, '', '')
+        with mock.patch.object(jam_update, '_ble_session_active', return_value=False), \
+             mock.patch.object(jam_update, 'run_command', side_effect=run), \
+             mock.patch.object(jam_update.time, 'sleep'), \
+             self.assertLogs(jam_update.logger, level='INFO') as logs:
+            jam_update.restart_services(bluetooth_conf_changed=False)
+        messages = [r.getMessage() for r in logs.records]
+        self.assertTrue(any('restart queued behind this updater' in m for m in messages), messages)
+        self.assertFalse(any('may need attention' in m for m in messages), messages)
+        self.assertTrue(any('All critical services running' in m for m in messages), messages)
+
+    def test_a_dead_service_with_no_queued_job_is_still_reported(self):
+        def run(cmd, *a, **k):
+            if cmd[:2] == ['systemctl', 'is-active']:
+                return (True, 'failed' if cmd[-1] == 'jam-content-manager.service' else 'active', '')
+            return (True, '', '')
+        with mock.patch.object(jam_update, '_ble_session_active', return_value=False), \
+             mock.patch.object(jam_update, 'run_command', side_effect=run), \
+             mock.patch.object(jam_update.time, 'sleep'), \
+             self.assertLogs(jam_update.logger, level='INFO') as logs:
+            jam_update.restart_services(bluetooth_conf_changed=False)
+        self.assertTrue(any('may need attention' in r.getMessage() for r in logs.records))
+
     def test_no_updating_flag_is_not_created_by_the_refresh(self):
         self._restart(session_active=False, bluetooth_changed=False)
         self.assertFalse(self.update_flag.exists(), 'refresh must never create the flag')

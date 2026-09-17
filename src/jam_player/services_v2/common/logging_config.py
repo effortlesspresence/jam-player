@@ -55,6 +55,7 @@ when done. The lines show up in the player's Logs & Errors dashboard panel.
 """
 
 import logging
+import os
 import sys
 import threading
 from typing import Dict, Optional, Type, TypeVar
@@ -147,6 +148,9 @@ def _called_from_main_module() -> bool:
         return False
 
 
+SHIPPING_DISABLED_ENV = 'JAM_LOG_SHIPPING_DISABLED'
+
+
 def setup_service_logging(
     service_name: str,
     level: Optional[int] = None,
@@ -216,6 +220,14 @@ def setup_service_logging(
     # effective level applies so on-site debugging still sees INFO/DEBUG.
     stream_handler.setLevel(LOCAL_STREAM_LEVEL if stderr_is_journal() else effective_level)
 
+    # JAM_LOG_SHIPPING_DISABLED=1 keeps the card handler and its journal
+    # formatting but attaches no shipper. tests/run_on_device.sh sets it: the
+    # suites import every service module, whose module-level logging setup
+    # would otherwise ship the tests' own lines -- fake download failures and
+    # all -- to the backend under whichever service happened to import first.
+    if os.environ.get(SHIPPING_DISABLED_ENV) == '1':
+        shipping_available = False
+        BackendLogHandler = None  # type: ignore[assignment]
     backend_handler = _find_handler(root, BackendLogHandler) if shipping_available else None
     if backend_handler is None and shipping_available:
         backend_handler = BackendLogHandler(service=service_enum_for(service_name))

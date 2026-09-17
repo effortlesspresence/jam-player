@@ -2901,6 +2901,15 @@ def restart_services(bluetooth_conf_changed: bool = False):
         status = stdout.strip() if stdout else 'unknown'
         if status in ('active', 'activating'):
             logger.info(f"    {service}: {status}")
+            continue
+        # jam-update.service is Before=jam-content-manager / jam-heartbeat (and
+        # After='d by tailscale, announce, the version reporter): systemd will
+        # not START any of them while this oneshot is still running, so their
+        # restart jobs sit queued until we exit a few seconds from now. A queued
+        # job is the expected state here, not a fault.
+        _, job, _ = run_command(['systemctl', 'show', '-p', 'Job', '--value', service], timeout=5)
+        if (job or '').strip():
+            logger.info(f"    {service}: {status}, restart queued behind this updater (runs when jam-update exits)")
         else:
             logger.warning(f"    {service}: {status} (may need attention)")
             all_ok = False

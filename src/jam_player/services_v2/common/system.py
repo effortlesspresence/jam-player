@@ -286,12 +286,16 @@ def check_required_services() -> Tuple[bool, List[str]]:
     return len(failed_services) == 0, failed_services
 
 
-def start_service(service_name: str) -> bool:
+def start_service(service_name: str, no_block: bool = False) -> bool:
     """
     Start a systemd service.
 
     Args:
         service_name: Name of the service to start
+        no_block: queue the start job and return at once instead of waiting
+            for the unit to be up. For units ordered behind a oneshot that may
+            be running right now (jam-update.service is Before= jam-heartbeat and
+            jam-content-manager): a blocking start sits out its whole timeout.
 
     Returns:
         True if service started successfully.
@@ -307,7 +311,7 @@ def start_service(service_name: str) -> bool:
         except Exception:
             pass
         result = subprocess.run(
-            ['systemctl', 'start', service_name],
+            ['systemctl', 'start'] + (['--no-block'] if no_block else []) + [service_name],
             capture_output=True,
             text=True,
             timeout=DEFAULT_SERVICE_ACTION_TIMEOUT
@@ -317,7 +321,7 @@ def start_service(service_name: str) -> bool:
             logger.error(f"Failed to start {service_name}: {result.stderr}")
             return False
 
-        logger.info(f"Successfully started {service_name}")
+        logger.info(f"{'Queued start of' if no_block else 'Successfully started'} {service_name}")
         return True
 
     except subprocess.TimeoutExpired:
@@ -396,13 +400,14 @@ def restart_service(service_name: str) -> bool:
         return False
 
 
-def manage_service(service_name: str, should_run: bool) -> bool:
+def manage_service(service_name: str, should_run: bool, no_block: bool = False) -> bool:
     """
     Ensure a service is in the desired state (running or stopped).
 
     Args:
         service_name: Name of the service
         should_run: True to ensure running, False to ensure stopped
+        no_block: passed through to start_service (queue, do not wait)
 
     Returns:
         True if service is in desired state.
@@ -421,7 +426,7 @@ def manage_service(service_name: str, should_run: bool) -> bool:
         # Don't log - this is the normal/expected state during periodic checks
         return True
     elif should_run:
-        return start_service(service_name)
+        return start_service(service_name, no_block=no_block)
     else:
         return stop_service(service_name)
 

@@ -935,7 +935,13 @@ class BLEStateManager:
                 # Registered and online: make sure heartbeat runs regardless of
                 # what we decide about BLE (its ConditionPathExists was evaluated
                 # at boot, before a BLE registration could have created .registered).
-                manage_service(HEARTBEAT_SERVICE, should_run=True)
+                # Queued, not awaited: jam-update.service is Before=jam-heartbeat,
+                # so while an update runs (every first-connect update, every boot
+                # update) a blocking start sat out its 30 s timeout here and froze
+                # this loop -- bench 2026-09-17: "Timeout starting jam-heartbeat"
+                # from the manager systemd had just restarted. systemd starts it
+                # the moment the updater exits.
+                manage_service(HEARTBEAT_SERVICE, should_run=True, no_block=True)
 
             if should_run:
                 if registered and self._in_boot_recovery_window():

@@ -17,11 +17,16 @@ never keep anything on disk.
 - One daemon thread flushes. It wakes every flush interval or as soon as
   the buffer reaches the batch threshold, takes up to 200 entries (and at
   most MAX_BATCH_BYTES serialized, under the contract's 256 KB body cap)
-  and sends them as one signed POST via common.api.api_request. Any
-  exception, a None response, or a non-2xx status drops that batch: no
-  retry, no queue. A failed send also ends that wake's drain, so an
-  unreachable backend costs one timeout per interval rather than one per
-  batch while the ring keeps overwriting the oldest lines.
+  and sends them as one signed POST via common.api.api_request. A send
+  that fails for a reason that can pass later (exception, None response,
+  429/408, any 5xx) puts the batch BACK at the head of the ring for the
+  next wake; only a send the backend rejects outright (any other 4xx) drops
+  it. Nothing is ever queued on disk: while the backend is unreachable the
+  ring simply fills to its capacity and evicts the oldest lines. A failed
+  send also ends that wake's drain, so an unreachable backend costs one
+  timeout per interval rather than one per batch. (Until 2026-09-17 every
+  failure dropped the batch, so a single slow Lambda cold start silently
+  lost 30 s of a healthy player's lines.)
 - Nothing is sent until the device is announced and has its signing
   identity (device UUID + Ed25519 key). Until then entries are dropped.
 - Anything logged *by* the send path is suppressed for the duration of the
@@ -82,6 +87,25 @@ MAX_LOGGER_NAME_LENGTH = 128
 FAILURE_REPORT_INTERVAL = 3600.0
 TRACE_ENV = 'JAM_LOG_SHIPPER_TRACE'
 STDERR_TAG = '[log_shipper]'
+
+# _send() outcomes. Only SEND_DROP loses records.
+SEND_OK = 'ok'
+SEND_RETRY = 'retry'
+SEND_DROP = 'drop'
+# 4xx statuses that mean "try again later", not "this batch is bad".
+TRANSIENT_4XX = frozenset({408, 429})
+
+
+def api_request(**kwargs):
+    """Lazy proxy to common.api.api_request.
+
+    common.api pulls in requests and pynacl; importing it lazily keeps this
+    module stdlib-only at import time (it is loaded by every service's
+    logging setup, before anything else). The proxy is also the patch point
+    the tests use.
+    """
+    from .api import api_request as _api_request
+    return _api_request(**kwargs)
 
 _LEVEL_NAMES = (
     (logging.CRITICAL, 'CRITICAL'),
@@ -195,8 +219,9 @@ class BackendLogHandler(logging.Handler):
             'emit_errors': 0,         # records emit() could not process at all
             'batches_sent': 0,
             'records_sent': 0,
-            'batches_dropped': 0,     # send failures (exception, None, non-2xx)
+            'batches_dropped': 0,     # sends the backend rejected outright (4xx other than 408/429)
             'records_dropped': 0,
+            'batches_deferred': 0,    # sends that failed transiently; the batch went back to the ring
             'no_identity_dropped': 0,  # records discarded because the device cannot sign yet
             'last_error': None,
         }
@@ -383,8 +408,12 @@ class BackendLogHandler(logging.Handler):
                     batch = self._take_batch()
                     if not batch:
                         return True
-                    if not self._send(batch, timeout):
-                        return False
+                    outcome = self._send(batch, timeout)
+                    if outcome == SEND_OK:
+                        continue
+                    if outcome == SEND_RETRY:
+                        self._requeue(batch)
+                    return False
             except Exception as e:
                 self._record_failure(0, f'{type(e).__name__}: {e}')
                 return False
@@ -412,6 +441,28 @@ class BackendLogHandler(logging.Handler):
                 size += entry_size
         return batch
 
+    def _requeue(self, batch: List[Dict[str, Any]]) -> None:
+        """Put a batch that failed transiently back at the head of the ring.
+
+        Bounded by the ring: if the batch plus what queued meanwhile exceeds
+        capacity, the OLDEST entries (the head of the batch) are evicted and
+        counted as ring_dropped, exactly as emit() does when the ring is full.
+        """
+        with self._lock:
+            combined = batch + list(self._buffer)
+            overflow = max(0, len(combined) - self.ring_capacity)
+            if overflow:
+                self._stats['ring_dropped'] += overflow
+            self._buffer = collections.deque(combined[overflow:], maxlen=self.ring_capacity)
+
+    def _record_deferral(self, record_count: int, reason: str) -> None:
+        """A send failed for a reason that may pass later; the batch is kept.
+        Shares the once-an-hour failure report with real drops."""
+        with self._lock:
+            self._stats['batches_deferred'] += 1
+        self._record_failure(0, reason)
+        self._trace_line(f'deferred {record_count} records ({reason})')
+
     def _discard_all_no_identity(self) -> int:
         with self._lock:
             count = len(self._buffer)
@@ -431,9 +482,11 @@ class BackendLogHandler(logging.Handler):
         except Exception:
             return False
 
-    def _send(self, batch: List[Dict[str, Any]], timeout: float) -> bool:
+    def _send(self, batch: List[Dict[str, Any]], timeout: float) -> str:
+        """One POST. SEND_OK; SEND_RETRY when the failure can pass later (the
+        caller keeps the batch); SEND_DROP when the backend rejected the batch
+        outright (it will never succeed, so it is counted as dropped)."""
         try:
-            from .api import api_request  # lazy: keeps this module stdlib-only at import
             response = api_request(
                 method='POST',
                 path=LOGS_PATH,
@@ -442,23 +495,26 @@ class BackendLogHandler(logging.Handler):
                 signed=True,
             )
         except Exception as e:
-            self._record_failure(len(batch), f'{type(e).__name__}: {e}')
-            return False
+            self._record_deferral(len(batch), f'{type(e).__name__}: {e}')
+            return SEND_RETRY
 
         if response is None:
-            self._record_failure(len(batch), 'request failed')
-            return False
+            self._record_deferral(len(batch), 'request failed')
+            return SEND_RETRY
 
         status = getattr(response, 'status_code', None)
         if not (isinstance(status, int) and 200 <= status < 300):
-            self._record_failure(len(batch), f'HTTP {status}')
-            return False
+            if isinstance(status, int) and 400 <= status < 500 and status not in TRANSIENT_4XX:
+                self._record_failure(len(batch), f'HTTP {status}')
+                return SEND_DROP
+            self._record_deferral(len(batch), f'HTTP {status}')
+            return SEND_RETRY
 
         with self._lock:
             self._stats['batches_sent'] += 1
             self._stats['records_sent'] += len(batch)
         self._trace_line(f'sent {len(batch)} records (HTTP {status})')
-        return True
+        return SEND_OK
 
     # ------------------------------------------------------------------
     # Out-of-band health reporting
@@ -468,8 +524,9 @@ class BackendLogHandler(logging.Handler):
         now = time.monotonic()
         report: Optional[str] = None
         with self._lock:
-            self._stats['batches_dropped'] += 1
-            self._stats['records_dropped'] += record_count
+            if record_count:
+                self._stats['batches_dropped'] += 1
+                self._stats['records_dropped'] += record_count
             self._stats['last_error'] = reason
             self._failures_unreported += 1
             # Never report the FIRST failure: every process on an offline
@@ -483,15 +540,17 @@ class BackendLogHandler(logging.Handler):
             due = now - self._last_failure_report >= FAILURE_REPORT_INTERVAL
             if due:
                 report = (
-                    f'{self._failures_unreported} log batch(es) dropped since '
-                    f'{iso_utc(self._failure_window_start)}; last: {reason}'
+                    f'{self._failures_unreported} log batch send(s) failed since '
+                    f'{iso_utc(self._failure_window_start)}; last: {reason}; '
+                    f'{self._stats["records_dropped"]} records dropped, {len(self._buffer)} held'
                 )
                 self._failures_unreported = 0
                 self._last_failure_report = now
                 self._failure_window_start = time.time()
         if report is not None:
             self._write_stderr(report)
-        self._trace_line(f'dropped {record_count} records ({reason})')
+        if record_count:
+            self._trace_line(f'dropped {record_count} records ({reason})')
 
     def _trace_line(self, text: str) -> None:
         if self._trace:

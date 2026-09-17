@@ -16,5 +16,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SV="$(dirname "$HERE")"
 PY="${JAM_PYTHON:-/opt/jam/venv/bin/python3}"
 [ -x "$PY" ] || PY="$(command -v python3)"
+# The suites import every service module; without this their own log lines
+# (fake download failures included) would ship to the backend as this player's.
+export JAM_LOG_SHIPPING_DISABLED=1
 cd "$SV"
 exec "$PY" -m unittest discover -s tests -t . "${@:--v}"

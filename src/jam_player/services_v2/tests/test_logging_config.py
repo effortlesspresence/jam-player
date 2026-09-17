@@ -37,6 +37,8 @@ from common.logging_config import (  # noqa: E402
 
 # The table in docs/LOGGING.md ("Device implementation"). Binding.
 CONTRACT_MAPPING = {
+    # docs/LOGGING.md, mirrored by jam_player_system_service in jam-sphere's
+    # packages/database/prisma. Every Pi service here; OTHER is the fallback.
     'jam-announce': 'JAM_ANNOUNCE',
     'jam-ble-provisioning': 'JAM_BLE_PROVISIONING',
     'jam-ble-state-manager': 'JAM_BLE_STATE_MANAGER',
@@ -49,6 +51,14 @@ CONTRACT_MAPPING = {
     'jam-tailscale': 'JAM_TAILSCALE',
     'jam-update': 'JAM_UPDATE',
     'jam-ws-commands': 'JAM_WEBSOCKET_COMMANDS',
+    'jam-chrony-peering': 'JAM_CHRONY_PEERING',
+    'jam-display-cache-prewarm': 'JAM_DISPLAY_CACHE_PREWARM',
+    'jam-display-hotplug-monitor': 'JAM_DISPLAY_HOTPLUG_MONITOR',
+    'jam-display-wait-for-hdmi': 'JAM_DISPLAY_WAIT_FOR_HDMI',
+    'jam-installed-version-reporter': 'JAM_INSTALLED_VERSION_REPORTER',
+    'jam-outlet-status-poller': 'JAM_OUTLET_STATUS_POLLER',
+    'jam-venv-repair': 'JAM_VENV_REPAIR',
+    'jam-content-manager': 'JAM_CONTENT_MANAGER',
 }
 
 LOCAL_LINE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - (?P<name>\S+) - (?P<level>[A-Z]+) - (?P<msg>.*)$')
@@ -86,6 +96,7 @@ class _RootIsolation(unittest.TestCase):
         for p in self._patches:
             p.start()
         os.environ.pop('JOURNAL_STREAM', None)
+        os.environ.pop(logging_config.SHIPPING_DISABLED_ENV, None)  # run_on_device.sh sets it; these tests want the shipper
 
     def tearDown(self):
         for handler in list(self.root.handlers):
@@ -360,9 +371,13 @@ class JournalTests(unittest.TestCase):
             os.environ.pop('JOURNAL_STREAM', None)
             self.assertFalse(stderr_is_journal())
             self.assertFalse(JournalPriorityFormatter('%(message)s').journal)
-            os.environ['JOURNAL_STREAM'] = '9:1'
+            # systemd's rule: the variable is set AND names stderr's own dev:inode.
+            st = os.fstat(2)
+            os.environ['JOURNAL_STREAM'] = f'{st.st_dev}:{st.st_ino}'
             self.assertTrue(stderr_is_journal())
             self.assertTrue(JournalPriorityFormatter('%(message)s').journal)
+            os.environ['JOURNAL_STREAM'] = '9:1'   # some other stream: not ours
+            self.assertFalse(stderr_is_journal())
 
     def test_formatter_output(self):
         record = logging.LogRecord('n', logging.WARNING, __file__, 1, 'hello', None, None)

@@ -1081,7 +1081,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     # Title - centered
     title = "Waiting for content..."
     draw.text(
-        (center_x, center_y - 40),
+        (center_x, center_y - _scaled(40, height)),
         title,
         font=title_font,
         fill=JAM_ORANGE_PRIMARY,
@@ -1091,7 +1091,7 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     # Subtitle
     subtitle = "Content is being downloaded. This may take a few minutes."
     draw.text(
-        (center_x, center_y + 70),
+        (center_x, center_y + _scaled(70, height)),
         subtitle,
         font=subtitle_font,
         fill=TEXT_COLOR,
@@ -1100,9 +1100,11 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
 
     # Animated-looking dots (static, but gives impression of activity)
     # Draw three dots with varying opacity to suggest animation
-    dot_y = center_y + 150
-    dot_spacing = 30
-    dot_radius = 8
+    # Scaled like the text above: fixed offsets put the 4K title and subtitle
+    # on top of each other (caught by tests/test_display_screen_layout.py).
+    dot_y = center_y + _scaled(150, height)
+    dot_spacing = _scaled(30, height)
+    dot_radius = _scaled(8, height)
     for i, alpha in enumerate([255, 180, 100]):
         dot_x = center_x + (i - 1) * dot_spacing
         dot_color = (
@@ -1539,7 +1541,7 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
 
     title = "No Content Scheduled"
     draw.text(
-        (center_x, center_y - 65),
+        (center_x, center_y - _scaled(65, height)),
         title,
         font=title_font,
         fill=JAM_ORANGE_PRIMARY,
@@ -1548,7 +1550,7 @@ def create_no_scheduled_content_screen(width: int, height: int, device_uuid: str
 
     subtitle = "Content will appear during scheduled hours."
     draw.text(
-        (center_x, center_y + 60),
+        (center_x, center_y + _scaled(60, height)),
         subtitle,
         font=subtitle_font,
         fill=TEXT_COLOR,

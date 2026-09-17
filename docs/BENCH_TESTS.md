@@ -317,9 +317,26 @@ downloading), never "Set up your JAM Player" (AWAITING_NETWORK), even though
 and the screens are unchanged. (2026-09-16: the new display treated the missing
 stamp as offline and showed the setup screen until reboot.)
 
-**E6 · No stalls or timeouts in the state manager during the update** `[ ]`
-During E2/E4, `journalctl -u jam-ble-state-manager -b --no-pager | grep -cE "Timeout restarting|start jam-update timed out"`
-= 0 (both systemctl calls are now `--no-block`; queued jobs run when jam-update exits).
+**E6 · No stalls or timeouts in the NEW state manager during an update** `[ ]`
+Applies from the second update onward (or any update on a player already on
+this code). During it,
+`journalctl -u jam-ble-state-manager -b --no-pager | grep -cE "Timeout restarting|Timeout starting|start jam-update timed out|Watchdog timeout"`
+= 0: every systemctl call the manager makes is now `--no-block`, so jobs queue
+behind the running updater instead of freezing the manager's loop.
+**Known and expected on the FIRST hop from 7440d2d only:** the fielded manager
+blocks on those same calls, misses its 90 s watchdog about 70 s after WiFi
+connects, is killed by systemd and restarted onto the new code (bench
+2026-09-17, 10:55:36). The phone's BLE link survives (jam-ble-provisioning is
+a separate unit). Not a regression; it is why E5's mixed window usually does
+not last.
+
+**E7 · Restarts queued behind the updater are not reported as faults** `[ ]`
+`jam-update.service` is `Before=` jam-content-manager and jam-heartbeat, so
+systemd cannot start either until the updater exits. Expected in the updater's
+journal: `jam-content-manager.service: inactive, restart queued behind this
+updater (runs when jam-update exits)` and `All critical services running`; no
+`may need attention`. Both units' ExecMainStartTimestamp is within ~10 s of
+jam-update's ExecMainExitTimestamp.
 
 ### F — Reporting and display (MAC / network status)
 
@@ -346,10 +363,13 @@ Wi-Fi MAC, Ethernet MAC, and Network (SSID / Ethernet) for the bench device.
 Power off the AP for > 10 min. Expected: dashboard flips to offline with the last
 network shown; no false-offline while the device is healthy.
 
-**F4 · Logs reach the backend** `[ ]`
+**F4 · Logs reach the backend, in device-time order, none lost** `[ ]`
 Within a minute of any service starting on new code, JamPlayerLog rows for this
-device appear in the testing dashboard's Logs & Errors panel (INFO level). If
-not: `sudo journalctl -b --no-pager | grep -F "[log_shipper]"` (drops are reported
+device appear in the testing dashboard's Logs & Errors panel (INFO level), each
+line stamped with its own device time (arrival time in the tooltip), and the
+content manager's full initial-load sequence is there from "Loading initial
+content..." to "Initial content loaded" (2026-09-17: a failed send dropped its
+batch; now it is kept and retried). If not: `sudo journalctl -b --no-pager | grep -F "[log_shipper]"` (drops are reported
 only after 1 h of continuous failure) and confirm the handler is attached:
 `cd /opt/jam/services && sudo /opt/jam/venv/bin/python -c "import logging; from common.logging_config import setup_service_logging; setup_service_logging('jam-heartbeat'); print([type(h).__name__ for h in logging.getLogger().handlers])"`
 must list `BackendLogHandler`. (2026-09-11..16 code never attached it.)

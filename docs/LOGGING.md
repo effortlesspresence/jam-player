@@ -10,16 +10,28 @@ and fielded cards have failed from it. So:
 
 | Level | On the card (journald) | Backend (dashboards) |
 |---|---|---|
-| DEBUG, INFO | never written | shipped when online, **dropped when offline** |
+| DEBUG, INFO | never written | shipped when online; **held in memory (bounded) while it is not** |
 | WARNING | kept | shipped |
 | ERROR, CRITICAL | kept | shipped |
 
 "Kept on the card" means exactly what an operator standing in front of the
 player needs to tell that a critical part of the system is not working.
 Everything else is only useful with the whole fleet in view, which is what
-the dashboards are for. A player that cannot reach the backend loses its
-INFO/DEBUG lines for that period. That is accepted on purpose: no disk
-queue, no retry buffer on the card.
+the dashboards are for. A player that cannot reach the backend keeps its
+INFO/DEBUG lines in memory only: a send that fails for a reason that can
+pass later (timeout, connection error, 5xx, 429) puts the batch back at the
+head of the shipper's ring buffer (1000 entries per process) and is retried
+at the next 30-second flush; once the ring is full the oldest lines are
+evicted. A batch the backend rejects outright (any other 4xx) is dropped.
+Nothing is ever queued on disk. (Before 2026-09-17 every failed send dropped
+its batch, so one slow Lambda cold start silently lost 30 s of a healthy
+player's lines.)
+
+The dashboards' Logs & Errors panel shows and orders by each line's
+**device time** (`deviceTs`); the arrival time (`receivedAt`) is in the
+tooltip. Set `JAM_LOG_SHIPPING_DISABLED=1` in a process's environment to
+keep the card handler but attach no shipper -- `tests/run_on_device.sh`
+does, so the suites' own log lines never reach the backend as the player's.
 
 Two independent mechanisms enforce the rule, so neither alone is load-bearing:
 

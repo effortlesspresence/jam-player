@@ -104,6 +104,7 @@ class _ShipperTestCase(unittest.TestCase):
                 self.stderr = started
         os.environ.pop('JOURNAL_STREAM', None)
         os.environ.pop(log_shipper.TRACE_ENV, None)
+        os.environ.pop('JAM_LOG_SHIPPING_DISABLED', None)
         self._handlers = []
 
     def tearDown(self):
@@ -315,34 +316,66 @@ class FailureTests(_ShipperTestCase):
             handler.emit(_record(str(i)))
         return handler.flush_now()
 
-    def test_request_exception_drops_batch_without_retry(self):
+    def test_request_exception_keeps_the_batch_for_the_next_flush(self):
+        """A slow Lambda cold start used to cost 30 s of a healthy player's lines."""
         handler = self.handler()
         self.backend.exc = RuntimeError('boom')
         self.assertFalse(self._emit_and_flush(handler))
         stats = handler.stats()
-        self.assertEqual(stats['queued'], 0)
-        self.assertEqual(stats['batches_dropped'], 1)
-        self.assertEqual(stats['records_dropped'], 3)
+        self.assertEqual(stats['queued'], 3, 'the batch went back to the ring')
+        self.assertEqual(stats['batches_deferred'], 1)
+        self.assertEqual(stats['batches_dropped'], 0)
+        self.assertEqual(stats['records_dropped'], 0)
         self.assertIn('RuntimeError', stats['last_error'])
-        handler.flush_now()
-        self.assertEqual(len(self.backend.calls), 1)  # nothing re-queued, nothing retried
-
-    def test_none_response_drops_batch(self):
+        self.backend.exc = None
+        self.assertTrue(handler.flush_now())
+        self.assertEqual(len(self.backend.calls), 2)
+        self.assertEqual(self.sent_messages(call_index=1), ['0', '1', '2'], 'same records, same order, once')
+    def test_none_response_keeps_the_batch(self):
         handler = self.handler()
         self.backend.status = None  # api_request's timeout / connection-error result
         self.assertFalse(self._emit_and_flush(handler))
-        self.assertEqual(handler.stats()['queued'], 0)
-        self.assertEqual(handler.stats()['batches_dropped'], 1)
+        self.assertEqual(handler.stats()['queued'], 3)
+        self.assertEqual(handler.stats()['batches_deferred'], 1)
+        self.assertEqual(handler.stats()['batches_dropped'], 0)
+    def test_transient_statuses_keep_the_batch(self):
+        for status in (408, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                handler = self.handler()
+                self.backend.status = status
+                self.assertFalse(self._emit_and_flush(handler))
+                self.assertEqual(handler.stats()['queued'], 3)
+                self.assertEqual(handler.stats()['batches_dropped'], 0)
+                self.assertEqual(handler.stats()['last_error'], f'HTTP {status}')
 
-    def test_non_2xx_drops_batch(self):
-        for status in (400, 401, 429, 500, 503):
+    def test_a_rejected_batch_is_dropped_not_retried_forever(self):
+        """400/401/404/413: the backend has said no; resending would never help."""
+        for status in (400, 401, 403, 404, 413):
             with self.subTest(status=status):
                 handler = self.handler()
                 self.backend.status = status
                 self.assertFalse(self._emit_and_flush(handler))
                 self.assertEqual(handler.stats()['queued'], 0)
+                self.assertEqual(handler.stats()['batches_dropped'], 1)
+                self.assertEqual(handler.stats()['records_dropped'], 3)
                 self.assertEqual(handler.stats()['last_error'], f'HTTP {status}')
 
+    def test_a_kept_batch_still_yields_to_the_ring_capacity(self):
+        """Offline for a long time: the ring, not the retry, bounds memory."""
+        handler = self.handler(ring_capacity=5)
+        self.backend.status = 503
+        with mock.patch.object(handler, '_ensure_thread'):
+            for i in range(3):
+                handler.emit(_record(str(i)))
+            self.assertFalse(handler.flush_now())          # 0,1,2 kept
+            for i in range(3, 7):
+                handler.emit(_record(str(i)))               # 7 entries for a ring of 5
+        stats = handler.stats()
+        self.assertEqual(stats['queued'], 5)
+        self.assertEqual(stats['ring_dropped'], 2, 'the two oldest kept entries were evicted')
+        self.backend.status = 200
+        self.assertTrue(handler.flush_now())
+        self.assertEqual(self.sent_messages(call_index=1), ['2', '3', '4', '5', '6'])
     def test_any_2xx_is_accepted(self):
         for status in (200, 202, 204):
             with self.subTest(status=status):
@@ -360,8 +393,7 @@ class FailureTests(_ShipperTestCase):
         self.assertEqual(self.backend.wait_for_calls(1), 1)
         time.sleep(0.3)
         self.assertEqual(len(self.backend.calls), 1)
-        self.assertEqual(handler.stats()['queued'], MAX_BATCH_RECORDS)
-
+        self.assertEqual(handler.stats()['queued'], 400, 'the failed batch went back; nothing was lost')
     def test_no_send_without_announce(self):
         handler = self.handler()
         self.backend.identity = False
@@ -394,18 +426,17 @@ class FailureTests(_ShipperTestCase):
         for _ in range(3):
             self._emit_and_flush(handler, count=1)
         self.assertEqual(self.stderr.getvalue(), '', 'no line on the first failures')
-
         handler._last_failure_report -= log_shipper.FAILURE_REPORT_INTERVAL + 1  # an hour passes
         self._emit_and_flush(handler, count=1)
         lines = self.stderr.getvalue().splitlines()
         self.assertEqual(len(lines), 1, lines)
-        self.assertIn('4 log batch(es) dropped since', lines[0])
+        self.assertIn('4 log batch send(s) failed since', lines[0])
         self.assertIn('HTTP 503', lines[0])
-
+        self.assertIn('4 held', lines[0], 'the kept records are reported, not silently lost')
         self._emit_and_flush(handler, count=1)
         self.assertEqual(len(self.stderr.getvalue().splitlines()), 1, 'at most one line per interval')
-        self.assertEqual(handler.stats()['batches_dropped'], 5)
-
+        self.assertEqual(handler.stats()['batches_deferred'], 5)
+        self.assertEqual(handler.stats()['batches_dropped'], 0)
     def test_stderr_report_carries_journal_priority_under_systemd(self):
         handler = self.handler()
         self.backend.status = None

@@ -160,8 +160,10 @@ class GitHygieneTests(unittest.TestCase):
 class ReleaseTargetResolutionTests(unittest.TestCase):
     HEAD = 'h' * 40
 
+    INSTALLED = 'i' * 40   # an installed player; the first-install floor is test_update_target's business
+
     def _resolve(self, target, uuid='3f2a9c10-7b4e-4d2a-9e1f-0a1b2c3d4e5f', available=True,
-                 cached=None, installed=None, is_ancestor=False):
+                 cached=None, installed=INSTALLED, is_ancestor=False):
         """target = what the backend answers (None = unreachable); cached = what
         /var/lib/jam/update_target.json holds for 'main' (None = nothing);
         installed = /etc/jam/version.txt; is_ancestor = what
@@ -181,7 +183,8 @@ class ReleaseTargetResolutionTests(unittest.TestCase):
              mock.patch.object(ju, 'write_cached_target', side_effect=lambda b, a: self.cache_writes.append((b, a)) or True), \
              mock.patch('common.credentials.get_device_uuid', return_value=uuid), \
              mock.patch.object(ju, '_ensure_commit_available', return_value=available), \
-             mock.patch.object(ju, 'report_error'):
+             mock.patch.object(ju, 'report_error') as report_error:
+            self.report_error = report_error
             return ju.get_latest_version('main')
 
     def test_no_backend_answer_and_no_cache_stays_put_never_head(self):
@@ -250,7 +253,7 @@ class ReleaseTargetResolutionTests(unittest.TestCase):
              mock.patch.object(ju, '_fetch_update_target', return_value=None), \
              mock.patch.object(ju, 'read_cached_target', return_value=None), \
              mock.patch.object(ju, 'write_cached_target', return_value=True), \
-             mock.patch.object(ju, 'get_current_version', return_value=None), \
+             mock.patch.object(ju, 'get_current_version', return_value=self.INSTALLED), \
              mock.patch('common.credentials.get_device_uuid', return_value='u'), \
              mock.patch.object(ju, 'report_error'):
             self.assertIsNone(ju.get_latest_version('main'), 'no answer, no cache -> stay put')
@@ -266,10 +269,10 @@ class ReleaseTargetResolutionTests(unittest.TestCase):
         """Even a deliberate backward target is refused: the updater never
         deletes files or units a newer release added, so 'downgrading' yields a
         mixed-version tree. Fix forward instead."""
-        with mock.patch.object(ju, 'report_error') as rep:
-            self.assertIsNone(self._resolve(
-                {'targetCommit': 'old' + 'a' * 37, 'hold': False, 'eligible': True},
-                installed='n' * 40, is_ancestor=True))
+        self.assertIsNone(self._resolve(
+            {'targetCommit': 'old' + 'a' * 37, 'hold': False, 'eligible': True},
+            installed='n' * 40, is_ancestor=True))
+        rep = self.report_error   # _resolve patches report_error itself; assert on that mock
         self.assertTrue(rep.called)
         self.assertIn('older than the installed', rep.call_args.args[0])
 
