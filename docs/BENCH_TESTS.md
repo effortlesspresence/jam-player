@@ -705,6 +705,85 @@ sudo rm -f /run/jam/boot_identity_shown; sudo systemctl start jam-update & sleep
 ```
 
 
+### M — Schedules: past midnight and several windows a day (J20Q-583)
+
+The backend compiles a row's schedule into calendar-day entries and sends two lists per scene:
+`daysScheduled` (one entry per weekday, all that fielded 7440d2d can read, an approximation when a
+schedule needs more) and `exactDaysScheduled` (every window, sent only when one entry per weekday
+cannot say it). This player now reads the exact list when it is there, tries EVERY entry for today
+instead of only the first, compares by whole minutes with the end minute included (as webOS always
+has), and re-checks the schedule when the minute turns over instead of every 60 s from service
+start. Rules and the reasons for them: `common/schedule.py`.
+
+Until the jam-sphere gate is lifted (`isPastMidnightScheduleAllowed`, chains-common), only a
+RESTAURANT_CHAIN location can SAVE a past-midnight or several-window schedule, so link the bench
+player to a screen in one on the testing backend.
+
+**M1 · Unit suite** `[ ]`
+Runs on a laptop too (stdlib only). It mirrors the webOS schedule suite case for case.
+```
+cd /home/comitup/jam-player/src/jam_player/services_v2 && sudo JAM_LOG_SHIPPING_DISABLED=1 /opt/jam/venv/bin/python3 -m unittest tests.test_schedule -v
+```
+
+**M2 · The exact windows reach the manifest** `[ ]`
+Give a row "Monday 8am-12pm + 5pm-10pm" and publish. Expected: a count of 1 or more below, and
+`days_scheduled` is still there beside it (the single entry older displays read).
+```
+sudo grep -c exact_days_scheduled /opt/jam/content/live_scenes/scenes.json
+```
+A row with one plain window, or the same past-midnight window every night, must NOT get an exact
+list: the backend only sends it when one entry per weekday falls short.
+
+**M3 · Ask the player what plays at any moment** `[ ]`
+Evaluates the LIVE manifest with the player's own rules, at a time you name, without waiting for
+the clock. Use it to walk a schedule's edges: for "Monday 8am-12pm + 5pm-2am" expect PLAYS at Monday
+09:00, off at 13:00, PLAYS at 23:59 and at Tuesday 01:30 and 02:00, off at Tuesday 02:01 and 17:30.
+Change the date and time at the end (2026-11-16 is a Monday).
+```
+cd /opt/jam/services && sudo /opt/jam/venv/bin/python3 -c "import json,sys;sys.path.insert(0,'.');from datetime import datetime;from common import schedule as s;w=datetime.strptime(sys.argv[1],'%Y-%m-%d %H:%M');[print(x['id'],'PLAYS' if s.is_scene_scheduled_at(x,w) else 'off','(exact windows)' if x.get('exact_days_scheduled') else '') for x in json.load(open('/opt/jam/content/live_scenes/scenes.json'))]" "2026-11-16 09:00"
+```
+
+**M4 · A window opens and closes on the minute** `[ ]`
+Schedule a row to start 3 minutes from now and end 2 minutes after that, with another row playing
+all day. Watch the TV against a phone clock showing seconds. Expected: the row joins within a second
+or two of its start minute turning over, and leaves within a second or two of the minute AFTER its
+end minute turning over (the end minute is included). On 7440d2d a start could be up to a minute
+late, and an end landed somewhere inside the end minute instead of after it.
+
+**M5 · Several windows in one day** `[ ]`
+One row, today, two windows a few minutes apart (for example now+2 to now+4 and now+6 to now+8),
+and no other rows. Expected: content, then the "No Content Scheduled" screen between the windows,
+then content again for the second window, then the screen again. On 7440d2d only the longer window
+plays.
+
+**M6 · Through midnight** `[ ]`
+A row scheduled today from 23:00 to 02:00. Jump the clock to just before midnight and watch.
+Expected: playback continues across 00:00 without a blank frame or the wait screen. Then jump to
+02:00:30: still playing. At 02:01:00 it stops.
+```
+sudo systemctl stop chrony && sudo date -s "23:59:30"
+```
+```
+sudo date -s "02:00:30"
+```
+Restore the clock when done (signed API calls fail while it is wrong, which is harmless for a few
+minutes):
+```
+sudo systemctl start chrony && sleep 15 && date
+```
+
+**M7 · Back-to-back rows leave no gap** `[ ]`
+Two rows today: A ends at now+3 minutes, B starts at now+4 (the editor's "ends 12:00 / starts
+12:00" pair, or two dayparts). Expected: A's scenes are replaced by B's at the top of the minute
+with no "No Content Scheduled" screen in between. On 7440d2d the screen sat empty for up to a
+minute at this seam.
+
+**M8 · A wall changes together** `[ ]`
+Two players on one layout, a row that starts 3 minutes from now. Expected: both TVs pick the row
+up in the same second, and their scenes stay in step afterwards (wall sync positions each screen
+from the same scene list).
+
+
 ### G — Gates
 
 **G1 · On-device unit suites green** `[ ]` — `cd /opt/jam/services && sudo tests/run_on_device.sh`

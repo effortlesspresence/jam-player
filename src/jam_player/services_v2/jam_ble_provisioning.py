@@ -108,6 +108,7 @@ from common.network import (
 )
 from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, safe_touch, touch_volatile_flag
 from common.network import check_internet_connectivity
+from common.wifi_attempts import WifiAttemptLedger
 
 # ============================================================================
 # Logging Configuration
@@ -1045,6 +1046,19 @@ class WiFiCredentialsCharacteristic(Characteristic):
         super().__init__(bus, index, WIFI_CREDENTIALS_UUID, ['write', 'write-without-response'], service)
         # Reference to status characteristic so we can update it
         self.status_characteristic = status_characteristic
+        # Which connect attempt is the current one. Every status this class
+        # reports goes through it, so an attempt the user has moved on from
+        # can never speak over a newer one. See common/wifi_attempts.py.
+        self._attempts = WifiAttemptLedger()
+
+    def _reject(self, message: str) -> None:
+        """
+        Answer a write we cannot act on with `failed`. It still counts as the
+        newest attempt: it is the answer to the latest thing the app asked,
+        so an older attempt that is still running must not report over it.
+        """
+        self._attempts.begin(lambda: self.status_characteristic.set_status('failed', message))
+        self._attempts.end()
 
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
     def WriteValue(self, value, options):
@@ -1071,7 +1085,7 @@ class WiFiCredentialsCharacteristic(Characteristic):
                 # 'failed' is in every fielded app's ConnectionState enum;
                 # 'error' was not, so the apps dropped it and sat in their
                 # 60-second polling loop before reporting a timeout.
-                self.status_characteristic.set_status('failed', 'No network specified')
+                self._reject('No network specified')
                 return
 
             if use_saved and connection_name:
@@ -1080,7 +1094,14 @@ class WiFiCredentialsCharacteristic(Characteristic):
                 logger.info(f"Attempting to connect to WiFi: {ssid}")
                 logger.info(f"Password length: {len(password)} chars")
 
-            self.status_characteristic.set_status('connecting', f'Connecting to {ssid or connection_name}...')
+            # Begin a new attempt. From this line on every earlier attempt is
+            # superseded: it reports nothing more, and it stops before judging
+            # or forgetting a network. `connecting` is reported in the same
+            # step, so a late report from an older attempt can only ever land
+            # before it, never on top of it.
+            attempt = self._attempts.begin(
+                lambda: self.status_characteristic.set_status(
+                    'connecting', f'Connecting to {ssid or connection_name}...'))
 
             # Tell jam-ble-state-manager a setup session is in flight, so it
             # will not close the post-boot recovery window underneath us. The
@@ -1088,9 +1109,42 @@ class WiFiCredentialsCharacteristic(Characteristic):
             # reboot if we somehow fail to clear it.
             touch_volatile_flag(BLE_SESSION_ACTIVE_FLAG)
 
+            def report(status: str, message: str) -> bool:
+                """Report on behalf of THIS attempt; dropped once it is superseded."""
+                sent = self._attempts.report(
+                    attempt, lambda: self.status_characteristic.set_status(status, message))
+                if not sent:
+                    logger.info(f"[BLE->WiFi] Not reporting '{status}': a newer connect attempt has started")
+                return sent
+
+            def superseded(stage: str) -> bool:
+                if self._attempts.is_current(attempt):
+                    return False
+                logger.warning(
+                    f"[BLE->WiFi] A newer connect attempt started {stage} {ssid or connection_name}; "
+                    f"leaving the outcome to it")
+                return True
+
             # Run connection in a background thread so we don't block the BLE write.
             # BLE operations should complete quickly; WiFi connection can take 10-30 seconds.
             def connect_async():
+                # The `failed` owed ~3 s after a status that older app builds
+                # do not know. Reported after this attempt's turn has ended,
+                # so the next attempt never waits out that pause.
+                fallback = None
+                with self._attempts.turn(attempt) as still_wanted:
+                    if not still_wanted:
+                        logger.info(
+                            f"[BLE->WiFi] Not connecting to {ssid or connection_name}: "
+                            f"a newer connect attempt replaced this one while it waited its turn")
+                        return
+                    fallback = connect_and_judge()
+                if fallback is not None:
+                    time.sleep(NO_INTERNET_FALLBACK_DELAY_SECONDS)
+                    report('failed', fallback)
+
+            def connect_and_judge():
+                """One attempt's turn. Returns the message for a trailing `failed`, or None."""
                 if use_saved and connection_name:
                     # Connect to saved network without password
                     logger.info(f"[BLE->WiFi] Connecting to saved network: {connection_name}")
@@ -1099,6 +1153,12 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     # Connect with password (new network or updating saved network password)
                     logger.info(f"[BLE->WiFi] Starting WiFi connection attempt for SSID: {ssid}")
                     success, error_msg = connect_to_wifi(ssid, password, hidden=hidden)
+
+                # The user picked something else while nmcli was working. This
+                # attempt's result is no longer wanted, and the newer attempt
+                # (which runs next) decides where the player ends up.
+                if superseded('while connecting to'):
+                    return None
 
                 if success:
                     # WiFi ASSOCIATED, but association is not usability: a
@@ -1120,11 +1180,17 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     # network.wait_for_clock_sync for the 60 s app budget.
                     clock_synced = wait_for_clock_sync()
                     reachability = classify_connectivity()
+                    # Judging took up to half a minute. If the user moved on in
+                    # that time, this verdict must not be reported, must not
+                    # forget a profile and must not announce: the newer attempt
+                    # is about to change the network under it.
+                    if superseded('while checking the internet on'):
+                        return None
                     if reachability == 'backend':
                         logger.info(f"[BLE->WiFi] SUCCESS - {ssid or connection_name} can reach the JAM backend")
-                        self.status_characteristic.set_status('connected', f'Connected to {ssid or connection_name}')
-                        announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
-                        announce_thread.start()
+                        if report('connected', f'Connected to {ssid or connection_name}'):
+                            announce_thread = threading.Thread(target=try_announce_after_wifi, daemon=True)
+                            announce_thread.start()
                     elif reachability == 'internet_only':
                         # Real internet, but our backend is unreachable: a customer
                         # firewall OR one of our own outages -- the device cannot
@@ -1133,9 +1199,8 @@ class WiFiCredentialsCharacteristic(Characteristic):
                         # and the state manager keeps BLE up meanwhile. Just tell the
                         # user their network cannot reach us.
                         logger.warning(f"[BLE->WiFi] {ssid or connection_name} has internet but CANNOT reach the JAM backend (firewall or backend outage) - profile kept")
-                        self.status_characteristic.set_status('backend_unreachable', 'Internet OK but JAM servers unreachable')
-                        time.sleep(NO_INTERNET_FALLBACK_DELAY_SECONDS)
-                        self.status_characteristic.set_status('failed', 'JAM servers unreachable from this network')
+                        if report('backend_unreachable', 'Internet OK but JAM servers unreachable'):
+                            return 'JAM servers unreachable from this network'
                     else:
                         # Nothing verifiable answers: captive portal, dead uplink, or
                         # a network firewalling everything we probe. Forget the
@@ -1152,9 +1217,8 @@ class WiFiCredentialsCharacteristic(Characteristic):
                             forget_active_wifi_connection()
                         else:
                             logger.warning(f"[BLE->WiFi] {ssid or connection_name} associated but nothing verifiable answered; KEEPING the profile: {why_not}")
-                        self.status_characteristic.set_status('no_internet', 'Network has no usable internet (captive portal?)')
-                        time.sleep(NO_INTERNET_FALLBACK_DELAY_SECONDS)
-                        self.status_characteristic.set_status('failed', 'No usable internet on this network')
+                        if report('no_internet', 'Network has no usable internet (captive portal?)'):
+                            return 'No usable internet on this network'
                 else:
                     logger.error(f"[BLE->WiFi] FAILED - Could not connect to {ssid or connection_name}")
                     logger.error(f"[BLE->WiFi] Raw error message: {error_msg}")
@@ -1168,26 +1232,41 @@ class WiFiCredentialsCharacteristic(Characteristic):
                     else:
                         status_code = 'failed'
                     logger.error(f"[BLE->WiFi] Sending status '{status_code}' to mobile app")
-                    self.status_characteristic.set_status(status_code, error_msg)
+                    report(status_code, error_msg)
+                return None
 
             def connect_async_guarded():
                 try:
                     connect_async()
+                except Exception as e:
+                    # Never leave the app polling a `connecting` that nobody
+                    # will ever finish. (Dropped, like any report, if a newer
+                    # attempt has already taken over.)
+                    logger.error(f"[BLE->WiFi] Connect attempt crashed: {e}", exc_info=True)
+                    report('failed', str(e))
                 finally:
-                    try:
-                        BLE_SESSION_ACTIVE_FLAG.unlink(missing_ok=True)
-                    except Exception as e:
-                        logger.warning(f"Could not clear BLE session flag: {e}")
+                    # The marker belongs to every attempt still in flight, so
+                    # it comes down only when the last one is done.
+                    if self._attempts.end():
+                        try:
+                            BLE_SESSION_ACTIVE_FLAG.unlink(missing_ok=True)
+                        except Exception as e:
+                            logger.warning(f"Could not clear BLE session flag: {e}")
 
-            thread = threading.Thread(target=connect_async_guarded, daemon=True)
-            thread.start()
+            try:
+                thread = threading.Thread(target=connect_async_guarded, daemon=True)
+                thread.start()
+            except Exception:
+                # No thread means nobody will ever call end() for this attempt.
+                self._attempts.end()
+                raise
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in WiFi credentials: {e}")
-            self.status_characteristic.set_status('failed', 'Invalid data format')
+            self._reject('Invalid data format')
         except Exception as e:
             logger.error(f"Error processing WiFi credentials: {e}")
-            self.status_characteristic.set_status('failed', str(e))
+            self._reject(str(e))
 
 
 # ============================================================================

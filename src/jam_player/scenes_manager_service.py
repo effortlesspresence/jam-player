@@ -13,7 +13,9 @@ The API returns scenes with:
 - imageUrl: URL to image file (for image-based scenes)
 - videoUrl: URL to video file (for video-based scenes)
 - duration: How long to display (seconds)
-- daysScheduled: Day/time scheduling info
+- daysScheduled: Day/time scheduling info, at most one entry per weekday
+- exactDaysScheduled: Only when one entry per weekday cannot say it exactly
+  (several windows in a day, some past-midnight windows): every window
 
 Content updates can be triggered by:
 1. WebSocket REFRESH_CONTENT command (via SIGUSR1 from jam_ws_commands)
@@ -157,8 +159,8 @@ def fetch_content() -> Optional[Tuple[List[Dict[str, Any]], Optional[int]]]:
     Calls GET /jam-players/{deviceUuid}/content with Ed25519 signing.
 
     Returns:
-        List of scene dicts with id, mediaType, imageUrl, videoUrl, duration, daysScheduled,
-        or None on error.
+        List of scene dicts with id, mediaType, imageUrl, videoUrl, duration, daysScheduled
+        and (for some schedules) exactDaysScheduled, or None on error.
     """
     device_uuid = get_device_uuid()
     if not device_uuid:
@@ -663,6 +665,10 @@ def load_content() -> str:
         video_url = scene.get('videoUrl')
         duration = scene.get('duration')
         days_scheduled = scene.get('daysScheduled', [])
+        # Sent only when one entry per weekday cannot say exactly when the
+        # scene plays: several windows in a day, or some windows that run past
+        # midnight. See common/schedule.py.
+        exact_days_scheduled = scene.get('exactDaysScheduled')
 
         # Determine if this is an image or video scene based on mediaType
         # IMAGE types: CANVAS_IMAGE, and CANVAS_BRAND_AD with image
@@ -724,6 +730,14 @@ def load_content() -> str:
             'duration': duration,
             'days_scheduled': days_scheduled,  # For display service to filter by day/time
         }
+        # The exact windows ride ALONGSIDE days_scheduled rather than replacing
+        # it. days_scheduled stays the one-entry-per-weekday list that every
+        # display build can read, so a manifest written by this build is still
+        # right for a display that predates the exact list (the two services
+        # are restarted separately during an update, and a rolled-back update
+        # restores an older display over this manifest).
+        if isinstance(exact_days_scheduled, list) and exact_days_scheduled:
+            processed_scene['exact_days_scheduled'] = exact_days_scheduled
         processed_scenes.append(processed_scene)
 
         # Write individual scene JSON (for compatibility)

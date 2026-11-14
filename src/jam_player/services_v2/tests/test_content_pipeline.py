@@ -199,6 +199,30 @@ class LoadResultTests(_TmpDirs):
             self.assertEqual(sms.load_content(), sms.LOAD_COMPLETE)
         self.assertEqual(json.loads((self.live / 'scenes.json').read_text()), [])
 
+    def test_exact_schedule_windows_reach_the_manifest_beside_days_scheduled(self):
+        # "Monday 8am-12pm + 5pm-10pm": one entry per weekday cannot say it,
+        # so the backend sends the closest single entry AND the exact windows.
+        approx = [{'dayOfWeek': {'value': 'MONDAY'}, 'startTime': '17:00', 'endTime': '22:00'}]
+        exact = [{'dayOfWeek': {'value': 'MONDAY'}, 'startTime': '08:00', 'endTime': '12:00'},
+                 {'dayOfWeek': {'value': 'MONDAY'}, 'startTime': '17:00', 'endTime': '22:00'}]
+        two_windows = dict(_scene(1, 'https://cdn/1.png'), daysScheduled=approx, exactDaysScheduled=exact)
+        one_window = dict(_scene(2, 'https://cdn/2.png'), daysScheduled=approx)
+        empty_exact = dict(_scene(3, 'https://cdn/3.png'), daysScheduled=approx, exactDaysScheduled=[])
+        null_exact = dict(_scene(4, 'https://cdn/4.png'), daysScheduled=approx, exactDaysScheduled=None)
+        with mock.patch.object(sms, 'fetch_content',
+                               return_value=([two_windows, one_window, empty_exact, null_exact], 1)), \
+             mock.patch.object(sms, 'download_media', side_effect=self._fake_download(None)), \
+             mock.patch.object(sms, 'cleanup_unused_media'):
+            self.assertEqual(sms.load_content(), sms.LOAD_COMPLETE)
+        live = {s['id']: s for s in json.loads((self.live / 'scenes.json').read_text())}
+        self.assertEqual(live['s1']['exact_days_scheduled'], exact)
+        self.assertEqual(live['s1']['days_scheduled'], approx,
+                         'the single-entry list stays, for a display that predates the exact one')
+        for scene_id in ('s2', 's3', 's4'):
+            self.assertNotIn('exact_days_scheduled', live[scene_id],
+                             'no exact list sent: the record is what it always was')
+            self.assertEqual(live[scene_id]['days_scheduled'], approx)
+
 
 class OfflinePlayersKeepTheirContentTests(_TmpDirs):
     """Product rule: a reload attempt never takes content off the board. Only an

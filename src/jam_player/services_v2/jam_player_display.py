@@ -80,7 +80,7 @@ import signal
 from pathlib import Path
 from enum import Enum
 from typing import Optional, Any, List, Dict
-from datetime import datetime, time as dt_time
+from datetime import datetime
 
 # Add the services directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -96,6 +96,7 @@ from common.credentials import (
     get_display_orientation,
 )
 from common.system import get_systemd_notifier, setup_signal_handlers, check_chrony_sync
+from common.schedule import is_scene_scheduled_at, schedule_minute
 from common.paths import (
     INTERNET_VERIFIED_FLAG,
     BOOT_IDENTITY_SHOWN_FLAG, PLYMOUTH_SPLASH, PLYMOUTH_SPLASH_BACKUP,
@@ -275,91 +276,25 @@ class DisplayMode(Enum):
 # Scheduling Helpers - Filter scenes by day/time
 # =============================================================================
 
-# Map Python weekday (0=Monday) to API day names
-WEEKDAY_NAMES = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
-
-
-def parse_time_str(time_str: str) -> Optional[dt_time]:
-    """Parse 'HH:MM' string to datetime.time object."""
-    if not time_str:
-        return None
-    try:
-        parts = time_str.split(':')
-        return dt_time(int(parts[0]), int(parts[1]))
-    except (ValueError, IndexError):
-        return None
-
-
 def is_scene_scheduled_now(scene: Dict[str, Any]) -> bool:
     """
-    Check if a scene should be displayed right now based on its daysScheduled.
+    Should this scene be on screen right now?
 
-    Rules from the design doc:
-    1. If current day is NOT in daysScheduled list → don't display
-    2. If current day IS in list but startTime/endTime are null → display all day
-    3. If current day IS in list with startTime + endTime → only display during that range
+    The rules live in common/schedule.py, which is stdlib-only so they can be
+    tested off the device and kept in step with the webOS and browser players.
+    In short: a scene with no schedule always plays; otherwise it plays when
+    ANY entry for today's weekday covers the current minute, reading the
+    backend's exact windows (several per day, or split around midnight) when
+    it sent them and the one-entry-per-day list when it did not.
 
     Args:
-        scene: Scene dict with optional 'days_scheduled' field
+        scene: Scene dict from scenes.json, with optional 'days_scheduled'
+               and 'exact_days_scheduled' fields
 
     Returns:
         True if scene should be displayed now, False otherwise
     """
-    days_scheduled = scene.get('days_scheduled', [])
-
-    # If no scheduling info, always display (backwards compatibility)
-    if not days_scheduled:
-        return True
-
-    now = datetime.now()
-    current_weekday = WEEKDAY_NAMES[now.weekday()]
-    current_time = now.time()
-
-    # Find schedule entry for current day
-    for schedule in days_scheduled:
-        day_of_week = schedule.get('dayOfWeek')
-        # Handle both formats: string "FRIDAY" or object {"value": "FRIDAY", "label": "Friday"}
-        if isinstance(day_of_week, dict):
-            day_of_week = day_of_week.get('value')
-        if day_of_week != current_weekday:
-            continue
-
-        # Found entry for today
-        start_time_str = schedule.get('startTime')
-        end_time_str = schedule.get('endTime')
-
-        # If no time constraints, display all day
-        if not start_time_str and not end_time_str:
-            return True
-
-        # If we have time constraints, check them
-        start_time = parse_time_str(start_time_str)
-        end_time = parse_time_str(end_time_str)
-
-        if start_time and end_time:
-            # Handle overnight schedules (e.g., 22:00 to 02:00)
-            if start_time <= end_time:
-                # Normal range (e.g., 09:00 to 17:00)
-                if start_time <= current_time <= end_time:
-                    return True
-            else:
-                # Overnight range (e.g., 22:00 to 02:00)
-                if current_time >= start_time or current_time <= end_time:
-                    return True
-        elif start_time:
-            # Only start time - display from start time until midnight
-            if current_time >= start_time:
-                return True
-        elif end_time:
-            # Only end time - display from midnight until end time
-            if current_time <= end_time:
-                return True
-
-        # Time constraints not met
-        return False
-
-    # Current day not in schedule list - don't display
-    return False
+    return is_scene_scheduled_at(scene, datetime.now())
 
 
 def filter_scenes_by_schedule(scenes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3147,10 +3082,14 @@ class JamPlayerDisplayManager:
         self._missing_media_reported = set()
         self._last_sync_check = 0
         self._last_sync_log = 0
-        self._last_schedule_check = 0
-
-        # How often to re-check schedule (every 60 seconds)
-        SCHEDULE_CHECK_INTERVAL_SEC = 60
+        # The wall-clock minute the schedule was last evaluated in. Windows
+        # start and end on whole minutes, so the schedule is re-checked once
+        # each time the minute turns over: a window opens or closes within one
+        # pass of this loop of its minute, and at the same moment on every
+        # screen of a wall. (This used to be "every 60 s since the loop
+        # started", which put each change up to a minute late and at a
+        # different second on every player.)
+        self._last_schedule_minute = None
 
         while self.running and self.current_mode == DisplayMode.PLAYING_CONTENT:
             current_time_sec = time.time()
@@ -3164,8 +3103,10 @@ class JamPlayerDisplayManager:
 
             content_changed = not hasattr(self, '_last_scenes_mtime') or scenes_mtime != self._last_scenes_mtime
 
-            # Periodically re-check schedule even if content hasn't changed
-            schedule_check_needed = (current_time_sec - self._last_schedule_check) >= SCHEDULE_CHECK_INTERVAL_SEC
+            # Re-check the schedule when the minute turns over, even if the
+            # content hasn't changed
+            current_minute = schedule_minute(current_time_sec)
+            schedule_check_needed = current_minute != self._last_schedule_minute
 
             if content_changed or schedule_check_needed:
                 if content_changed:
@@ -3183,8 +3124,8 @@ class JamPlayerDisplayManager:
                     self._num_screens = self._get_num_screens()
                     logger.info("Content file updated, reloading scenes")
                 if schedule_check_needed:
-                    self._last_schedule_check = current_time_sec
-                    logger.debug("Periodic schedule re-check")
+                    self._last_schedule_minute = current_minute
+                    logger.debug("Schedule re-check (new minute)")
 
                 new_scenes = self._load_scenes()  # This applies schedule filter
 
