@@ -2148,6 +2148,64 @@ def install_ble_configs() -> bool:
                                _BLUEZ_MAIN_CONF_DEST, 'BlueZ config')
 
 
+# The D-Bus rule that keeps the desktop session from ever being asked for a
+# WiFi password. Destination as a module constant so tests can redirect it.
+_WIFI_PROMPT_BLOCK_NAME = 'jam-no-desktop-wifi-prompt.conf'
+_WIFI_PROMPT_BLOCK_DEST = Path('/etc/dbus-1/system.d') / _WIFI_PROMPT_BLOCK_NAME
+
+
+def _is_complete_busconfig(path: Path) -> bool:
+    """
+    True when `path` looks like a whole D-Bus policy file: it opens a
+    <busconfig> element and its last tag closes it. That is what a truncated
+    or empty file (a checkout cut short by a power loss) fails, and such a file
+    must never reach /etc/dbus-1/system.d (see _install_if_changed).
+
+    A plain text check on purpose: the updater must not depend on an XML
+    parser being importable.
+    """
+    try:
+        text = path.read_text(encoding='utf-8')
+    except Exception as e:
+        logger.warning(f"  Could not read D-Bus policy {path}: {e}")
+        return False
+    if '<busconfig>' in text and text.rstrip().endswith('</busconfig>'):
+        return True
+    logger.warning(f"  Incomplete D-Bus policy, refusing to install: {path}")
+    return False
+
+
+def install_desktop_wifi_prompt_block() -> bool:
+    """
+    Make sure a WiFi password prompt can never appear on the customer's TV.
+
+    The JAM display runs inside the Pi OS desktop session, and that session's
+    network applet registers with NetworkManager as a "secret agent". When a
+    saved profile fails to authenticate (the customer changed the password at
+    the router, or the fielded 7440d2d code left a wrong one behind),
+    NetworkManager asked the applet for a new password and the applet drew
+    "Authentication required by Wi-Fi network" over the content.
+
+    The policy file denies agent registration to everyone but root, so there
+    is nobody to ask and NetworkManager just fails that attempt quietly. Our
+    own services run as root and put the password in the profile, so they are
+    unaffected.
+
+    dbus-daemon picks the file up on its own. An applet that registered before
+    the file arrived keeps its registration until the next boot, so on the
+    update that first brings this in, the block is complete from the next
+    (nightly) reboot. Returns whether the file changed.
+    """
+    logger.info("Installing the desktop WiFi-prompt block...")
+    src = ETC_SRC / 'dbus-1' / 'system.d' / _WIFI_PROMPT_BLOCK_NAME
+    if not src.exists():
+        logger.warning(f"  WiFi-prompt block not found: {src}")
+        return False
+    if not _is_complete_busconfig(src):
+        return False
+    return _install_if_changed(src, _WIFI_PROMPT_BLOCK_DEST, 'desktop WiFi-prompt block')
+
+
 def _ble_central_connected() -> bool:
     """
     True while a phone is connected to our GATT server, asked of BlueZ via
@@ -3250,6 +3308,9 @@ def main():
 
     # Install BLE configuration (D-Bus and BlueZ) for pairing-free provisioning
     bluetooth_conf_changed = install_ble_configs()
+
+    # Never let the desktop session put a WiFi password prompt on the TV
+    install_desktop_wifi_prompt_block()
 
     # Configure lightdm to hide cursor on desktop
     install_lightdm_cursor_config()

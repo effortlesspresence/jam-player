@@ -163,6 +163,26 @@ accepted in exchange for never destroying a valid slow activation.
 Steps: A1 then the right password. Expected: connects; exactly one `jam-wifi-*`
 profile for the SSID.
 
+**A6 · The desktop session cannot be asked for a WiFi password** `[ ]`
+Found on the bench 2026-11-15: a 7440d2d player with a wrong saved password showed the desktop's
+*Authentication required by Wi-Fi network* dialog over the JAM screen after a reboot. The dialog is
+the Pi OS network applet answering NetworkManager's request for a new password; the update installs
+`/etc/dbus-1/system.d/jam-no-desktop-wifi-prompt.conf`, which lets only root register as the thing
+NetworkManager asks. Setup: updated player, **rebooted once since the update** (an applet that
+registered before the file arrived keeps its registration until the next boot). Verify the file is
+there and the desktop user is refused:
+`ls /etc/dbus-1/system.d/jam-no-desktop-wifi-prompt.conf && sudo -u comitup busctl --system call org.freedesktop.NetworkManager /org/freedesktop/NetworkManager/AgentManager org.freedesktop.NetworkManager.AgentManager Register s jam.bench`
+Expected: the path is printed, then `Access denied`. The same `busctl` line with `sudo` alone (root)
+must NOT say `Access denied`. Then run A1, A2 and A5 again: joining WiFi from the app still works.
+
+**A7 · A saved password that stops working puts nothing on the TV** `[ ]`
+Setup: player online on a hotspot through a saved good profile, A6 passed. Steps: change the
+hotspot's password, reboot the player, and watch the TV for 10 minutes. Expected: no dialog or
+window of any kind at any moment, only JAM screens. Verify
+`journalctl -u NetworkManager -b --no-pager | grep -c "No agents were available"` >= 1 (NetworkManager
+looked for someone to ask and found nobody). Recover from the app with the new password -> online.
+On a player still on 7440d2d the same steps show the dialog; that is the bug.
+
 ### B — Forget-on-`none` corroboration (audit #8, Decision C)
 
 **B1 · Stale clock, NTP reachable → accurate verdict, no forget** `[ ]`
@@ -715,9 +735,9 @@ instead of only the first, compares by whole minutes with the end minute include
 has), and re-checks the schedule when the minute turns over instead of every 60 s from service
 start. Rules and the reasons for them: `common/schedule.py`.
 
-Until the jam-sphere gate is lifted (`isPastMidnightScheduleAllowed`, chains-common), only a
-RESTAURANT_CHAIN location can SAVE a past-midnight or several-window schedule, so link the bench
-player to a screen in one on the testing backend.
+Who can SAVE these schedules (jam-sphere): anyone. A window that runs past midnight, and several
+windows on one day, can be set on any row or daypart at any location, once the jam-sphere change for
+J20Q-583 is deployed to the backend the bench player talks to.
 
 **M1 · Unit suite** `[ ]`
 Runs on a laptop too (stdlib only). It mirrors the webOS schedule suite case for case.
