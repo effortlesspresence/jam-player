@@ -2206,6 +2206,146 @@ def install_desktop_wifi_prompt_block() -> bool:
     return _install_if_changed(src, _WIFI_PROMPT_BLOCK_DEST, 'desktop WiFi-prompt block')
 
 
+# The Pi OS desktop panel's own settings file. Module constant so tests can
+# redirect it.
+_PANEL_CONF = Path('/home/comitup/.config/wf-panel-pi.ini')
+_PANEL_PROCESS = 'wf-panel-pi'
+_PANEL_USER = 'comitup'
+
+# What the panel is left with: one blank spacer on each side. A spacer rather
+# than nothing, so the panel never meets an empty list.
+_PANEL_NO_APPLETS = 'spacing4'
+
+# Settings that keep the panel silent and out of sight.
+_PANEL_REQUIRED = {
+    'widgets_left': _PANEL_NO_APPLETS,
+    'widgets_right': _PANEL_NO_APPLETS,
+    'notify_enable': 'false',
+}
+
+# Written when a player has no panel settings file at all. Hidden and empty,
+# matching what the JAM image ships otherwise.
+_PANEL_CONF_FRESH = (
+    '[panel]\n'
+    'autohide=true\n'
+    'autohide_duration=100\n'
+    'notify_enable=false\n'
+    f'widgets_left={_PANEL_NO_APPLETS}\n'
+    f'widgets_right={_PANEL_NO_APPLETS}\n'
+    'position=top\n'
+    'icon_size=8\n'
+)
+
+
+def _strip_panel_applets(content: str) -> str:
+    """
+    Return the panel settings with every applet removed and notifications off.
+
+    Only the three keys in _PANEL_REQUIRED inside the [panel] section are
+    touched; every other line comes back byte for byte, in the file's own
+    `key=value` style. A key that is missing is added to [panel]. A file with
+    no [panel] section (or no content) gets one. Idempotent.
+    """
+    if not content.strip():
+        return _PANEL_CONF_FRESH
+
+    lines = content.split('\n')
+    start = end = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            if start is not None:
+                end = i
+                break
+            if stripped == '[panel]':
+                start = i
+    if start is None:
+        return content.rstrip('\n') + '\n\n' + _PANEL_CONF_FRESH
+    if end is None:
+        end = len(lines)
+
+    seen = set()
+    body = []
+    for line in lines[start + 1:end]:
+        stripped = line.strip()
+        if '=' in stripped and not stripped.startswith('#'):
+            key, value = (part.strip() for part in stripped.split('=', 1))
+            if key in _PANEL_REQUIRED:
+                seen.add(key)
+                if value != _PANEL_REQUIRED[key]:
+                    line = f'{key}={_PANEL_REQUIRED[key]}'
+        body.append(line)
+
+    missing = [f'{key}={value}' for key, value in _PANEL_REQUIRED.items() if key not in seen]
+    if missing:
+        # Before the blank lines that close the section, so the keys stay in it.
+        tail = len(body)
+        while tail > 0 and not body[tail - 1].strip():
+            tail -= 1
+        body[tail:tail] = missing
+
+    return '\n'.join(lines[:start + 1] + body + lines[end:])
+
+
+def install_kiosk_panel_config() -> bool:
+    """
+    Take every applet out of the Pi OS desktop panel, so nothing from the
+    desktop can draw a window on the customer's TV.
+
+    The JAM display runs inside the Pi OS desktop session, and that session
+    starts the desktop panel (wf-panel-pi). The image hides the panel, but its
+    applets still run, and two of them open windows over the content by
+    themselves:
+
+      - the network applet: "Authentication required by Wi-Fi network" when a
+        saved password stops working, and a message when a connection changes;
+      - the Bluetooth applet: pairing and "successful" messages when a phone
+        connects for setup.
+
+    Both were seen on the bench (2026-11-15 and 2026-11-16). The other applets
+    (removable drives, volume, battery, Raspberry Pi Connect, clock, menu) have
+    no job on a player either, so the panel is left with a blank spacer on each
+    side and its notifications off. The D-Bus rule from
+    install_desktop_wifi_prompt_block() stays as a second guard for the WiFi
+    password case.
+
+    When the settings change, the running panel is stopped once. The desktop
+    starts it again within a second (it is launched through wfrespawn) and it
+    comes back without the applets, so the fix does not wait for a reboot.
+    Nothing else is restarted. Returns whether the file changed.
+    """
+    logger.info("Removing the desktop panel's applets...")
+    try:
+        current = _PANEL_CONF.read_text() if _PANEL_CONF.exists() else ''
+        updated = _strip_panel_applets(current)
+        if updated == current:
+            logger.info(f"  {_PANEL_CONF} already has no applets")
+            return False
+
+        _PANEL_CONF.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _PANEL_CONF.with_name(_PANEL_CONF.name + '.jam-tmp')
+        with open(tmp, 'w') as f:
+            f.write(updated)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _PANEL_CONF)
+        for path in (_PANEL_CONF.parent, _PANEL_CONF):
+            run_command(['chown', f'{_PANEL_USER}:{_PANEL_USER}', str(path)], timeout=10)
+        logger.info(f"  Updated {_PANEL_CONF}")
+    except Exception as e:
+        logger.warning(f"  Could not update the desktop panel settings: {e}")
+        return False
+
+    try:
+        # Exit status 1 just means no panel is running (headless boot, or the
+        # desktop has not started yet). It reads the new file when it starts.
+        run_command(['pkill', '-u', _PANEL_USER, '-x', _PANEL_PROCESS], timeout=10)
+        logger.info("  Stopped the running panel; the desktop restarts it without applets")
+    except Exception as e:
+        logger.warning(f"  Could not restart the desktop panel (takes effect at next boot): {e}")
+    return True
+
+
 def _ble_central_connected() -> bool:
     """
     True while a phone is connected to our GATT server, asked of BlueZ via
@@ -3311,6 +3451,9 @@ def main():
 
     # Never let the desktop session put a WiFi password prompt on the TV
     install_desktop_wifi_prompt_block()
+
+    # ...or any other window: take the applets out of the desktop panel
+    install_kiosk_panel_config()
 
     # Configure lightdm to hide cursor on desktop
     install_lightdm_cursor_config()

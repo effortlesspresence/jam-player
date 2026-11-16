@@ -183,6 +183,21 @@ window of any kind at any moment, only JAM screens. Verify
 looked for someone to ask and found nobody). Recover from the app with the new password -> online.
 On a player still on 7440d2d the same steps show the dialog; that is the bug.
 
+**A8 · The desktop panel has no applets, so nothing from it can draw on the TV** `[ ]`
+Found on the bench 2026-11-16 on 5148277: changing the WiFi of a registered player from the app put a
+*Connection successful* box with one OK button over the content. Like the A6 dialog it comes from the
+Pi OS desktop panel (`wf-panel-pi`), which the image hides but which still runs its network and
+Bluetooth applets. The update now rewrites `~/.config/wf-panel-pi.ini` so the panel loads no applets
+(`widgets_left` / `widgets_right` = one spacer) and restarts the panel once. Setup: updated player with
+content playing. Verify the settings, that one panel is running, and that neither applet is loaded:
+`grep -E '^widgets_|^notify' ~/.config/wf-panel-pi.ini; pgrep -x wf-panel-pi; grep -cE 'libnetman|libbluetooth' /proc/$(pidof wf-panel-pi)/maps`
+Expected: `widgets_left=spacing4`, `widgets_right=spacing4`, `notify_enable=false`; one process id; then `0`.
+Run `pgrep -x wf-panel-pi` again after 10 s: the same id (the panel is not restarting in a loop). Then,
+with content playing: connect the phone and change the WiFi from the app (K15). Expected: no box,
+window or bar appears on the TV at any point. A6 still passes (it is the second guard).
+Not covered by this fix: the desktop file manager (`pcmanfm --desktop`) also runs in the session and may
+open a window when a USB drive is plugged in. Plug one in once and record what the TV shows.
+
 ### B — Forget-on-`none` corroboration (audit #8, Decision C)
 
 **B1 · Stale clock, NTP reachable → accurate verdict, no forget** `[ ]`
