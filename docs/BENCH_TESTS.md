@@ -142,11 +142,14 @@ that SSID, and `journalctl -u jam-ble-provisioning -b --no-pager | grep -c "disc
 Then retry with the correct password → connects (A5 covers this).
 
 **A2 · A typo never deletes the working profile** `[ ]`
-Setup: device connected to SSID X on a saved good profile. Steps: from the app,
-choose X again with a wrong password. Expected: *Invalid password*; **the device
-stays online on X** (or returns to it within seconds). Verify:
-`nmcli -f NAME,ACTIVE connection show | grep jam-wifi` still lists the original
-profile, active.
+Needs two networks. Setup: device online on SSID Y, with a saved good profile for
+SSID X in range. Steps: from the app, type X's name with a wrong password ("My
+Wi-Fi isn't in the list"). Expected: *Invalid password*; X's saved profile is
+untouched and the device goes back to Y within seconds. Verify:
+`nmcli -f NAME,ACTIVE connection show | grep jam-wifi` still lists both profiles.
+Not this case: a device that is ALREADY online on X does not try the typed
+password at all -- `connect_to_wifi` returns "connected" without reconnecting
+(same in 7440d2d), so the app shows success. Found on the bench 2026-11-16.
 
 **A3 · Exact SSID match, not substring** `[ ]`
 Setup R5 (good saved profile for `Shop-5G`). Steps: connect to `Shop` with a
@@ -211,6 +214,25 @@ drive and wait 20 s. Expected: nothing appears on the TV, and the drive is not m
 nothing after their names, then `0`. Reboot with the drive still plugged in: still nothing on the TV, still not mounted,
 and the settings file still reads `0` three times (the file manager did not write the old values back).
 A USB keyboard still types (storage is ignored, not USB).
+
+
+**A10 · A wrong name and a wrong password get different answers** `[ ]`
+Found on the bench 2026-11-16: a made-up network name typed into the app came back as *invalid
+password*. NetworkManager says "Secrets were required" whenever a first-time join to a secured network
+does not complete, whether the password was wrong or no access point of that name answered. Before
+blaming the password, the player now checks that an access point with exactly that name is answering
+(`wifi_network_answers`, common/network.py). Steps, all from the app's "My Wi-Fi isn't in the list"
+page, on a player that is NOT already online on the network being typed:
+1. A made-up name with any password. Expected: the app shows *Can't find that Wi-Fi* (status
+   `network_not_found`), within 60 s.
+2. A real, visible network's name with a wrong password. Expected: *That password didn't work*
+   (status `invalid_password`), and the typed name and password are still on the page.
+3. A real network from the list with a wrong password (A1). Expected: unchanged, *That password
+   didn't work*, with no extra delay.
+4. If a hidden network is available: its name with a wrong password. Expected: *That password
+   didn't work* (it answers a scan by name, so it is "there").
+Verify nothing is left behind after each: `nmcli -t -f NAME connection show | grep -c jam-wifi`
+is unchanged. A 7440d2d player still answers *invalid password* for step 1; that is the old behaviour.
 
 ### B — Forget-on-`none` corroboration (audit #8, Decision C)
 
@@ -438,6 +460,22 @@ batch; now it is kept and retried). If not: `sudo journalctl -b --no-pager | gre
 only after 1 h of continuous failure) and confirm the handler is attached:
 `cd /opt/jam/services && sudo /opt/jam/venv/bin/python -c "import logging; from common.logging_config import setup_service_logging; setup_service_logging('jam-heartbeat'); print([type(h).__name__ for h in logging.getLogger().handlers])"`
 must list `BackendLogHandler`. (2026-09-11..16 code never attached it.)
+
+
+**F5 · Registered with no screen linked shows the same screen as not registered** `[ ]`
+Until 2026-11 a registered player with no screen had its own screen (*Registered! ... Link this JAM
+Player to a screen using the JAM Player Setup app or the web app*). Customers stalled on it, so it is
+gone: the display has no separate mode for that state and shows the AWAITING_REGISTRATION screen
+(*Almost there. Set up this JAM Player in the JAM Player Setup app on your phone.* + QR) until a screen
+is linked. Steps: set a fresh player up from the app and stop at the pick-a-menu step (or unlink a
+linked player's screen in the web app and wait for its content to clear). Expected: the TV shows
+*Almost there...*, never *Registered!*. `systemctl status jam-player-display | grep Status` reads
+`Registered, awaiting screen link (setup screen)`. Pick a menu (app or web): the TV moves on to
+*Waiting for content...* and then plays. Also run the on-device suite, which renders every screen:
+`/home/comitup/jam-player/src/jam_player/services_v2/tests/run_on_device.sh`
+Note: Bluetooth setup still turns off 15 minutes after boot for a registered, online player, so the
+app's "Set Up a JAM Player" scan may not find it then; "Edit an existing JAM Player" and the web app
+both can link a screen at any time.
 
 ### H — Content pipeline integrity (audit #12, #13, #14)
 

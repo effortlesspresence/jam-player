@@ -12,7 +12,7 @@ called inline from jam-first-boot or jam-update):
     boots into the latest commit, jam-update exits early as "already
     up to date", never runs the install pipeline, never calls
     prewarm_display_cache). Without pre-warm in this path, every
-    setup-flow screen (AWAITING_REGISTRATION, AWAITING_SCREEN_LINK,
+    setup-flow screen (AWAITING_REGISTRATION,
     NO_ACTIVE_SCENES, DOWNLOADING_CONTENT) renders fresh on first
     encounter -- ~10-15s of CPU per screen at 4K, all customer-visible.
 

@@ -51,7 +51,6 @@ def _screens():
     return [
         ('unregistered', disp.create_unregistered_screen),
         ('awaiting_registration', disp.create_awaiting_registration_screen),
-        ('awaiting_screen_link', disp.create_awaiting_screen_link_screen),
         ('waiting_for_content', disp.create_waiting_for_content_screen),
         ('no_active_scenes', disp.create_no_active_scenes_screen),
         ('no_scheduled_content', disp.create_no_scheduled_content_screen),

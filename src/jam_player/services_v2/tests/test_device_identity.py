@@ -88,7 +88,6 @@ class ScreenRenderSmokeTests(unittest.TestCase):
     SCREENS = [
         'create_unregistered_screen',
         'create_waiting_for_content_screen',
-        'create_awaiting_screen_link_screen',
         'create_awaiting_registration_screen',
         'create_no_active_scenes_screen',
         'create_no_scheduled_content_screen',

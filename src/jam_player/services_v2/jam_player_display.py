@@ -14,22 +14,22 @@ Display Modes (in order of setup progress):
      (re-run WiFi setup via the mobile app over BLE).
    - Display: setup screen with JAM logo, QR code, "Set up your JAM Player"
 
-2. AWAITING_REGISTRATION (internet verified, but .registered flag is missing)
-   - Device is online but has not yet been registered to a Location via
-     the mobile app. Registration is a mobile-app-only flow (the web app
-     cannot register devices because registration depends on the BLE
-     session the mobile app already has open). Internally, the device
-     may or may not be .announced at this point -- announce is plumbing
-     and doesn't gate anything the user sees.
+2. AWAITING_REGISTRATION (internet verified, but setup is not finished:
+   the .registered flag is missing, OR the device is registered and no
+   screen_id is on disk yet)
+   - The device is online and the customer still has something to do in
+     the JAM Player Setup app: register it to a Location, or pick the
+     screen (menu) it should show. Both are steps of the same setup in the
+     app, so the TV says the same thing for both.
+   - Until 2026-11 a registered device with no screen had a screen of its
+     own ("Registered! ... Link this JAM Player to a screen using the JAM
+     Player Setup app or the web app"). It read as a finished state with a
+     new, unexplained task, and customers stalled on it. It is gone: there
+     is no separate display mode for "registered but not linked".
+   - Internally, the device may or may not be .announced at this point --
+     announce is plumbing and doesn't gate anything the user sees.
    - Display: "Almost there. Set up this JAM Player in the JAM Player
      Setup app on your phone." + mobile-app QR.
-
-3. AWAITING_SCREEN_LINK (registered, but no screen_id on disk)
-   - Device is registered to a Location but the user hasn't linked it
-     to a specific Screen yet. Linking can happen from the mobile app
-     OR the web app.
-   - Display: "Connected! Link this JAM Player to a screen using the
-     JAM Player Setup app or the web app."
 
 4. DOWNLOADING_CONTENT (screen_id exists, scenes.json missing OR has scenes
    with media files not yet on disk)
@@ -264,8 +264,7 @@ class DisplayMode(Enum):
     keeps playing -- see that function's docstring for the full spec.
     """
     AWAITING_NETWORK = "awaiting_network"  # .internet_verified flag missing
-    AWAITING_REGISTRATION = "awaiting_registration"  # online, but not yet registered to a Location (.registered missing)
-    AWAITING_SCREEN_LINK = "awaiting_screen_link"  # registered, but no screen_id
+    AWAITING_REGISTRATION = "awaiting_registration"  # online, setup unfinished: not registered, OR registered with no screen (.registered missing)
     DOWNLOADING_CONTENT = "downloading_content"  # screen linked, content not yet on disk
     NO_ACTIVE_SCENES = "no_active_scenes"  # screen linked, backend returned empty scenes list
     PLAYING_CONTENT = "playing_content"  # scenes + media present
@@ -1071,123 +1070,6 @@ def create_waiting_for_content_screen(width: int, height: int, device_uuid: str 
     return img, identity_cacheable
 
 
-def create_awaiting_screen_link_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
-    """
-    Create the screen for AWAITING_SCREEN_LINK mode.
-
-    Shown when the device has verified internet connectivity but has not
-    been linked to a Screen yet. Communicates that setup is partially
-    complete and directs the user to the mobile or web app to finish.
-
-    Visually distinct from the AWAITING_NETWORK setup screen: a cool-
-    themed gradient (matches DOWNLOADING_CONTENT's family) emphasizes
-    "you're past the WiFi step"; no primary QR code (the user already
-    has the app open), just device UUID for reference.
-    """
-    if not HAS_PIL:
-        logger.error("PIL not available for creating display images")
-        return None
-
-    img = create_mesh_gradient_background(width, height, theme="cool")
-    draw = ImageDraw.Draw(img)
-
-    title_font = get_font(_scaled(FONT_SIZE_TITLE, height))
-    subtitle_font = get_font(_scaled(FONT_SIZE_SUBTITLE, height), bold=False)
-    instructions_font = get_font(_scaled(FONT_SIZE_INSTRUCTIONS, height), bold=False)
-
-    center_x = width // 2
-
-    # Logo (scaled). 1080p reference: 120px; 4K: 240px.
-    logo_height = _scaled(120, height)
-    y = int(height * 0.12)
-    logo = load_and_scale_logo(logo_height)
-    if logo:
-        logo_x = center_x - logo.width // 2
-        img.paste(logo, (logo_x, y), logo if logo.mode == 'RGBA' else None)
-        y += logo.height + 40
-    else:
-        y += 40
-
-    # Primary heading: "Registered!" -- the user just completed the
-    # registration step in the mobile app, so this is the appropriate
-    # celebratory checkpoint. "Connected!" was too ambiguous given
-    # AWAITING_REGISTRATION also mentions the device being connected
-    # to the internet.
-    heading = "Registered!"
-    draw.text(
-        (center_x, y),
-        heading,
-        font=title_font,
-        fill=JAM_ORANGE_PRIMARY,
-        anchor="mt"
-    )
-    bbox = draw.textbbox((0, 0), heading, font=title_font)
-    y += bbox[3] + 20
-
-    # Secondary line: "Almost there."
-    sub = "Your JAM Player is connected to the internet."
-    draw.text(
-        (center_x, y),
-        sub,
-        font=subtitle_font,
-        fill=TEXT_COLOR,
-        anchor="mt"
-    )
-    bbox = draw.textbbox((0, 0), sub, font=subtitle_font)
-    y += bbox[3] + 20
-
-    # Confirmation of the registration state: by the time we reach
-    # AWAITING_SCREEN_LINK we know the .registered flag exists, so this
-    # statement is always accurate here. Helps users understand that
-    # the "link to a screen" step is the only remaining action.
-    status_line = "Your JAM Player is registered to your outlet."
-    draw.text(
-        (center_x, y),
-        status_line,
-        font=subtitle_font,
-        fill=TEXT_COLOR,
-        anchor="mt"
-    )
-    bbox = draw.textbbox((0, 0), status_line, font=subtitle_font)
-    y += bbox[3] + 40
-
-    # Instruction: link this JAM Player
-    line1 = "Link this JAM Player to a screen"
-    draw.text(
-        (center_x, y),
-        line1,
-        font=instructions_font,
-        fill=TEXT_COLOR,
-        anchor="mt"
-    )
-    bbox = draw.textbbox((0, 0), line1, font=instructions_font)
-    y += bbox[3] + 12
-
-    line2 = "using the JAM Player Setup app or the web app."
-    draw.text(
-        (center_x, y),
-        line2,
-        font=instructions_font,
-        fill=TEXT_COLOR,
-        anchor="mt"
-    )
-
-    # Device UUID at the bottom so support / users can identify this JP
-    # in the app / web UI when linking.
-    identity_cacheable = _draw_device_identity(draw, width, height, device_uuid)
-
-    version_font = get_font(_scaled(14, height), bold=False)
-    draw.text(
-        (width - 30, height - 25),
-        "v2",
-        font=version_font,
-        fill=(80, 80, 80),
-        anchor="mm"
-    )
-
-    return img, identity_cacheable
-
-
 def create_awaiting_registration_screen(width: int, height: int, device_uuid: str = None) -> Image.Image:
     """
     Create the screen for AWAITING_REGISTRATION mode.
@@ -1199,10 +1081,10 @@ def create_awaiting_registration_screen(width: int, height: int, device_uuid: st
     the user specifically to the mobile app and includes a QR code to
     the app download / setup landing page.
 
-    Distinct from AWAITING_SCREEN_LINK, which is shown after the device
-    is registered but not yet linked to a specific Screen; that screen
-    directs the user to either the mobile app or the web app and has no
-    QR code.
+    Also shown once the device IS registered but has no screen linked yet:
+    picking the screen is the next step of the same setup in the app, so
+    the TV keeps saying the same thing until it is done (there is no
+    separate "registered, link a screen" screen any more).
     """
     if not HAS_PIL:
         logger.error("PIL not available for creating display images")
@@ -1694,7 +1576,6 @@ def build_display_render_registry() -> dict:
     return {
         DisplayMode.AWAITING_NETWORK.value: create_unregistered_screen,
         DisplayMode.AWAITING_REGISTRATION.value: create_awaiting_registration_screen,
-        DisplayMode.AWAITING_SCREEN_LINK.value: create_awaiting_screen_link_screen,
         DisplayMode.DOWNLOADING_CONTENT.value: create_waiting_for_content_screen,
         DisplayMode.NO_ACTIVE_SCENES.value: create_no_active_scenes_screen,
         NO_SCHEDULED_CONTENT_CACHE_KEY: create_no_scheduled_content_screen,
@@ -2226,7 +2107,8 @@ class JamPlayerDisplayManager:
           2. Otherwise walk the setup ladder:
              a. No .internet_verified -> AWAITING_NETWORK
              b. No .registered        -> AWAITING_REGISTRATION
-             c. No screen_id          -> AWAITING_SCREEN_LINK
+             c. No screen_id          -> AWAITING_REGISTRATION (same screen:
+                                         setup is still unfinished)
              d. scenes.json is empty  -> NO_ACTIVE_SCENES
              e. Otherwise             -> DOWNLOADING_CONTENT
 
@@ -2264,12 +2146,16 @@ class JamPlayerDisplayManager:
         if not is_device_registered():
             return DisplayMode.AWAITING_REGISTRATION
 
-        # 2c. Registered but not linked to a specific Screen. Screen
-        # linking can happen from the mobile app OR the web app. This
-        # also covers the recently-unlinked case (heartbeat /
-        # SET_SCREEN_ID deletes screen_id.txt on unlink).
+        # 2c. Registered but not linked to a specific Screen. To the
+        # customer this is the same unfinished setup as 2b (the app's
+        # next step is "pick a menu"), so it shows the same screen; a
+        # separate "Registered! Link this JAM Player to a screen" screen
+        # read as finished-with-a-new-task and stalled people. Linking
+        # can still be done from the mobile app OR the web app. This also
+        # covers the recently-unlinked case (heartbeat / SET_SCREEN_ID
+        # deletes screen_id.txt on unlink).
         if not get_screen_id():
-            return DisplayMode.AWAITING_SCREEN_LINK
+            return DisplayMode.AWAITING_REGISTRATION
 
         # 2d / 2e. Screen linked but content not playable yet. Fall back
         # to whatever the content check said (NO_ACTIVE_SCENES vs
@@ -2455,21 +2341,13 @@ class JamPlayerDisplayManager:
                     "Scan the QR code to begin."
                 )
             )
-            sd_notifier.notify("STATUS=Online, awaiting registration")
-
-        elif new_mode == DisplayMode.AWAITING_SCREEN_LINK:
-            logger.info("Showing AWAITING_SCREEN_LINK screen")
-            self.feh_process = self._show_cached_screen(
-                new_mode, device_uuid,
-                fallback_msg=(
-                    "Registered!\n\n"
-                    "Almost there.\n\n"
-                    "Your JAM Player is registered to your outlet.\n\n"
-                    "Link this JAM Player to a screen\n"
-                    "using the mobile app or web app."
-                )
+            # One screen, two reasons; say which in the service status so
+            # support can still tell them apart.
+            sd_notifier.notify(
+                "STATUS=Registered, awaiting screen link (setup screen)"
+                if is_device_registered()
+                else "STATUS=Online, awaiting registration"
             )
-            sd_notifier.notify("STATUS=Registered, awaiting screen link")
 
         elif new_mode == DisplayMode.DOWNLOADING_CONTENT:
             logger.info("Showing DOWNLOADING_CONTENT screen")

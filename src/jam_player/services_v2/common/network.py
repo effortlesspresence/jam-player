@@ -894,6 +894,72 @@ def _promote_in_background(target: Callable[[], None]) -> None:
         logger.warning(f"Could not start priority promotion thread: {e}")
 
 
+# How long NetworkManager gets to hear an access point answer a scan for its name.
+_PRESENCE_RESCAN_WAIT_SECONDS = 4
+
+
+def _scanned_ssids() -> Optional[set]:
+    """
+    The network names NetworkManager can hear right now (its current scan
+    list, no new scan), or None if it could not be asked.
+    """
+    try:
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'SSID', 'device', 'wifi', 'list', '--rescan', 'no'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        logger.debug(f"Could not read the WiFi scan list: {e}")
+        return None
+    if result.returncode != 0:
+        logger.debug(f"Could not read the WiFi scan list: {result.stderr.strip()}")
+        return None
+    return {_unescape_nmcli_field(line) for line in result.stdout.split('\n') if line}
+
+
+def wifi_network_answers(ssid: str) -> bool:
+    """
+    Is an access point with EXACTLY this name answering right now?
+
+    Used after a failed join, to tell "that network is not there" from "that
+    network is there and turned us down". NetworkManager cannot be trusted for
+    this: when a first-time join to a secured network does not complete, it
+    asks for a new password ("Secrets were required") whether the password
+    was wrong or no access point of that name ever answered. A made-up name
+    typed into the app therefore came back as "invalid password" (bench,
+    2026-11-16).
+
+    The join attempt has just scanned for this name, and for a typed network
+    that scan asked for it BY name -- which is what makes a hidden network
+    answer. So an access point that exists is already in NetworkManager's
+    list. If it is not, one more scan by name is requested and the list is
+    read again, in case the first answer was missed.
+
+    Fails towards True: if NetworkManager cannot be asked, the caller keeps
+    the verdict it had (the behaviour before this check existed).
+    """
+    seen = _scanned_ssids()
+    if seen is None:
+        return True
+    if ssid in seen:
+        return True
+
+    try:
+        subprocess.run(
+            ['nmcli', 'device', 'wifi', 'rescan', 'ssid', ssid],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        # Refused while the radio is busy, for one. The list is still read.
+        logger.debug(f"Scan for '{ssid}' could not be requested: {e}")
+    time.sleep(_PRESENCE_RESCAN_WAIT_SECONDS)
+
+    seen = _scanned_ssids()
+    if seen is None:
+        return True
+    return ssid in seen
+
+
 def connect_to_wifi(ssid: str, password: str, hidden: bool = False) -> Tuple[bool, str]:
     """
     Connect to a WiFi network, preserving existing connection if new attempt fails.
@@ -960,6 +1026,13 @@ def connect_to_wifi(ssid: str, password: str, hidden: bool = False) -> Tuple[boo
 
         # Parse common error messages for user-friendly feedback
         if 'Secrets were required' in error_msg or 'password' in error_msg.lower():
+            # NetworkManager says this for a wrong password AND when no access
+            # point of that name answered at all (a mistyped or made-up name).
+            # Only blame the password if the network is really there, so the
+            # app can tell the customer which of the two to fix.
+            if not wifi_network_answers(ssid):
+                logger.info(f"No access point named '{ssid}' answered; reporting network not found, not a wrong password")
+                return False, "Network not found"
             return False, "Invalid password"
         elif 'No network with SSID' in error_msg:
             return False, "Network not found"

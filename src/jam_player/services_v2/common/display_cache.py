@@ -2,7 +2,7 @@
 Pre-rendered display screen cache for jam-player-display.service.
 
 Static setup-state screens (AWAITING_NETWORK, AWAITING_REGISTRATION,
-AWAITING_SCREEN_LINK, DOWNLOADING_CONTENT) are expensive to render at 4K
+DOWNLOADING_CONTENT) are expensive to render at 4K
 (10-12s of PIL work for the mesh gradient alone). Their contents are
 deterministic given (mode, width, height, device_uuid, code_commit) --
 device_uuid is per-device-constant, so the meaningful cache key is
