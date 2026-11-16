@@ -387,6 +387,22 @@ updater (runs when jam-update exits)` and `All critical services running`; no
 `may need attention`. Both units' ExecMainStartTimestamp is within ~10 s of
 jam-update's ExecMainExitTimestamp.
 
+
+**E8 · After an update during setup, the backend shows the NEW version** `[ ]`
+Found on the bench 2026-11-16: a 7440d2d card set up from the app updated itself to 65ed8c6 during
+setup, but the super-admin JAM Players list kept showing 7440d2d. The old version reporter had started
+before the update, was refused (401) until the app registered the player, and then delivered the
+7440d2d it had read at the start, seconds after the updater reported the new commit. Now the reporter
+reads the version again for every attempt, and the updater restarts the reporter at the end of every
+update (which stops a stale run and sends the version once more). Setup: fresh 7440d2d card, new code
+released on its branch. Steps: set it up from the app straight through (E4 / N14). When the TV is
+playing content, wait 2 minutes and open the super-admin JAM Players list. Expected: INSTALLED VERSION
+is the new commit, not 7440d2d. On the player:
+`cat /etc/jam/version.txt; journalctl -u jam-installed-version-reporter -b --no-pager | tail -5`
+shows the new commit, and no successful report of 7440d2d after the update finished.
+Known remainder: a player registered more than a couple of minutes AFTER its update finished is
+refused on every retry and reports at its next boot instead (every player reboots nightly).
+
 ### F — Reporting and display (MAC / network status)
 
 **F1 · Setup screens show the MACs, and nothing collides** `[ ]`

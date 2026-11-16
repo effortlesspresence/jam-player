@@ -3107,11 +3107,16 @@ def restart_services(bluetooth_conf_changed: bool = False):
         # It only matters at boot (gates lightdm). Restarting it post-boot
         # would have no useful effect.
         'jam-display-hotplug-monitor.service',  # Type=notify, watches DRM for HDMI hotplug
-        # NOTE: jam-installed-version-reporter is also a no-op to restart
-        # here -- jam_update.py already called report_installed_version_to_backend()
-        # directly above, so the new commit is already known to the
-        # backend. Skipping the systemctl-restart of the reporter avoids
-        # a redundant POST.
+        # The version reporter, even though this run already reported the new
+        # commit itself. A reporter run that started BEFORE the update can
+        # still be retrying with the old version in hand, and its late success
+        # overwrote ours: the backend then showed the old version until the
+        # next reboot (bench, 2026-11-16, first setup of a 7440d2d card: the
+        # old reporter was refused until the app registered the player, then
+        # delivered 7440d2d seconds after we delivered the new commit).
+        # Restarting stops that stale run now; the fresh one starts when this
+        # unit exits (it is After=jam-update) and sends the installed version.
+        'jam-installed-version-reporter.service',  # Type=oneshot, one small POST
     ]
     # Restarted last, and only when no setup session is live (see below).
     ble_units = [

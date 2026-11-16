@@ -81,8 +81,16 @@ def main() -> int:
 
     backoff = INITIAL_BACKOFF_SEC
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        # Read the version again for EVERY attempt. The retries can span
+        # minutes (an unregistered player is refused until the app registers
+        # it), and an update can finish in that time. A run that kept the
+        # value it read at the start then delivered the OLD version after the
+        # updater had reported the new one, and the backend showed the old
+        # version until the next reboot (bench, 2026-11-16: 7440d2d sent at
+        # 12:39:22, on attempt 5, seconds after the update to 65ed8c6).
+        version = read_installed_version() or version
         if report_installed_version_to_backend(version=version, branch=read_update_branch()):
-            logger.info(f"Successfully reported on attempt {attempt}")
+            logger.info(f"Successfully reported {version} on attempt {attempt}")
             return 0
 
         if attempt < MAX_ATTEMPTS:
