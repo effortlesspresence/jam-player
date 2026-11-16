@@ -2237,32 +2237,37 @@ _PANEL_CONF_FRESH = (
 )
 
 
-def _strip_panel_applets(content: str) -> str:
-    """
-    Return the panel settings with every applet removed and notifications off.
-
-    Only the three keys in _PANEL_REQUIRED inside the [panel] section are
-    touched; every other line comes back byte for byte, in the file's own
-    `key=value` style. A key that is missing is added to [panel]. A file with
-    no [panel] section (or no content) gets one. Idempotent.
-    """
-    if not content.strip():
-        return _PANEL_CONF_FRESH
-
-    lines = content.split('\n')
-    start = end = None
+def _find_ini_section(lines: list, section: str):
+    """(start, end) line indexes of `section`'s body, or None if it is absent."""
+    start = None
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith('[') and stripped.endswith(']'):
             if start is not None:
-                end = i
-                break
-            if stripped == '[panel]':
+                return start, i
+            if stripped == section:
                 start = i
-    if start is None:
-        return content.rstrip('\n') + '\n\n' + _PANEL_CONF_FRESH
-    if end is None:
-        end = len(lines)
+    return None if start is None else (start, len(lines))
+
+
+def _set_ini_keys(content: str, section: str, required: dict) -> str:
+    """
+    Return `content` with every key in `required` set to its value inside
+    `section` (header given with its brackets).
+
+    Only those keys are touched; every other line comes back byte for byte,
+    and what is written uses the `key=value` style the desktop's own tools
+    write. A key that is missing is added to the section; a missing section
+    is added to the file. Idempotent.
+    """
+    lines = content.split('\n')
+    found = _find_ini_section(lines, section)
+    if found is None:
+        fresh = section + '\n' + ''.join(f'{key}={value}\n' for key, value in required.items())
+        if not content.strip():
+            return fresh
+        return content.rstrip('\n') + '\n\n' + fresh
+    start, end = found
 
     seen = set()
     body = []
@@ -2270,13 +2275,13 @@ def _strip_panel_applets(content: str) -> str:
         stripped = line.strip()
         if '=' in stripped and not stripped.startswith('#'):
             key, value = (part.strip() for part in stripped.split('=', 1))
-            if key in _PANEL_REQUIRED:
+            if key in required:
                 seen.add(key)
-                if value != _PANEL_REQUIRED[key]:
-                    line = f'{key}={_PANEL_REQUIRED[key]}'
+                if value != required[key]:
+                    line = f'{key}={required[key]}'
         body.append(line)
 
-    missing = [f'{key}={value}' for key, value in _PANEL_REQUIRED.items() if key not in seen]
+    missing = [f'{key}={value}' for key, value in required.items() if key not in seen]
     if missing:
         # Before the blank lines that close the section, so the keys stay in it.
         tail = len(body)
@@ -2285,6 +2290,47 @@ def _strip_panel_applets(content: str) -> str:
         body[tail:tail] = missing
 
     return '\n'.join(lines[:start + 1] + body + lines[end:])
+
+
+def _strip_panel_applets(content: str) -> str:
+    """
+    Return the panel settings with every applet removed and notifications off.
+
+    Only the three keys in _PANEL_REQUIRED inside the [panel] section are
+    touched; every other line comes back byte for byte, in the file's own
+    `key=value` style. A key that is missing is added to [panel]. A file with
+    no [panel] section (or no content) gets a whole hidden, empty panel, not
+    just the three keys: a panel we create must not be visible. Idempotent.
+    """
+    if not content.strip():
+        return _PANEL_CONF_FRESH
+    if _find_ini_section(content.split('\n'), '[panel]') is None:
+        return content.rstrip('\n') + '\n\n' + _PANEL_CONF_FRESH
+    return _set_ini_keys(content, '[panel]', _PANEL_REQUIRED)
+
+
+def _write_desktop_setting(conf: Path, content: str) -> None:
+    """
+    Write a settings file in the desktop user's home: atomically, and owned by
+    that user (the updater runs as root; a root-owned file there is one the
+    desktop's own programs could not save over).
+    """
+    created = []
+    folder = conf.parent
+    while not folder.exists():
+        created.append(folder)
+        folder = folder.parent
+    conf.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = conf.with_name(conf.name + '.jam-tmp')
+    with open(tmp, 'w') as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, conf)
+    for path in reversed(created):
+        run_command(['chown', f'{_PANEL_USER}:{_PANEL_USER}', str(path)], timeout=10)
+    run_command(['chown', f'{_PANEL_USER}:{_PANEL_USER}', str(conf)], timeout=10)
 
 
 def install_kiosk_panel_config() -> bool:
@@ -2322,15 +2368,7 @@ def install_kiosk_panel_config() -> bool:
             logger.info(f"  {_PANEL_CONF} already has no applets")
             return False
 
-        _PANEL_CONF.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _PANEL_CONF.with_name(_PANEL_CONF.name + '.jam-tmp')
-        with open(tmp, 'w') as f:
-            f.write(updated)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, _PANEL_CONF)
-        for path in (_PANEL_CONF.parent, _PANEL_CONF):
-            run_command(['chown', f'{_PANEL_USER}:{_PANEL_USER}', str(path)], timeout=10)
+        _write_desktop_setting(_PANEL_CONF, updated)
         logger.info(f"  Updated {_PANEL_CONF}")
     except Exception as e:
         logger.warning(f"  Could not update the desktop panel settings: {e}")
@@ -2343,6 +2381,83 @@ def install_kiosk_panel_config() -> bool:
         logger.info("  Stopped the running panel; the desktop restarts it without applets")
     except Exception as e:
         logger.warning(f"  Could not restart the desktop panel (takes effect at next boot): {e}")
+    return True
+
+
+# The desktop file manager (it draws the desktop behind the JAM screen) and
+# its settings: the user's own file, and the system default it starts from.
+# "LXDE-pi" is the profile the desktop starts it with
+# (`pcmanfm --desktop --profile LXDE-pi`).
+_FILE_MANAGER_CONF = Path('/home/comitup/.config/pcmanfm/LXDE-pi/pcmanfm.conf')
+_FILE_MANAGER_SYSTEM_CONF = Path('/etc/xdg/pcmanfm/LXDE-pi/pcmanfm.conf')
+_FILE_MANAGER_PROCESS = 'pcmanfm'
+
+# Ignore removable drives: do not mount them, do not ask what to do with them.
+_FILE_MANAGER_REQUIRED = {
+    'mount_on_startup': '0',
+    'mount_removable': '0',
+    'autorun': '0',
+}
+
+
+def _ignore_removable_media(content: str) -> str:
+    """The file manager's settings with removable drives ignored. Idempotent."""
+    return _set_ini_keys(content, '[volume]', _FILE_MANAGER_REQUIRED)
+
+
+def install_ignore_removable_media() -> bool:
+    """
+    Make the player ignore USB drives, so plugging one in puts nothing on the
+    customer's TV.
+
+    The desktop session runs the Pi OS file manager to draw the desktop. Left
+    at its defaults it mounts any drive that is plugged in and opens
+    "Removable medium is inserted ... Open in File Manager" over the content
+    (seen on the bench, 2026-11-16). Nobody on site has a keyboard to dismiss
+    it, so it stays until the nightly reboot, and its OK button opens a file
+    manager on a device that holds its own keys. A player has no use for
+    either, so mounting and the question are both switched off. A USB keyboard
+    or mouse still works; only storage is ignored.
+
+    The settings go in the desktop user's own file, which the file manager
+    reads over the system defaults. When that file does not exist yet it
+    starts as a copy of the system file, so no other setting changes.
+
+    When the settings change, the running file manager is killed once and the
+    desktop starts it again within a second (it is launched through
+    wfrespawn). It is KILLED, not asked to quit: on a clean quit it saves the
+    settings it has in memory, which would put the old values straight back
+    over this file. Returns whether the file changed.
+    """
+    logger.info("Making the desktop ignore removable drives...")
+    try:
+        existing = _FILE_MANAGER_CONF.read_text() if _FILE_MANAGER_CONF.exists() else None
+        if existing is not None:
+            base = existing
+        elif _FILE_MANAGER_SYSTEM_CONF.exists():
+            base = _FILE_MANAGER_SYSTEM_CONF.read_text()
+        else:
+            base = ''
+        updated = _ignore_removable_media(base)
+        if updated == base and (existing is not None or base):
+            # The file in force already says so (ours, or the image's own
+            # system file with no user file over it).
+            logger.info("  Removable drives are already ignored")
+            return False
+
+        _write_desktop_setting(_FILE_MANAGER_CONF, updated)
+        logger.info(f"  Updated {_FILE_MANAGER_CONF}")
+    except Exception as e:
+        logger.warning(f"  Could not update the file manager settings: {e}")
+        return False
+
+    try:
+        # Exit status 1 just means it is not running; it reads the file when
+        # it starts.
+        run_command(['pkill', '-KILL', '-u', _PANEL_USER, '-x', _FILE_MANAGER_PROCESS], timeout=10)
+        logger.info("  Stopped the running file manager; the desktop restarts it with the new settings")
+    except Exception as e:
+        logger.warning(f"  Could not restart the file manager (takes effect at next boot): {e}")
     return True
 
 
@@ -3454,6 +3569,9 @@ def main():
 
     # ...or any other window: take the applets out of the desktop panel
     install_kiosk_panel_config()
+
+    # ...and ignore USB drives, so plugging one in asks nothing on the TV
+    install_ignore_removable_media()
 
     # Configure lightdm to hide cursor on desktop
     install_lightdm_cursor_config()

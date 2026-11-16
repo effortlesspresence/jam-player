@@ -195,8 +195,22 @@ Expected: `widgets_left=spacing4`, `widgets_right=spacing4`, `notify_enable=fals
 Run `pgrep -x wf-panel-pi` again after 10 s: the same id (the panel is not restarting in a loop). Then,
 with content playing: connect the phone and change the WiFi from the app (K15). Expected: no box,
 window or bar appears on the TV at any point. A6 still passes (it is the second guard).
-Not covered by this fix: the desktop file manager (`pcmanfm --desktop`) also runs in the session and may
-open a window when a USB drive is plugged in. Plug one in once and record what the TV shows.
+The desktop file manager's USB-drive window is a separate fix: A9.
+
+**A9 · A USB drive is ignored: nothing on the TV, nothing mounted** `[ ]`
+Found on the bench 2026-11-16 on b05231f: plugging in a USB drive put *Removable medium is inserted ...
+Open in File Manager* (Cancel / OK) over the content. It comes from the desktop file manager
+(`pcmanfm --desktop`), which at its defaults mounts any drive and asks what to do with it. The update now
+writes `~/.config/pcmanfm/LXDE-pi/pcmanfm.conf` with mounting and the question switched off, and restarts
+the file manager once. Setup: updated player with content playing. Verify the settings and that one file
+manager is running:
+`grep -A3 '^\[volume\]' ~/.config/pcmanfm/LXDE-pi/pcmanfm.conf; pgrep -x pcmanfm`
+Expected: `mount_on_startup=0`, `mount_removable=0`, `autorun=0`; one process id. Then plug in a USB
+drive and wait 20 s. Expected: nothing appears on the TV, and the drive is not mounted:
+`lsblk -o NAME,MOUNTPOINT | grep sd; mount | grep -c /media` lists the drive and its partitions with
+nothing after their names, then `0`. Reboot with the drive still plugged in: still nothing on the TV, still not mounted,
+and the settings file still reads `0` three times (the file manager did not write the old values back).
+A USB keyboard still types (storage is ignored, not USB).
 
 ### B — Forget-on-`none` corroboration (audit #8, Decision C)
 
