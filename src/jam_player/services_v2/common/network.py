@@ -917,6 +917,18 @@ def _scanned_ssids() -> Optional[set]:
     return {_unescape_nmcli_field(line) for line in result.stdout.split('\n') if line}
 
 
+def _says_network_not_found(error_msg: str) -> bool:
+    """
+    Did NetworkManager say no access point of that name answered? It has two
+    wordings: "No network with SSID 'x' found" (asked to join a name it has
+    never seen) and "The Wi-Fi network could not be found" (a profile whose
+    network did not turn up, e.g. a saved network that is switched off or out
+    of range).
+    """
+    lowered = (error_msg or '').lower()
+    return 'no network with ssid' in lowered or 'could not be found' in lowered
+
+
 def wifi_network_answers(ssid: str) -> bool:
     """
     Is an access point with EXACTLY this name answering right now?
@@ -1034,7 +1046,7 @@ def connect_to_wifi(ssid: str, password: str, hidden: bool = False) -> Tuple[boo
                 logger.info(f"No access point named '{ssid}' answered; reporting network not found, not a wrong password")
                 return False, "Network not found"
             return False, "Invalid password"
-        elif 'No network with SSID' in error_msg:
+        elif _says_network_not_found(error_msg):
             return False, "Network not found"
         else:
             return False, error_msg or "Connection failed"
@@ -1163,6 +1175,12 @@ def connect_to_saved_wifi(connection_name: str) -> Tuple[bool, str]:
                 logger.info(f"Restoring previous connection to: {previous_connection['name']}")
                 _restore_wifi_connection(previous_connection['name'])
 
+            # A saved network that is switched off or out of range. Say so in
+            # the words the status mapping knows, so the app shows "Can't find
+            # that Wi-Fi" and not a general failure (bench, 2026-11-16: a
+            # phone hotspot that had stopped advertising came back as 'failed').
+            if _says_network_not_found(error_msg):
+                return False, "Network not found"
             return False, error_msg
 
     except subprocess.TimeoutExpired:

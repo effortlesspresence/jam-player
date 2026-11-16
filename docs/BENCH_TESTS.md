@@ -234,6 +234,19 @@ page, on a player that is NOT already online on the network being typed:
 Verify nothing is left behind after each: `nmcli -t -f NAME connection show | grep -c jam-wifi`
 is unchanged. A 7440d2d player still answers *invalid password* for step 1; that is the old behaviour.
 
+
+**A11 · A saved network that is out of range says so** `[ ]`
+Found on the bench 2026-11-16: a saved phone hotspot had stopped advertising. Tapping it in the app
+(connect by saved profile) failed with NetworkManager's "The Wi-Fi network could not be found", which
+the player passed on word for word; the status mapping did not recognise it and the app was told
+`failed`. `connect_to_saved_wifi` now reports it as "Network not found" (status `network_not_found`).
+Steps: with two networks saved and the player online on the first, switch the second one off, then tap
+it (Saved) in the app. Expected: the app shows *Can't find that Wi-Fi* within about 30 s, and the player
+is back online on the first network (`nmcli -t -f NAME,DEVICE connection show --active`).
+Also from that log: the apps' 3-second keep-alive read of Device Info was logged as a WARNING every
+3 s. After this change `journalctl -u jam-ble-provisioning -b --no-pager | grep -c "read device info"`
+stays at 0 for a whole setup session.
+
 ### B — Forget-on-`none` corroboration (audit #8, Decision C)
 
 **B1 · Stale clock, NTP reachable → accurate verdict, no forget** `[ ]`
@@ -314,6 +327,22 @@ online within ~15 s of association; BLE stops again (fresh API stamp needed — 
 Two saved networks. Connect to the second from the app. Verify:
 `nmcli -f NAME,connection.autoconnect-priority connection show | grep jam-wifi`
 — the newest has the highest priority.
+
+
+**C6 · A phone that is still linked but idle does not hold BLE open** `[ ]`
+Found on the bench 2026-11-16 (8d8cf18, iPhone): 3.5 minutes after the app had let go of the player,
+`bluetoothctl devices Connected` still listed the phone and jam-ble-provisioning was still running, 21
+minutes after boot. iOS keeps the link up after the app releases it, and the state manager treated any
+linked phone as a setup in progress with no time limit. Now a linked phone counts only while it is
+using the link: jam-ble-provisioning touches `/run/jam/ble_client_activity` on every read and write
+(both apps read Device Info every 3 s on a setup page), and a link silent for 2 minutes is ignored.
+When setup then closes, the idle link is dropped. Steps: reboot a registered, online player. Inside
+the window open it in the app, tap Change WiFi Network, wait for the WiFi list, then back out. Leave
+the phone next to the player with Bluetooth on. At 18 minutes after the reboot run:
+`systemctl is-active jam-ble-provisioning; bluetoothctl devices Connected; ls -l --time-style=+%T /run/jam/ble_client_activity; date`
+Expected: `inactive`, no device listed, and a marker last touched when you backed out. Then K16: the
+app says it cannot reach the player. Also check the opposite: with the app sitting on the WiFi list
+past the 15-minute mark, jam-ble-provisioning stays `active` for as long as the app stays there.
 
 ### D — Connectivity probe and API health (Decision A)
 

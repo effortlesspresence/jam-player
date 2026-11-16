@@ -153,6 +153,60 @@ class WhatTheAppIsTold(unittest.TestCase):
         check.assert_not_called()
 
 
+NOT_IN_RANGE = ("Error: Connection activation failed: The Wi-Fi network could not be found\n"
+                "Hint: use 'journalctl -xe NM_CONNECTION=0344bb06 + NM_DEVICE=wlan0' to get more details.")
+
+
+class ASavedNetworkThatIsNotThere(unittest.TestCase):
+    """Bench, 2026-11-16: the phone hotspot the player had saved was no longer
+    advertising. NetworkManager said "The Wi-Fi network could not be found";
+    the player passed that on word for word, the status mapping did not
+    recognise it, and the app was told 'failed'."""
+
+    def _saved(self, returncode, stderr, previous=None):
+        result = mock.MagicMock(returncode=returncode, stdout='', stderr=stderr)
+        restored = []
+        with mock.patch.object(network, '_get_active_wifi_connection', return_value=previous), \
+             mock.patch.object(network, '_stop_comitup_hotspot', return_value=False), \
+             mock.patch.object(network.subprocess, 'run', return_value=result), \
+             mock.patch.object(network, '_restore_wifi_connection', side_effect=restored.append), \
+             mock.patch.object(network, '_promote_in_background'):
+            answer = network.connect_to_saved_wifi('jam-wifi-428d1ae5')
+        return answer, restored
+
+    def test_a_saved_network_out_of_range_is_network_not_found(self):
+        answer, _ = self._saved(4, NOT_IN_RANGE)
+        self.assertEqual(answer, (False, 'Network not found'))
+
+    def test_the_network_that_was_working_is_still_restored(self):
+        _, restored = self._saved(4, NOT_IN_RANGE, previous={'name': 'jam-wifi-bf216a93', 'ssid': 'Good'})
+        self.assertEqual(restored, ['jam-wifi-bf216a93'])
+
+    def test_other_saved_network_failures_are_passed_on_as_before(self):
+        answer, _ = self._saved(4, 'Error: Connection activation failed: Secrets were required, but not provided.')
+        self.assertEqual(answer, (False, 'Error: Connection activation failed: Secrets were required, but not provided.'))
+
+    def test_a_saved_network_that_connects_is_unaffected(self):
+        answer, _ = self._saved(0, '')
+        self.assertEqual(answer, (True, ''))
+
+    def test_both_networkmanager_wordings_are_recognised(self):
+        self.assertTrue(network._says_network_not_found("Error: No network with SSID 'Shop' found."))
+        self.assertTrue(network._says_network_not_found(NOT_IN_RANGE))
+        for other in ('', None, 'Secrets were required, but not provided', 'timeout', 'Connection failed'):
+            self.assertFalse(network._says_network_not_found(other), other)
+
+    def test_a_typed_network_gets_the_same_answer_for_that_wording(self):
+        failed = mock.MagicMock(returncode=4, stdout='', stderr=NOT_IN_RANGE)
+        with mock.patch.object(network, '_get_active_wifi_connection', return_value=None), \
+             mock.patch.object(network, '_log_network_diagnostic_info'), \
+             mock.patch.object(network, '_stop_comitup_hotspot', return_value=False), \
+             mock.patch.object(network, '_connect_wifi_secure', return_value=failed), \
+             mock.patch.object(network, 'wifi_network_answers') as check:
+            self.assertEqual(network.connect_to_wifi('Gone', 'pw'), (False, 'Network not found'))
+        check.assert_not_called()
+
+
 class TheStatusCodesTheAppsAlreadyKnow(unittest.TestCase):
     """jam_ble_provisioning turns the text above into a status code by looking
     for words in it. It cannot be imported off-device (D-Bus), so this pins the

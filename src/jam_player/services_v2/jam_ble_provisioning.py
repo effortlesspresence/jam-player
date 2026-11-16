@@ -106,7 +106,10 @@ from common.network import (
     get_current_connection_info,
     trigger_wifi_scan,
 )
-from common.paths import INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, safe_touch, touch_volatile_flag
+from common.paths import (
+    INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, BLE_CLIENT_ACTIVITY_FLAG,
+    safe_touch, touch_volatile_flag,
+)
 from common.network import check_internet_connectivity
 from common.wifi_attempts import WifiAttemptLedger
 
@@ -578,6 +581,23 @@ class Service(dbus.service.Object):
 # GATT Characteristic Base Class
 # ============================================================================
 
+def _note_client_activity():
+    """
+    Record that a connected phone just read or wrote one of our
+    characteristics. Called first thing in every ReadValue / WriteValue.
+
+    jam-ble-state-manager keeps Bluetooth setup open for a connected phone,
+    but only while the phone is actually using the link: iOS keeps the link
+    up for minutes after the app has let go of it, and that idle link kept
+    setup open long after the 15-minute window (bench, 2026-11-16). Both apps
+    read Device Info every 3 s while they are on a setup page, so this marker
+    stays fresh for exactly as long as an app is in a session.
+
+    A tmpfs touch: no SD-card write, and it never raises.
+    """
+    touch_volatile_flag(BLE_CLIENT_ACTIVITY_FLAG)
+
+
 class Characteristic(dbus.service.Object):
     """
     Base class for a GATT Characteristic.
@@ -710,6 +730,7 @@ class WiFiNetworksCharacteristic(Characteristic):
         Reading this characteristic triggers sending WiFi networks via notifications.
         Returns immediately with status; actual data comes via notifications.
         """
+        _note_client_activity()
         logger.info("WiFi networks read requested - sending via notifications")
 
         if not self._notifying:
@@ -827,6 +848,7 @@ class SavedNetworksCharacteristic(Characteristic):
         Reading this characteristic triggers sending saved networks via notifications.
         Returns immediately with status; actual data comes via notifications.
         """
+        _note_client_activity()
         logger.info("Saved networks read requested - sending via notifications")
 
         if not self._notifying:
@@ -1010,8 +1032,14 @@ def _trigger_post_announce_services():
     for service in services_to_restart:
         try:
             logger.info(f"Triggering {service} restart...")
+            # --no-block: queue the restart and move on. A plain restart waits
+            # for the unit to report ready; jam-heartbeat and jam-ws-commands
+            # take longer than this 10 s, so every WiFi change sat out two
+            # timeouts and logged "Failed to restart ... timed out" for
+            # restarts that then completed normally (bench, 2026-11-16). Same
+            # change the state manager made for the same units.
             subprocess.run(
-                ['systemctl', 'restart', service],
+                ['systemctl', 'restart', '--no-block', service],
                 timeout=10,
                 capture_output=True
             )
@@ -1063,6 +1091,7 @@ class WiFiCredentialsCharacteristic(Characteristic):
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
     def WriteValue(self, value, options):
         """Receive WiFi credentials and attempt to connect."""
+        _note_client_activity()
         try:
             # Convert bytes back to string
             data = bytes(value).decode('utf-8')
@@ -1326,6 +1355,7 @@ class ConnectionStatusCharacteristic(Characteristic):
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
     def ReadValue(self, options):
         """Return current connection status."""
+        _note_client_activity()
         logger.debug("Client requested connection status")
         return self._get_status_value()
 
@@ -1392,10 +1422,16 @@ class DeviceInfoCharacteristic(Characteristic):
         Reading this characteristic triggers sending device info via notifications.
         Returns immediately with status; actual data comes via notifications.
         """
+        _note_client_activity()
         logger.info("Device info read requested - sending via notifications")
 
         if not self._notifying:
-            logger.warning("Client read device info but notifications not enabled")
+            # DEBUG, not WARNING: the apps read this characteristic every 3 s
+            # as a keep-alive for the whole time they are connected, without
+            # subscribing. As a warning it was written to the SD card every
+            # 3 s of every setup session and buried the lines that matter
+            # (bench, 2026-11-16). The reply to the app is unchanged.
+            logger.debug("Client read device info but notifications not enabled")
             error = json.dumps({"error": "Subscribe to notifications first"})
             return dbus.Array([dbus.Byte(b) for b in error.encode('utf-8')], signature='y')
 
@@ -1544,6 +1580,7 @@ class ProvisioningConfirmCharacteristic(Characteristic):
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
     def WriteValue(self, value, options):
         """Receive and store provisioning confirmation."""
+        _note_client_activity()
         try:
             data = bytes(value).decode('utf-8')
             logger.info("Received provisioning confirmation")
@@ -1611,6 +1648,7 @@ class ScreenIdCharacteristic(Characteristic):
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
     def WriteValue(self, value, options):
         """Receive and store screen ID."""
+        _note_client_activity()
         try:
             data = bytes(value).decode('utf-8')
             logger.info("Received screen ID via BLE")

@@ -74,7 +74,8 @@ from common.system import manage_service, seconds_since_boot, unit_active_since_
 from common.network import InternetConnectivityMonitor, check_internet_connectivity, api_recently_ok
 from common.credentials import is_device_registered, is_device_announced
 from common.paths import (
-    INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, STATE_MANAGER_ALIVE_FLAG,
+    INTERNET_VERIFIED_FLAG, BLE_SESSION_ACTIVE_FLAG, BLE_CLIENT_ACTIVITY_FLAG,
+    STATE_MANAGER_ALIVE_FLAG,
     FIRST_CONNECT_UPDATE_FLAG, safe_touch, touch_volatile_flag,
 )
 
@@ -191,6 +192,17 @@ BLE_BOOT_RECOVERY_WINDOW_SECONDS = 15 * 60
 #     case). A marker older than that means the attempt died without
 #     clearing it, not that somebody is still waiting.
 BLE_SESSION_FLAG_MAX_AGE_SECONDS = 5 * 60
+
+# A connected phone counts as a setup in progress only while it has read or
+# written one of our characteristics this recently. "The BlueZ answer clears
+# itself when the phone disconnects" turned out not to be enough: iOS keeps
+# the Bluetooth link up for minutes after the app has let go of it, so a
+# player stayed open for setup long after its window with nobody using it
+# (bench, 2026-11-16: still linked 3.5 minutes after the app's last read).
+# Both apps read Device Info every 3 s while they are on a setup page, so two
+# minutes is forty missed keep-alives -- an app that is really in a session is
+# never mistaken for an idle link.
+BLE_CLIENT_ACTIVITY_MAX_AGE_SECONDS = 2 * 60
 
 # First-connect auto-update: wait (bounded) for jam-announce so the updater's
 # device-authorized release-target lookup can be verified; see
@@ -516,6 +528,10 @@ class BLEStateManager:
                     f"({BLE_BOOT_RECOVERY_WINDOW_SECONDS // 60} min); device is "
                     f"online via our backend and registered - stopping BLE provisioning"
                 )
+                # Once, when setup closes: a phone that is still linked but
+                # idle must not stay linked to a player that has stopped
+                # offering setup.
+                self._disconnect_idle_ble_links()
             manage_service(BLE_PROVISIONING_SERVICE, should_run=should_run)
         else:
             manage_service(BLE_PROVISIONING_SERVICE, should_run=True)
@@ -664,17 +680,70 @@ class BLEStateManager:
             logger.debug(f"Could not query BlueZ for connected devices: {e}")
         return False
 
+    def _ble_client_recently_active(self) -> bool:
+        """
+        Has a connected phone used the link lately (see
+        BLE_CLIENT_ACTIVITY_MAX_AGE_SECONDS)?
+
+        No marker at all answers True: either the phone connected a moment
+        ago and has not read anything yet, or jam-ble-provisioning is still
+        on code that does not write the marker. Both are cases where the old
+        rule (a connected phone is a session) is the right one. A marker that
+        cannot be read answers True for the same reason: when in doubt, do
+        not cut a session off.
+        """
+        try:
+            if not BLE_CLIENT_ACTIVITY_FLAG.exists():
+                return True
+            age = time.time() - BLE_CLIENT_ACTIVITY_FLAG.stat().st_mtime
+        except Exception:
+            return True
+        if age > BLE_CLIENT_ACTIVITY_MAX_AGE_SECONDS:
+            logger.debug(f"A phone is still linked but has been idle for {age:.0f}s; not a setup session")
+            return False
+        return True
+
     def _setup_session_in_progress(self) -> bool:
         """
         Hold the recovery window open for an active setup session.
 
         No overall deadline: a real session is never cut off, whenever it
         started. Each signal expires on its own instead (see the constants),
-        so this cannot become a permanent hold.
+        so this cannot become a permanent hold: a WiFi join by its marker's
+        age, and a connected phone by how long ago it last used the link.
         """
         if self._wifi_setup_in_flight():
             return True
-        return self._ble_central_connected()
+        return self._ble_central_connected() and self._ble_client_recently_active()
+
+    def _disconnect_idle_ble_links(self) -> None:
+        """
+        Drop any phone still linked when Bluetooth setup is being closed.
+
+        Only called once _should_ble_run has said "stop", which already means
+        nobody is in a session. Without this an idle link outlives the setup
+        service for as long as the phone stays in range, and everything that
+        asks BlueZ "is a phone connected?" (this manager, the updater's
+        session guard) keeps getting yes. Best-effort; never raises.
+        """
+        try:
+            manager = dbus.Interface(
+                self.bus.get_object('org.bluez', '/'),
+                'org.freedesktop.DBus.ObjectManager'
+            )
+            linked = [
+                path for path, interfaces in manager.GetManagedObjects().items()
+                if bool((interfaces.get('org.bluez.Device1') or {}).get('Connected', False))
+            ]
+        except Exception as e:
+            logger.debug(f"Could not query BlueZ for linked devices: {e}")
+            return
+        for path in linked:
+            try:
+                dbus.Interface(self.bus.get_object('org.bluez', path), 'org.bluez.Device1').Disconnect()
+                logger.info(f"Dropped an idle Bluetooth link: {path}")
+            except Exception as e:
+                logger.debug(f"Could not drop idle Bluetooth link {path}: {e}")
 
     def _should_ble_run(self, is_online: bool, method: str = 'unknown') -> bool:
         """

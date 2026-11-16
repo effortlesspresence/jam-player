@@ -48,6 +48,13 @@ JAM_RUN_DIR = Path('/run/jam')
 # refuses to close the post-boot BLE recovery window while this exists, so a
 # setup session started at minute 14 is never cut off mid-connect.
 BLE_SESSION_ACTIVE_FLAG = JAM_RUN_DIR / 'ble_session_active'
+# Touched by jam-ble-provisioning whenever a connected phone reads or writes one
+# of our Bluetooth characteristics. Both apps read Device Info every 3 s while
+# they are on a setup page, so a fresh mtime means "an app is using this link
+# right now". jam-ble-state-manager reads it: a phone that is merely still
+# linked (iOS keeps the link up for minutes after the app lets go) must not
+# count as a setup in progress.
+BLE_CLIENT_ACTIVITY_FLAG = JAM_RUN_DIR / 'ble_client_activity'
 
 # Touched by jam-ble-state-manager on every periodic tick (15 s) (and at the start
 # of its boot-time check). The .internet_verified flag is a CACHE maintained
